@@ -1,0 +1,22 @@
+{
+  "name": "rootgrid",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Rootgrid - local-first web UI for driving Codex via codex app-server",
+  "license": "UNLICENSED",
+  "bin": {
+    "rootgrid": "./src/cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "node ./src/cli.js",
+    "setup": "node ./src/cli.js setup"
+  },
+  "dependencies": {
+    "ws": "^8.18.3",
+    "zod": "^4.2.1"
+  }
+}
