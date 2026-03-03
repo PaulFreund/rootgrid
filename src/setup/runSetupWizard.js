@@ -1,13 +1,16 @@
-import { access, chmod, mkdir } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
+import { access, chmod, mkdir, readFile } from 'node:fs/promises'
 import { createInterface } from 'node:readline/promises'
 import process from 'node:process'
 import { stdin, stdout } from 'node:process'
+import { fileURLToPath } from 'node:url'
 
 import { buildDefaultConfig } from '../config/defaultConfig.js'
 import { RootgridConfigSchema } from '../config/schema.js'
 import { writeJsonFile } from '../lib/jsonFile.js'
 import { getConfigPath, getRootgridDir } from '../lib/paths.js'
-import { checkCodexInstalled, checkSystemdUserAvailable } from './setupChecks.js'
+import { checkCodeServerInstalled, checkCodexInstalled, checkGitInstalled, checkSystemdUserAvailable } from './setupChecks.js'
+import { installSystemdUserService } from './systemdUserAutostart.js'
 
 function normalizeYesNo(input, fallback) {
   const v = String(input ?? '').trim().toLowerCase()
@@ -43,7 +46,27 @@ async function promptChoice(rl, question, options) {
   }
 }
 
+function runShellCommand(cmd, { env = process.env } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn('sh', ['-lc', cmd], {
+      stdio: 'inherit',
+      env
+    })
+    child.on('error', () => resolve({ ok: false, code: null }))
+    child.on('exit', (code) => resolve({ ok: code === 0, code }))
+  })
+}
+
 export async function runSetupWizard() {
+  if (!stdin.isTTY || !stdout.isTTY) {
+    throw new Error('rootgrid setup requires an interactive TTY.')
+  }
+
+  const nodeMajor = Number.parseInt(String(process.versions.node).split('.')[0] ?? '', 10)
+  if (!Number.isFinite(nodeMajor) || nodeMajor < 22) {
+    throw new Error(`Node.js >= 22 is required. Detected: ${process.versions.node}`)
+  }
+
   const configPath = getConfigPath()
   try {
     await access(configPath)
@@ -63,17 +86,54 @@ export async function runSetupWizard() {
     const cfg = buildDefaultConfig()
 
     // Prereq checks
-    const codexOk = await checkCodexInstalled()
-    if (!codexOk) {
+    const codex = await checkCodexInstalled()
+    if (!codex.ok) {
       stdout.write('\n[!] Codex was not found in PATH.\n')
-      stdout.write('    Install Codex first, then re-run: rootgrid setup\n')
-      stdout.write('    See: https://developers.openai.com/codex/\n\n')
+      stdout.write('    Rootgrid v0 requires the Codex CLI.\n')
+      stdout.write('    See: https://developers.openai.com/codex/cli\n\n')
 
-      const continueAnyway = await promptYesNo(rl, 'Continue setup anyway?', { defaultValue: false })
-      if (!continueAnyway) {
-        stdout.write('\nAborted.\n')
-        return
+      const installNow = await promptYesNo(rl, 'Install Codex now via npm? (npm i -g @openai/codex)', { defaultValue: true })
+      if (installNow) {
+        stdout.write('\nInstalling Codex…\n\n')
+        const res = await runShellCommand('npm i -g @openai/codex')
+        if (!res.ok) stdout.write(`\n[!] Codex install command failed (exit ${res.code}).\n`)
       }
+
+      const codex2 = await checkCodexInstalled()
+      if (!codex2.ok) {
+        stdout.write('\n[!] Codex is still not available in PATH.\n')
+        const continueAnyway = await promptYesNo(rl, 'Continue setup anyway?', { defaultValue: false })
+        if (!continueAnyway) {
+          stdout.write('\nAborted.\n')
+          return
+        }
+      } else {
+        stdout.write(`\n[ok] Codex: ${codex2.version ?? 'installed'}\n`)
+      }
+    } else {
+      stdout.write(`\n[ok] Codex: ${codex.version ?? 'installed'}\n`)
+    }
+
+    const git = await checkGitInstalled()
+    if (!git.ok) stdout.write('[!] git was not found in PATH. (Optional, but recommended.)\n')
+    else stdout.write(`[ok] Git: ${git.version ?? 'installed'}\n`)
+
+    const codeServer = await checkCodeServerInstalled()
+    if (!codeServer.ok) {
+      stdout.write('[!] code-server was not found in PATH. (Optional; required for VS Code web viewer.)\n')
+      stdout.write('    Docs: https://coder.com/docs/code-server/latest/install\n\n')
+      const installCodeServer = await promptYesNo(rl, 'Install code-server now? (runs the official install script)', { defaultValue: false })
+      if (installCodeServer) {
+        stdout.write('\nInstalling code-server…\n\n')
+        const res = await runShellCommand('curl -fsSL https://code-server.dev/install.sh | sh')
+        if (!res.ok) stdout.write(`\n[!] code-server install script failed (exit ${res.code}).\n`)
+      }
+
+      const codeServer2 = await checkCodeServerInstalled()
+      if (codeServer2.ok) stdout.write(`[ok] code-server: ${codeServer2.version ?? 'installed'}\n`)
+      else stdout.write('[!] code-server still not found. VS Code web viewer will be unavailable until installed.\n')
+    } else {
+      stdout.write(`[ok] code-server: ${codeServer.version ?? 'installed'}\n`)
     }
 
     // Autostart (systemd --user)
@@ -142,10 +202,51 @@ export async function runSetupWizard() {
     if (validated.host.enabled) {
       const url = `http://${validated.host.listen.host}:${validated.host.listen.port}/`
       stdout.write(`Open: ${url}\n`)
-      stdout.write('\nClient token (browser → host) was generated and saved in config.\n')
-      stdout.write('Runner token (runner → host) was generated and saved in config.\n')
+      stdout.write('\nClient token (browser → host):\n')
+      stdout.write(`  ${validated.host.auth.clientToken}\n`)
+      stdout.write('\nRunner token (runner → host):\n')
+      stdout.write(`  ${validated.host.auth.runnerToken}\n`)
+      stdout.write('\nStore these somewhere safe.\n')
     } else {
       stdout.write('\nRunner is configured to connect upstream. Start rootgrid to register.\n')
+    }
+
+    if (validated.autostart.enabled && validated.autostart.method === 'systemd-user') {
+      stdout.write('\nSetting up autostart (systemd --user)…\n')
+      const cliPath = fileURLToPath(new URL('../cli.js', import.meta.url))
+
+      // If setup was run via npx, the on-disk package path may be in a cache
+      // location that can be evicted. Prefer `npx rootgrid@<version>` so the
+      // unit can always re-fetch if needed.
+      let selfVersion = null
+      try {
+        const pkgPath = fileURLToPath(new URL('../../package.json', import.meta.url))
+        selfVersion = JSON.parse(await readFile(pkgPath, 'utf-8'))?.version ?? null
+      } catch {
+        selfVersion = null
+      }
+
+      const isNpxPath = cliPath.includes('/_npx/') || cliPath.includes('/.npm/_npx/')
+      const execStart = isNpxPath
+        ? ['npx', '--yes', selfVersion ? `rootgrid@${selfVersion}` : 'rootgrid']
+        : [process.execPath, cliPath]
+      const res = await installSystemdUserService({
+        serviceName: 'rootgrid',
+        execStart,
+        description: validated.host.enabled ? 'Rootgrid (Codex web UI + runner)' : 'Rootgrid (runner)',
+        workingDirectory: process.env.HOME ?? null,
+        environment: {
+          ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+          ...(process.env.CODEX_HOME ? { CODEX_HOME: process.env.CODEX_HOME } : {})
+        }
+      })
+      if (res.ok) {
+        stdout.write(`[ok] Autostart enabled: ${res.unitPath}\n`)
+      } else {
+        stdout.write(`[!] Autostart setup failed (${res.step}).\n`)
+        stdout.write(`    Unit path: ${res.unitPath}\n`)
+        stdout.write(`    Error: ${res.error}\n`)
+      }
     }
 
     stdout.write('\nNext: run `rootgrid` to start the service.\n\n')

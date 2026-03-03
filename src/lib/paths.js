@@ -13,3 +13,14 @@ export function getDbPath() {
   return join(getRootgridDir(), 'rootgrid.db')
 }
 
+export function getSecretKeyPath() {
+  return join(getRootgridDir(), 'secret.key')
+}
+
+export function getVapidKeysPath() {
+  return join(getRootgridDir(), 'vapid.json')
+}
+
+export function getUploadsDir() {
+  return join(getRootgridDir(), 'uploads')
+}

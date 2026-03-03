@@ -37,12 +37,34 @@ Support both:
 - **Cancel current turn** via the structured control surface (preferred) and fall back to terminating the process if needed.
 - **Stop session**: terminate the process and mark the session exited; keep logs/artifacts.
 
+## Attachments / multimodal input (v0)
+
+Rootgrid supports user file attachments in the web UI (especially images).
+
+Codex `app-server` supports sending a turn as an **input array** (`UserInput[]`) instead of a single string prompt.
+Rootgrid uses this to support images:
+
+- Text: `{ type: "text", text: "..." }`
+- Image (local file on the runner): `{ type: "localImage", path: "/abs/path/on/runner.png" }`
+
+Implementation notes (Rootgrid v0):
+- The browser uploads attachment bytes to the host (base64-in-JSON in v0).
+- Attachment size limit (v0): max **50MB** per file.
+- The host stores attachments on disk (`~/.rootgrid/uploads/<sessionId>/...`) so the UI can download/preview them later.
+- The host also forwards attachments to the runner (via `session.upload`) and receives a runner-local path.
+- When starting/sending a turn, the host builds `input: UserInput[]` containing:
+  - one `text` item (the user’s message; if empty, a placeholder like `"(see attachments)"`)
+  - one `localImage` item per image attachment
+- Non-image files are not currently sent as structured app-server inputs; Rootgrid appends a small
+  `[Uploaded files]` block listing runner-local file paths into the text prompt so tools can reference them.
+
 ## Approvals + sandbox (Codex-managed)
 
 Rootgrid should behave like the native Codex CLI:
 
 - The user selects an **approval policy** and **sandbox policy** for a session.
 - Rootgrid passes these into `codex app-server` (thread/start + turn/start params).
+- Rootgrid can also update these during an active session by applying new overrides on the next `turn/start` (Codex treats per-turn overrides as the defaults for subsequent turns).
 - Codex decides *when* to ask for approval and emits approval requests only when needed.
 
 When Codex needs approval, the app-server sends JSON-RPC **requests** such as:

@@ -92,6 +92,9 @@ Host (durable):
   - normalized event log / message history
   - patch metadata + stored diffs
   - IDE sessions
+  - push subscriptions (VAPID) and session uploads/attachments metadata
+- Host stores uploaded/attached files on disk under:
+  - `~/.rootgrid/uploads/<sessionId>/...`
 
 Runner (ephemeral/minimal):
 - Runner does **not** need SQLite.
@@ -99,10 +102,14 @@ Runner (ephemeral/minimal):
   - Codex runs with the user’s normal `CODEX_HOME` by default (so Codex settings apply and native Codex can resume sessions)
   - small debug logs
   - optional on-disk “outbox spool” of events until the host confirms receipt
+  - runner-local copies of uploads/attachments (for Codex `localImage` inputs):
+    - `~/.rootgrid/uploads/<sessionId>/...`
 
 Retention:
 - `config.retentionDays` (default `30`) applies to **everything** Rootgrid persists.
 - Rootgrid should periodically delete session artifacts/logs and prune old session rows/records beyond `retentionDays`.
+  - Host deletes host-side upload files for pruned sessions.
+  - Host also sends a best-effort `session.cleanup` message to connected runners so they can delete runner-local upload copies.
 
 Exact schema and artifact layout should stay minimal in v0 and evolve based on the web UI needs.
 

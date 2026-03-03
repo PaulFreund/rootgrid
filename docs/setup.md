@@ -79,6 +79,7 @@ This is a **proposed** starting point; adjust as implementation realities land.
 {
   "version": 1,
   "retentionDays": 30,
+  "notifications": { "sseToasts": "if-not-visible", "webPush": "if-not-visible" },
   "autostart": { "enabled": false, "method": null },
   "runner": {
     "enabled": true,
@@ -106,6 +107,14 @@ This is a **proposed** starting point; adjust as implementation realities land.
 Notes:
 - `runner.machineId` should be a stable UUID generated once (so renaming the machine doesn’t create a “new machine”).
 - `retentionDays` defaults to `30` and applies to **all** persisted data (sessions, logs, artifacts) unless explicitly exempted later.
+- `notifications.sseToasts` controls toast/desktop notifications delivered over SSE:
+  - `"if-not-visible"` (default): send only to hidden tabs
+  - `"always"`: send to all connected tabs
+  - `"never"`: disable
+- `notifications.webPush` controls Web Push delivery (VAPID):
+  - `"if-not-visible"` (default): send when the relevant session is not currently open in a visible Rootgrid tab
+  - `"always"`: always send push (even while the UI is visible)
+  - `"never"`: disable push sends (subscription can remain registered)
 - In host mode:
   - `host.auth.clientToken` protects **browser/web UI** access.
   - `host.auth.runnerToken` protects **runner registration**.
@@ -143,3 +152,4 @@ Common setup prompts that become painful later if you skip them:
 
 6) **Retention / disk usage**
    - `retentionDays` (default `30`) should prune old sessions/logs/artifacts automatically
+   - uploads/attachments are stored under `~/.rootgrid/uploads/` and are also pruned (host-side) by retention

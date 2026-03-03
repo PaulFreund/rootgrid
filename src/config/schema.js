@@ -8,6 +8,10 @@ const ListenSchema = z.object({
 export const RootgridConfigSchema = z.object({
   version: z.number().int().min(1),
   retentionDays: z.number().int().min(1).default(30),
+  notifications: z.object({
+    sseToasts: z.enum(['always', 'never', 'if-not-visible']).default('if-not-visible'),
+    webPush: z.enum(['always', 'never', 'if-not-visible']).default('if-not-visible')
+  }).default({ sseToasts: 'if-not-visible', webPush: 'if-not-visible' }),
   autostart: z.object({
     enabled: z.boolean(),
     method: z.enum(['systemd-user']).nullable()

@@ -56,17 +56,6 @@ Platform / UX scope (v0):
 - Use `npm` for installs/builds; keep installation “npx rootgrid …” simple.
 - Git is read‑only for agents (`git log`, `git blame`); humans handle staging and commits.
 
-## Reference implementation notes (optional)
-
-There is a local reference repo at:
-- `/mnt/d/prj/references/hapi`
-
-Rootgrid should **not** copy HAPI’s stack (Bun/Hono/TypeScript), but it *can* reuse ideas:
-- Codex `app-server` JSON-RPC client patterns
-- app-server event conversion patterns (notifications → UI events)
-- approval bridging patterns (requestApproval → UI decision → app-server reply)
-- Vite PWA configuration patterns
-
 ## Testing Checklist (v0 smoke tests)
 
 - `npm install`

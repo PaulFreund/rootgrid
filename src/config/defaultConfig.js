@@ -10,6 +10,10 @@ export function buildDefaultConfig() {
   return {
     version: 1,
     retentionDays: 30,
+    notifications: {
+      sseToasts: 'if-not-visible',
+      webPush: 'if-not-visible'
+    },
     autostart: {
       enabled: false,
       method: null
