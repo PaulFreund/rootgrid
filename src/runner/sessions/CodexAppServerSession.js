@@ -71,13 +71,17 @@ function sandboxPolicyCandidates(input, cwd) {
 
   /** @type {any[]} */
   const out = []
+
+  // Prefer string values per the current app-server docs.
+  for (const m of modes) out.push(m)
+
+  // Best-effort object variants for older schemas / stricter sandbox root handling.
   for (const m of modes) {
     const type = toType(m)
     if (!type) continue
 
     out.push({ type })
 
-    // Best-effort: some schemas are pickier about workspace roots.
     if (type === 'workspaceWrite' && typeof cwd === 'string' && cwd) {
       out.push({ type, writableRoots: [cwd] })
     }
@@ -92,6 +96,47 @@ function sandboxPolicyCandidates(input, cwd) {
     deduped.push(obj)
   }
   return deduped
+}
+
+function reasoningEffortCandidates(input) {
+  if (!input) return []
+  const raw = String(input).trim()
+  if (!raw) return []
+
+  const norm = raw.toLowerCase().replace(/[\s_]+/g, '-')
+  const out = []
+
+  if (norm === 'none' || norm === 'minimal' || norm === 'low' || norm === 'medium' || norm === 'high') {
+    out.push(norm)
+    // common casing variants (best-effort)
+    out.push(norm.toUpperCase().slice(0, 1) + norm.slice(1))
+  } else if (norm === 'xhigh' || norm === 'x-high' || norm === 'extra-high' || norm === 'extrahigh') {
+    out.push('xhigh')
+    out.push('xHigh')
+    out.push('x_high')
+    out.push('x-high')
+    // older/alternate spelling
+    out.push('extra-high')
+    out.push('extraHigh')
+    out.push('extra_high')
+  } else {
+    out.push(raw)
+    if (norm !== raw) out.push(norm)
+  }
+
+  return uniqStrings(out)
+}
+
+function reasoningParamObjects(effort) {
+  const e = safeString(effort)
+  if (!e) return []
+  return [
+    { effort: e },
+    { reasoningEffort: e },
+    { reasoning_effort: e },
+    { reasoning: { effort: e } },
+    { reasoning: e }
+  ]
 }
 
 function tryExtractDeltaText(params) {
@@ -216,6 +261,9 @@ export class CodexAppServerSession {
     this.lastTurnStartedId = null
     this.lastTurnCompletedId = null
     this.lastNormalizedChunk = { text: null, tsMs: 0 }
+    this.lastReasoningChunk = { text: null, tsMs: 0 }
+    this.seenToolStarted = new Set()
+    this.seenToolCompleted = new Set()
 
     /** @type {Map<string, { resolve: (v:any)=>void, reject:(e:any)=>void }>} */
     this.pendingApprovals = new Map()
@@ -223,6 +271,19 @@ export class CodexAppServerSession {
     this.itemState = new Map()
     /** @type {Map<string, string>} */
     this.lastDeltaByKey = new Map()
+
+    // Some Codex builds emit both:
+    //   1) a wrapped event stream (`codex/event/*`) and
+    //   2) direct v2-style notifications (`item/*`, `turn/*`, etc.)
+    // When both are present, tokenization can differ slightly and naive dedupe
+    // can still "double every token" (very confusing in the UI). Prefer one
+    // notification source per session.
+    /** @type {'direct'|'wrapped'|null} */
+    this.notificationMode = null
+    /** @type {Array<{ method: string, params: any }>} */
+    this.pendingWrappedNotifications = []
+    /** @type {any} */
+    this.pendingWrappedTimer = null
 
     this.rpc = new JsonRpcStdioClient({
       command: 'codex',
@@ -284,6 +345,25 @@ export class CodexAppServerSession {
     return false
   }
 
+  /**
+   * Best-effort suppression of duplicated reasoning chunks emitted back-to-back.
+   * Some Codex app-server builds emit both wrapped and unwrapped deltas, which
+   * can otherwise double every token (and is very confusing in the UI).
+   *
+   * @param {string} text
+   */
+  #shouldDropReasoningChunk(text) {
+    const t = String(text ?? '')
+    if (!t) return false
+    const now = Date.now()
+    const last = this.lastReasoningChunk
+    if (last && last.text === t && (now - Number(last.tsMs ?? 0)) < 500) {
+      return true
+    }
+    this.lastReasoningChunk = { text: t, tsMs: now }
+    return false
+  }
+
   nextSeq() {
     this.outputSeq += 1
     return this.outputSeq
@@ -309,6 +389,7 @@ export class CodexAppServerSession {
     const model = safeString(this.options?.model)
     const approvalPolicies = approvalPolicyCandidates(this.options?.approvalPolicy)
     const sandboxes = sandboxCandidates(this.options?.sandbox)
+    const reasoningEfforts = reasoningEffortCandidates(this.options?.reasoningEffort)
 
     /** @type {any} */
     let threadRes = null
@@ -322,21 +403,33 @@ export class CodexAppServerSession {
 
       for (const ap of approvalVals) {
         for (const sb of sandboxVals) {
-          paramVariants.push({
+          const baseA = {
             threadId,
             cwd: this.cwd,
             ...(model ? { model } : {}),
             ...(ap ? { approvalPolicy: ap } : {}),
             ...(sb ? { sandbox: sb } : {})
-          })
+          }
+          if (reasoningEfforts.length) {
+            for (const re of reasoningEfforts) {
+              for (const ro of reasoningParamObjects(re)) paramVariants.push({ ...baseA, ...ro })
+            }
+          }
+          paramVariants.push(baseA)
           // Older/alternate schema (best-effort): some builds used `id` instead of `threadId`.
-          paramVariants.push({
+          const baseB = {
             id: threadId,
             cwd: this.cwd,
             ...(model ? { model } : {}),
             ...(ap ? { approvalPolicy: ap } : {}),
             ...(sb ? { sandbox: sb } : {})
-          })
+          }
+          if (reasoningEfforts.length) {
+            for (const re of reasoningEfforts) {
+              for (const ro of reasoningParamObjects(re)) paramVariants.push({ ...baseB, ...ro })
+            }
+          }
+          paramVariants.push(baseB)
         }
       }
 
@@ -363,18 +456,31 @@ export class CodexAppServerSession {
       let lastErr = null
       for (const ap of approvalVals) {
         for (const sb of sandboxVals) {
-          try {
-            threadRes = await this.rpc.sendRequest('thread/start', {
+          const base = {
               ...(model ? { model } : {}),
               cwd: this.cwd,
               ...(ap ? { approvalPolicy: ap } : {}),
               ...(sb ? { sandbox: sb } : {})
-            })
-            startedOk = true
-            break
-          } catch (err) {
-            lastErr = err
           }
+
+          const attempts = []
+          if (reasoningEfforts.length) {
+            for (const re of reasoningEfforts) {
+              for (const ro of reasoningParamObjects(re)) attempts.push({ ...base, ...ro })
+            }
+          }
+          attempts.push(base)
+
+          for (const params of attempts) {
+            try {
+              threadRes = await this.rpc.sendRequest('thread/start', params)
+              startedOk = true
+              break
+            } catch (err) {
+              lastErr = err
+            }
+          }
+          if (startedOk) break
         }
         if (startedOk) break
       }
@@ -400,12 +506,13 @@ export class CodexAppServerSession {
 
   /**
    * Update the per-session Codex options (applied on the next `turn/start`).
-   * @param {{ model?: string|null, approvalPolicy?: string|null, sandbox?: string|null }} patch
+   * @param {{ model?: string|null, reasoningEffort?: string|null, approvalPolicy?: string|null, sandbox?: string|null }} patch
    */
   updateOptions(patch) {
     if (!patch || typeof patch !== 'object') return
     const next = { ...(this.options ?? {}) }
     if ('model' in patch) next.model = (typeof patch.model === 'string' && patch.model.trim()) ? patch.model.trim() : (patch.model ?? null)
+    if ('reasoningEffort' in patch) next.reasoningEffort = (typeof patch.reasoningEffort === 'string' && patch.reasoningEffort.trim()) ? patch.reasoningEffort.trim() : (patch.reasoningEffort ?? null)
     if ('approvalPolicy' in patch) next.approvalPolicy = (typeof patch.approvalPolicy === 'string' && patch.approvalPolicy.trim()) ? patch.approvalPolicy.trim() : (patch.approvalPolicy ?? null)
     if ('sandbox' in patch) next.sandbox = (typeof patch.sandbox === 'string' && patch.sandbox.trim()) ? patch.sandbox.trim() : (patch.sandbox ?? null)
     this.options = next
@@ -480,6 +587,7 @@ export class CodexAppServerSession {
     const approvalPolicies = approvalPolicyCandidates(this.options?.approvalPolicy)
     const sandboxes = sandboxCandidates(this.options?.sandbox)
     const sandboxPolicies = sandboxPolicyCandidates(this.options?.sandbox, this.cwd)
+    const reasoningEfforts = reasoningEffortCandidates(this.options?.reasoningEffort)
 
     const base = {
       threadId: this.threadId,
@@ -497,28 +605,46 @@ export class CodexAppServerSession {
     // Prefer the documented v2-style `sandboxPolicy`, but keep fallbacks for older schemas.
     for (const ap of approvalVals) {
       for (const sp of sandboxPolicyVals) {
-        attempts.push({
+        const params = {
           ...base,
           ...(model ? { model } : {}),
           ...(ap ? { approvalPolicy: ap } : {}),
           ...(sp ? { sandboxPolicy: sp } : {})
-        })
+        }
+        if (reasoningEfforts.length) {
+          for (const re of reasoningEfforts) {
+            for (const ro of reasoningParamObjects(re)) attempts.push({ ...params, ...ro })
+          }
+        }
+        attempts.push(params)
       }
       for (const sb of sandboxVals) {
-        attempts.push({
+        const params = {
           ...base,
           ...(model ? { model } : {}),
           ...(ap ? { approvalPolicy: ap } : {}),
           ...(sb ? { sandbox: sb } : {})
-        })
+        }
+        if (reasoningEfforts.length) {
+          for (const re of reasoningEfforts) {
+            for (const ro of reasoningParamObjects(re)) attempts.push({ ...params, ...ro })
+          }
+        }
+        attempts.push(params)
       }
     }
 
     // Final fallback: no per-turn overrides.
-    attempts.push({
+    const fallback = {
       ...base,
       ...(model ? { model } : {})
-    })
+    }
+    if (reasoningEfforts.length) {
+      for (const re of reasoningEfforts) {
+        for (const ro of reasoningParamObjects(re)) attempts.push({ ...fallback, ...ro })
+      }
+    }
+    attempts.push(fallback)
 
     const seen = new Set()
     const uniqueAttempts = []
@@ -548,6 +674,42 @@ export class CodexAppServerSession {
   #onNotification(msg) {
     const { method, params } = msg
 
+    // Decide whether to use wrapped or direct notifications (avoid duplicates).
+    const isWrapped = (typeof method === 'string' && method.startsWith('codex/event/'))
+    if (isWrapped) {
+      if (this.notificationMode === 'direct') return
+      if (!this.notificationMode) {
+        this.pendingWrappedNotifications.push(msg)
+        if (!this.pendingWrappedTimer) {
+          const t = setTimeout(() => {
+            // If we observed any direct notifications, the mode will already be set.
+            if (this.notificationMode) return
+            this.notificationMode = 'wrapped'
+            const queued = this.pendingWrappedNotifications
+            this.pendingWrappedNotifications = []
+            this.pendingWrappedTimer = null
+            for (const q of queued) this.#onNotification(q)
+          }, 150)
+          try { t.unref?.() } catch { }
+          this.pendingWrappedTimer = t
+        }
+        return
+      }
+    } else {
+      // Allow internal remapped notifications from the wrapped stream.
+      const fromWrapped = Boolean(params?.__rgFromWrapped)
+      if (!this.notificationMode) {
+        this.notificationMode = 'direct'
+        if (this.pendingWrappedTimer) {
+          try { clearTimeout(this.pendingWrappedTimer) } catch { }
+          this.pendingWrappedTimer = null
+        }
+        this.pendingWrappedNotifications = []
+      } else if (this.notificationMode === 'wrapped' && !fromWrapped) {
+        return
+      }
+    }
+
     // Some Codex builds emit a wrapped event stream under `codex/event/*` where the
     // real event discriminator lives in `params.msg.type`. Normalize a few common
     // ones back into the v2-style notification methods we already handle.
@@ -566,6 +728,7 @@ export class CodexAppServerSession {
         this.#onNotification({
           method: itemMethod,
           params: {
+            __rgFromWrapped: true,
             ...(item ? { item } : {}),
             ...(itemId ? { itemId } : {}),
             ...(threadId ? { threadId } : {}),
@@ -576,17 +739,17 @@ export class CodexAppServerSession {
       }
 
       if (msgType === 'task_started' && turnId) {
-        this.#onNotification({ method: 'turn/started', params: { turn: { id: turnId } } })
+        this.#onNotification({ method: 'turn/started', params: { __rgFromWrapped: true, turn: { id: turnId } } })
         return
       }
 
       if ((msgType === 'task_complete' || msgType === 'turn_complete') && turnId) {
-        this.#onNotification({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } })
+        this.#onNotification({ method: 'turn/completed', params: { __rgFromWrapped: true, turn: { id: turnId, status: 'completed' } } })
         return
       }
 
       if (msgType === 'turn_aborted' && turnId) {
-        this.#onNotification({ method: 'turn/completed', params: { turn: { id: turnId, status: 'interrupted' } } })
+        this.#onNotification({ method: 'turn/completed', params: { __rgFromWrapped: true, turn: { id: turnId, status: 'interrupted' } } })
         return
       }
 
@@ -594,7 +757,7 @@ export class CodexAppServerSession {
         const err = safeString(wrapped?.error ?? wrapped?.message ?? wrapped?.reason ?? wrapped?.error_message)
         this.#onNotification({
           method: 'turn/completed',
-          params: { turn: { id: turnId, status: 'failed', ...(err ? { error: { message: err } } : {}) } }
+          params: { __rgFromWrapped: true, turn: { id: turnId, status: 'failed', ...(err ? { error: { message: err } } : {}) } }
         })
         return
       }
@@ -603,7 +766,7 @@ export class CodexAppServerSession {
         const itemId = safeString(wrapped?.item_id ?? wrapped?.itemId ?? wrapped?.id) ?? 'agent-message'
         const delta = safeString(wrapped?.delta ?? wrapped?.text ?? wrapped?.message)
         if (!delta) return
-        this.#onNotification({ method: 'item/agentMessage/delta', params: { itemId, delta } })
+        this.#onNotification({ method: 'item/agentMessage/delta', params: { __rgFromWrapped: true, itemId, delta } })
         return
       }
 
@@ -615,6 +778,7 @@ export class CodexAppServerSession {
         this.#onNotification({
           method: 'item/reasoning/summaryTextDelta',
           params: {
+            __rgFromWrapped: true,
             itemId,
             delta,
             ...(Number.isFinite(Number(summaryIndex)) ? { summaryIndex: Number(summaryIndex) } : {})
@@ -629,6 +793,7 @@ export class CodexAppServerSession {
         this.#onNotification({
           method: 'item/reasoning/summaryPartAdded',
           params: {
+            __rgFromWrapped: true,
             itemId,
             ...(Number.isFinite(Number(summaryIndex)) ? { summaryIndex: Number(summaryIndex) } : {})
           }
@@ -651,14 +816,14 @@ export class CodexAppServerSession {
         const itemId = safeString(wrapped?.call_id ?? wrapped?.callId ?? wrapped?.item_id ?? wrapped?.itemId ?? wrapped?.id)
         const delta = safeString(wrapped?.delta ?? wrapped?.output ?? wrapped?.stdout ?? wrapped?.text)
         if (!itemId || !delta) return
-        this.#onNotification({ method: 'item/commandExecution/outputDelta', params: { itemId, delta } })
+        this.#onNotification({ method: 'item/commandExecution/outputDelta', params: { __rgFromWrapped: true, itemId, delta } })
         return
       }
 
       if (msgType === 'error') {
         const willRetry = Boolean(wrapped?.will_retry ?? wrapped?.willRetry)
         const message = safeString(wrapped?.message)
-        this.#onNotification({ method: 'error', params: { willRetry, message } })
+        this.#onNotification({ method: 'error', params: { __rgFromWrapped: true, willRetry, message } })
         return
       }
 
@@ -697,6 +862,10 @@ export class CodexAppServerSession {
       this.activeTurnId = nextTurnId ?? this.activeTurnId ?? null
       this.lastTurnStartedId = this.activeTurnId
       this.turnText = ''
+      this.lastNormalizedChunk = { text: null, tsMs: 0 }
+      this.lastReasoningChunk = { text: null, tsMs: 0 }
+      try { this.seenToolStarted.clear() } catch { }
+      try { this.seenToolCompleted.clear() } catch { }
       this.emit('turn.started', { sessionId: this.sessionId, ...(this.activeTurnId ? { turnId: this.activeTurnId } : {}) })
       return
     }
@@ -803,6 +972,7 @@ export class CodexAppServerSession {
       if (this.lastDeltaByKey.get(key) === '1') return
       this.lastDeltaByKey.set(key, '1')
 
+      if (this.#shouldDropReasoningChunk('\n\n')) return
       this.emit('session.output', {
         sessionId: this.sessionId,
         seq: this.nextSeq(),
@@ -826,6 +996,7 @@ export class CodexAppServerSession {
         const key = `reasoning:${itemId ?? ''}:${method}:${idx}`
         if (this.lastDeltaByKey.get(key) === text) return
         this.lastDeltaByKey.set(key, text)
+        if (this.#shouldDropReasoningChunk(text)) return
         this.emit('session.output', {
           sessionId: this.sessionId,
           seq: this.nextSeq(),
@@ -859,6 +1030,10 @@ export class CodexAppServerSession {
 
     if (method === 'item/commandExecution/outputDelta') {
       const itemId = params?.itemId ?? params?.item?.id ?? null
+      if (itemId) {
+        const prev = this.itemState.get(itemId) ?? { sawDelta: false }
+        this.itemState.set(itemId, { ...prev, sawDelta: true })
+      }
       const text = tryExtractDeltaText(params)
       if (text) {
         const key = `cmd:${itemId ?? ''}`
@@ -878,6 +1053,10 @@ export class CodexAppServerSession {
 
     if (method === 'item/fileChange/outputDelta') {
       const itemId = params?.itemId ?? params?.item?.id ?? null
+      if (itemId) {
+        const prev = this.itemState.get(itemId) ?? { sawDelta: false }
+        this.itemState.set(itemId, { ...prev, sawDelta: true })
+      }
       const text = tryExtractDeltaText(params)
       if (text) {
         const key = `patch:${itemId ?? ''}`
@@ -916,6 +1095,9 @@ export class CodexAppServerSession {
       if (!type || !itemId) return
 
       if (type === 'commandexecution') {
+        const key = `commandexecution:${itemId}`
+        if (this.seenToolStarted.has(key)) return
+        this.seenToolStarted.add(key)
         this.emit('tool.started', {
           sessionId: this.sessionId,
           tool: 'commandExecution',
@@ -928,6 +1110,9 @@ export class CodexAppServerSession {
       }
 
       if (type === 'filechange') {
+        const key = `filechange:${itemId}`
+        if (this.seenToolStarted.has(key)) return
+        this.seenToolStarted.add(key)
         this.emit('tool.started', {
           sessionId: this.sessionId,
           tool: 'fileChange',
@@ -967,6 +1152,7 @@ export class CodexAppServerSession {
         if (!sawDelta) {
           const text = tryExtractReasoningText(item)
           if (text) {
+            if (this.#shouldDropReasoningChunk(text)) return
             this.emit('session.output', {
               sessionId: this.sessionId,
               seq: this.nextSeq(),
@@ -993,26 +1179,42 @@ export class CodexAppServerSession {
       }
 
       if (type === 'commandexecution') {
+        const tid = safeString(itemId)
+        const sawOutput = tid ? (this.itemState.get(tid)?.sawDelta ?? false) : false
+        const key = tid ? `commandexecution:${tid}` : null
+        if (key) {
+          if (this.seenToolCompleted.has(key)) return
+          this.seenToolCompleted.add(key)
+        }
         this.emit('tool.completed', {
           sessionId: this.sessionId,
           tool: 'commandExecution',
-          itemId: safeString(itemId),
+          itemId: tid,
           command: item.command,
           cwd: item.cwd,
           commandActions: item.commandActions ?? null,
           status: item.status ?? null,
           exitCode: item.exitCode ?? null,
+          hadOutput: sawOutput,
           durationMs: item.durationMs ?? null
         })
       }
 
       if (type === 'filechange') {
+        const tid = safeString(itemId)
+        const sawOutput = tid ? (this.itemState.get(tid)?.sawDelta ?? false) : false
+        const key = tid ? `filechange:${tid}` : null
+        if (key) {
+          if (this.seenToolCompleted.has(key)) return
+          this.seenToolCompleted.add(key)
+        }
         this.emit('tool.completed', {
           sessionId: this.sessionId,
           tool: 'fileChange',
-          itemId: safeString(itemId),
+          itemId: tid,
           changes: minimizeFileChanges(item.changes),
-          status: item.status ?? null
+          status: item.status ?? null,
+          hadOutput: sawOutput
         })
       }
       return

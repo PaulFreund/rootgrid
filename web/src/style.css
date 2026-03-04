@@ -3,7 +3,7 @@
 @tailwind utilities;
 
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 }
 
 html,
@@ -13,17 +13,14 @@ body {
 
 body {
   margin: 0;
-  background:
-    radial-gradient(1200px 800px at 20% -10%, rgba(99, 102, 241, 0.22), transparent 60%),
-    radial-gradient(900px 650px at 85% 0%, rgba(14, 165, 233, 0.14), transparent 55%),
-    #0b0f16;
-  color: #e5e7eb; /* gray-200 */
+  background: #f8fafc; /* slate-50 */
+  color: #0f172a; /* slate-900 */
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
     "Segoe UI Emoji";
 }
 
 * {
-  scrollbar-color: #334155 transparent; /* slate-700 */
+  scrollbar-color: #cbd5e1 transparent; /* slate-300 */
 }
 
 *::-webkit-scrollbar {
@@ -32,7 +29,7 @@ body {
 }
 
 *::-webkit-scrollbar-thumb {
-  background-color: rgba(51, 65, 85, 0.9); /* slate-700 */
+  background-color: rgba(148, 163, 184, 0.9); /* slate-400 */
   border: 2px solid transparent;
   border-radius: 999px;
   background-clip: content-box;
@@ -43,12 +40,12 @@ body {
 }
 
 ::selection {
-  background: rgba(99, 102, 241, 0.35); /* indigo-500 */
+  background: rgba(99, 102, 241, 0.2); /* indigo-500 */
 }
 
 @layer components {
   .rg-prose {
-    @apply prose prose-invert max-w-none;
+    @apply prose prose-slate max-w-none;
   }
 
   .rg-prose :where(pre):not(:where(.not-prose *)) {
@@ -56,11 +53,11 @@ body {
   }
 
   .rg-codeblock {
-    @apply my-3 overflow-hidden rounded-lg border border-slate-800 bg-slate-950/60;
+    @apply my-3 overflow-hidden rounded-lg border border-slate-200 bg-slate-50;
   }
 
   .rg-codeblock__header {
-    @apply flex items-center justify-between gap-3 border-b border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-400;
+    @apply flex items-center justify-between gap-3 border-b border-slate-200 bg-white px-3 py-2 text-xs text-slate-500;
   }
 
   .rg-codeblock__lang {
@@ -68,7 +65,7 @@ body {
   }
 
   .rg-codeblock__copy {
-    @apply rounded-md bg-slate-200/10 px-2 py-1 text-xs text-slate-200 hover:bg-slate-200/15;
+    @apply rounded-md bg-slate-100 px-2 py-1 text-xs text-slate-700 hover:bg-slate-200;
   }
 
   .rg-codeblock pre {
@@ -76,7 +73,7 @@ body {
   }
 
   .rg-codeblock code {
-    @apply font-mono text-slate-100;
+    @apply font-mono text-slate-900;
   }
 }
 

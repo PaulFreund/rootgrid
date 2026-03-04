@@ -1,6 +1,9 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { VitePWA } from 'vite-plugin-pwa'
+import os from 'node:os';
+
+const isWSL = Boolean(process.env.WSL_DISTRO_NAME) || os.release().toLowerCase().includes('microsoft');
 
 export default defineConfig({
   plugins: [
@@ -14,8 +17,8 @@ export default defineConfig({
         name: 'Rootgrid',
         short_name: 'Rootgrid',
         description: 'Local-first web UI for driving Codex via codex app-server',
-        theme_color: '#0b0f16',
-        background_color: '#0b0f16',
+        theme_color: '#ffffff',
+        background_color: '#f8fafc',
         display: 'standalone',
         icons: [
           {
@@ -29,6 +32,12 @@ export default defineConfig({
     })
   ],
   server: {
+    host: '0.0.0.0',
+    // On WSL or network filesystems, native file watch events may not fire; fall back to polling.
+    watch: {
+      usePolling: isWSL || process.env.CHOKIDAR_USEPOLLING === '1',
+      interval: 200
+    },
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:7337',

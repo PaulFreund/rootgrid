@@ -61,7 +61,16 @@ export function createRunnerWsServer({ config, store, sse, onApprovalRequest = n
         }
         connections.set(machineId, ws)
         ws.once('close', () => {
-          if (connections.get(machineId) === ws) connections.delete(machineId)
+          const active = connections.get(machineId) === ws
+          if (active) connections.delete(machineId)
+          if (active) {
+            // Notify UI that the runner disconnected (ephemeral connection status).
+            sse.send(makeEnvelope({
+              type: 'registry.machine.upsert',
+              scope: { machineId },
+              payload: { machineId, connected: false }
+            }))
+          }
         })
 
         ws.send(JSON.stringify(makeEnvelope({
@@ -77,7 +86,7 @@ export function createRunnerWsServer({ config, store, sse, onApprovalRequest = n
         sse.send(makeEnvelope({
           type: 'registry.machine.upsert',
           scope: { machineId },
-          payload: { machineId, machineName, platform, lastSeenMs: Date.now(), capabilities }
+          payload: { machineId, machineName, platform, lastSeenMs: Date.now(), capabilities, connected: true }
         }))
 
         return
@@ -91,7 +100,7 @@ export function createRunnerWsServer({ config, store, sse, onApprovalRequest = n
         sse.send(makeEnvelope({
           type: 'registry.machine.upsert',
           scope: { machineId: state.machineId },
-          payload: { machineId: state.machineId, lastSeenMs: now }
+          payload: { machineId: state.machineId, lastSeenMs: now, connected: true }
         }))
         if (typeof msg.seq === 'number') {
           try {
@@ -201,5 +210,12 @@ export function createRunnerWsServer({ config, store, sse, onApprovalRequest = n
     return Array.from(connections.keys())
   }
 
-  return { wss, sendToMachine, listConnectedMachineIds }
+  function disconnectMachine(machineId, { code = 4001, reason = 'disconnected by host' } = {}) {
+    const ws = connections.get(machineId)
+    if (!ws) return false
+    try { ws.close(code, reason) } catch { }
+    return true
+  }
+
+  return { wss, sendToMachine, listConnectedMachineIds, disconnectMachine }
 }

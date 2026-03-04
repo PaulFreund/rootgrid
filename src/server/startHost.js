@@ -40,6 +40,8 @@ export async function startHost({ config }) {
   const ideSessions = new Map() // ideId -> { machineId, cwd, port, basePath }
   const pendingIdeStarts = new Map() // ideId -> { resolve, reject, timer }
   const pendingUploads = new Map() // uploadId -> { resolve, reject, timer }
+  const pendingFsLists = new Map() // requestId -> { resolve, reject, timer }
+  const pendingModelLists = new Map() // requestId -> { resolve, reject, timer }
 
   const tunnelHub = new TunnelHub()
 
@@ -90,6 +92,38 @@ export async function startHost({ config }) {
           pendingUploads.delete(uploadId)
           clearTimeout(pending.timer)
           pending.reject(new Error(msg.payload?.error ?? 'upload failed'))
+        }
+        return
+      }
+
+      if (msg?.type === 'fs.list.result') {
+        const requestId = msg.payload?.requestId
+        if (!requestId) return
+        const pending = pendingFsLists.get(requestId)
+        if (pending) {
+          pendingFsLists.delete(requestId)
+          clearTimeout(pending.timer)
+          if (msg.payload?.ok === false) {
+            pending.reject(new Error(msg.payload?.error ?? 'fs list failed'))
+          } else {
+            pending.resolve(msg.payload)
+          }
+        }
+        return
+      }
+
+      if (msg?.type === 'codex.model.list.result') {
+        const requestId = msg.payload?.requestId
+        if (!requestId) return
+        const pending = pendingModelLists.get(requestId)
+        if (pending) {
+          pendingModelLists.delete(requestId)
+          clearTimeout(pending.timer)
+          if (msg.payload?.ok === false) {
+            pending.reject(new Error(msg.payload?.error ?? 'model list failed'))
+          } else {
+            pending.resolve(msg.payload)
+          }
         }
         return
       }
@@ -357,6 +391,66 @@ export async function startHost({ config }) {
     return await uploadedP
   }
 
+  async function fsListOnRunner({ machineId, path }) {
+    const requestId = crypto.randomUUID()
+    const resultP = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingFsLists.delete(requestId)
+        reject(httpError(504, 'timeout listing directory'))
+      }, 10_000)
+      pendingFsLists.set(requestId, { resolve, reject, timer })
+    })
+
+    const ok = runnerWs.sendToMachine(machineId, makeEnvelope({
+      type: 'fs.list',
+      scope: { machineId },
+      payload: { requestId, path: String(path ?? '') }
+    }))
+    if (!ok) {
+      pendingFsLists.delete(requestId)
+      throw httpError(503, 'runner not connected')
+    }
+
+    const payload = await resultP
+    return {
+      path: payload?.path ?? '',
+      parent: payload?.parent ?? null,
+      entries: Array.isArray(payload?.entries) ? payload.entries : []
+    }
+  }
+
+  async function codexModelListOnRunner({ machineId, cwd = '', limit = 200, includeHidden = false }) {
+    const requestId = crypto.randomUUID()
+    const resultP = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingModelLists.delete(requestId)
+        reject(httpError(504, 'timeout listing models'))
+      }, 20_000)
+      pendingModelLists.set(requestId, { resolve, reject, timer })
+    })
+
+    const ok = runnerWs.sendToMachine(machineId, makeEnvelope({
+      type: 'codex.model.list',
+      scope: { machineId },
+      payload: {
+        requestId,
+        cwd: String(cwd ?? ''),
+        limit: Number(limit) || 200,
+        includeHidden: Boolean(includeHidden)
+      }
+    }))
+    if (!ok) {
+      pendingModelLists.delete(requestId)
+      throw httpError(503, 'runner not connected')
+    }
+
+    const payload = await resultP
+    return {
+      models: Array.isArray(payload?.models) ? payload.models : [],
+      nextCursor: (payload?.nextCursor === null || payload?.nextCursor === undefined) ? null : String(payload.nextCursor)
+    }
+  }
+
   async function storeHostUpload({ sessionId, uploadId, filename, contentBase64 }) {
     const dir = join(getUploadsDir(), sessionId)
     await mkdir(dir, { recursive: true, mode: 0o700 })
@@ -498,6 +592,7 @@ export async function startHost({ config }) {
         res.write('\n')
 
         // Send an initial snapshot so the UI can render immediately.
+        const connectedMachineIds = new Set(runnerWs.listConnectedMachineIds())
         res.write(`data: ${JSON.stringify({
           v: 1,
           type: 'registry.snapshot',
@@ -506,7 +601,7 @@ export async function startHost({ config }) {
           scope: null,
           payload: {
             connectionId,
-            machines: store.listMachines(),
+            machines: store.listMachines().map((m) => ({ ...m, connected: connectedMachineIds.has(m.machineId) })),
             sessions: store.listSessions(),
             approvals: store.listApprovals().map((a) => a.payload)
           }
@@ -568,7 +663,101 @@ export async function startHost({ config }) {
 
       if (url.pathname === '/api/machines' && req.method === 'GET') {
         if (!auth.requireAuth(req, res)) return
-        return json(res, 200, { machines: store.listMachines() })
+        const connectedMachineIds = new Set(runnerWs.listConnectedMachineIds())
+        return json(res, 200, { machines: store.listMachines().map((m) => ({ ...m, connected: connectedMachineIds.has(m.machineId) })) })
+      }
+
+      if (parts[0] === 'api' && parts[1] === 'machines' && parts.length === 3 && parts[2] && req.method === 'DELETE') {
+        if (!auth.requireAuth(req, res)) return
+        const machineId = parts[2]
+        const machine = store.getMachine(machineId)
+        if (!machine) return json(res, 404, { error: 'not found' })
+
+        // To make deletion predictable, require the runner to be disconnected;
+        // otherwise machine.alive messages can re-create the UI state immediately.
+        if (runnerWs.listConnectedMachineIds().includes(machineId)) {
+          return json(res, 409, { error: 'machine is currently connected; disconnect the runner before deleting' })
+        }
+
+        let sessionIds = []
+        let uploadPaths = []
+        try { sessionIds = store.listSessionIdsByMachine(machineId) } catch {}
+        try { uploadPaths = store.listUploadHostPathsByMachine(machineId) } catch {}
+
+        // Remove any pending approval routing entries for this machine.
+        for (const [approvalId, route] of approvals.entries()) {
+          if (route?.machineId === machineId) approvals.delete(approvalId)
+        }
+
+        const ok = store.deleteMachine(machineId)
+        if (!ok) return json(res, 404, { error: 'not found' })
+
+        // Notify UI clients: session deletions + machine deletion.
+        for (const sessionId of sessionIds) {
+          sse.send(makeEnvelope({
+            type: 'registry.session.delete',
+            scope: { machineId, sessionId },
+            payload: { sessionId }
+          }))
+        }
+        sse.send(makeEnvelope({
+          type: 'registry.machine.delete',
+          scope: { machineId },
+          payload: { machineId }
+        }))
+
+        // Best-effort file removal (ignore missing).
+        for (const p of uploadPaths) {
+          if (!p || typeof p !== 'string') continue
+          try { rmSync(p, { force: true }) } catch { }
+        }
+
+        return json(res, 200, { ok: true, machineId, deletedSessions: sessionIds.length })
+      }
+
+      if (parts[0] === 'api' && parts[1] === 'machines' && parts[2] && parts[3] === 'disconnect' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return
+        const machineId = parts[2]
+        if (!runnerWs.listConnectedMachineIds().includes(machineId)) return json(res, 404, { error: 'runner not connected' })
+        const ok = runnerWs.disconnectMachine(machineId)
+        if (!ok) return json(res, 404, { error: 'runner not connected' })
+        return json(res, 200, { ok: true })
+      }
+
+      if (url.pathname === '/api/fs/list' && req.method === 'GET') {
+        if (!auth.requireAuth(req, res)) return
+        const machineId = url.searchParams.get('machineId')
+        if (!machineId || typeof machineId !== 'string') return json(res, 400, { error: 'machineId is required' })
+        if (!runnerWs.listConnectedMachineIds().includes(machineId)) return json(res, 503, { error: 'runner not connected' })
+        const path = url.searchParams.get('path') ?? ''
+        try {
+          const out = await fsListOnRunner({ machineId, path })
+          return json(res, 200, out)
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          return json(res, code, { error: String(err?.message ?? err) })
+        }
+      }
+
+      if (url.pathname === '/api/models' && req.method === 'GET') {
+        if (!auth.requireAuth(req, res)) return
+        const preferredMachineId = url.searchParams.get('machineId')
+        const machineId = pickMachineId((typeof preferredMachineId === 'string' && preferredMachineId.trim()) ? preferredMachineId.trim() : null)
+        if (!machineId) return json(res, 503, { error: 'no runner connected' })
+
+        const cwd = url.searchParams.get('cwd') ?? ''
+        const limitRaw = url.searchParams.get('limit')
+        const includeHiddenRaw = url.searchParams.get('includeHidden')
+        const limit = (limitRaw === null || limitRaw === undefined) ? 200 : Number(limitRaw)
+        const includeHidden = (includeHiddenRaw === '1' || includeHiddenRaw === 'true')
+
+        try {
+          const out = await codexModelListOnRunner({ machineId, cwd, limit, includeHidden })
+          return json(res, 200, { machineId, ...out })
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          return json(res, code, { error: String(err?.message ?? err) })
+        }
       }
 
       if (url.pathname === '/api/sessions' && req.method === 'GET') {
@@ -855,6 +1044,7 @@ export async function startHost({ config }) {
 
         const options = {
           ...(session.model ? { model: session.model } : {}),
+          ...(session.reasoningEffort ? { reasoningEffort: session.reasoningEffort } : {}),
           ...(session.approvalPolicy ? { approvalPolicy: session.approvalPolicy } : {}),
           ...(session.sandbox ? { sandbox: session.sandbox } : {})
         }
@@ -978,8 +1168,9 @@ export async function startHost({ config }) {
         const approvalPolicyRaw = patch?.approvalPolicy
         const sandboxRaw = patch?.sandbox
         const modelRaw = patch?.model
+        const reasoningEffortRaw = patch?.reasoningEffort
 
-        if (approvalPolicyRaw === undefined && sandboxRaw === undefined && modelRaw === undefined) {
+        if (approvalPolicyRaw === undefined && sandboxRaw === undefined && modelRaw === undefined && reasoningEffortRaw === undefined) {
           return json(res, 400, { error: 'at least one option is required' })
         }
 
@@ -987,6 +1178,11 @@ export async function startHost({ config }) {
           ? modelRaw
           : (typeof modelRaw === 'string' ? modelRaw.trim() : '__invalid__')
         if (model === '__invalid__') return json(res, 400, { error: 'model must be a string or null' })
+
+        const reasoningEffort = (reasoningEffortRaw === null || reasoningEffortRaw === undefined)
+          ? reasoningEffortRaw
+          : (typeof reasoningEffortRaw === 'string' ? reasoningEffortRaw.trim() : '__invalid__')
+        if (reasoningEffort === '__invalid__') return json(res, 400, { error: 'reasoningEffort must be a string or null' })
 
         const approvalPolicy = (approvalPolicyRaw === null || approvalPolicyRaw === undefined)
           ? approvalPolicyRaw
@@ -1001,6 +1197,7 @@ export async function startHost({ config }) {
         store.updateSession({
           sessionId,
           ...(modelRaw !== undefined ? { model: model || null } : {}),
+          ...(reasoningEffortRaw !== undefined ? { reasoningEffort: reasoningEffort || null } : {}),
           ...(approvalPolicyRaw !== undefined ? { approvalPolicy: approvalPolicy || null } : {}),
           ...(sandboxRaw !== undefined ? { sandbox: sandbox || null } : {})
         })
@@ -1021,6 +1218,7 @@ export async function startHost({ config }) {
             sessionId,
             options: {
               ...(modelRaw !== undefined ? { model: model || null } : {}),
+              ...(reasoningEffortRaw !== undefined ? { reasoningEffort: reasoningEffort || null } : {}),
               ...(approvalPolicyRaw !== undefined ? { approvalPolicy: approvalPolicy || null } : {}),
               ...(sandboxRaw !== undefined ? { sandbox: sandbox || null } : {})
             }

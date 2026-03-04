@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Archive, ArrowDown, Code, Loader2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Paperclip, Plus, Send, Settings, Square, Trash2, X } from 'lucide-vue-next'
+import { Archive, ArrowDown, Code, Copy, Loader2, PanelRightClose, PanelRightOpen, Plus, Send, Settings, Square, Trash2, X } from 'lucide-vue-next'
 
 import MarkdownView from './components/MarkdownView.vue'
 
@@ -26,6 +26,25 @@ const selectedSessionId = ref(null)
 const hasSnapshot = ref(false)
 
 const visibleSessions = computed(() => sessions.value.filter((s) => !s?.archivedMs))
+
+const newThreadRecentWorkspaces = computed(() => {
+  const mid = String(newThreadMachineId.value ?? '').trim()
+  const rows = sessions.value
+    .filter((s) => !s?.archivedMs && (!mid || s.machineId === mid))
+    .slice()
+    .sort((a, b) => Number(b?.updatedMs ?? 0) - Number(a?.updatedMs ?? 0))
+
+  const seen = new Set()
+  const out = []
+  for (const s of rows) {
+    const cwd = String(s?.cwd ?? '').trim()
+    if (!cwd || seen.has(cwd)) continue
+    seen.add(cwd)
+    out.push({ cwd, label: sessionProject(s) })
+    if (out.length >= 10) break
+  }
+  return out
+})
 
 const composerDragging = ref(false)
 let composerDragDepth = 0
@@ -73,11 +92,59 @@ const defaults = reactive({
   cwd: '',
   machineId: '',
   model: '',
+  reasoningEffort: '',
   approvalPolicy: 'on-request',
   sandbox: 'workspace-write'
 })
 
+// New thread dialog (Codex-style "pick machine + workspace" before starting).
+const newThreadOpen = ref(false)
+const newThreadMachineId = ref('')
+const newThreadCwd = ref('')
+const newThreadError = ref('')
+
+const newThreadBrowseOpen = ref(false)
+const newThreadBrowsePath = ref('')
+const newThreadBrowseParent = ref(null)
+const newThreadBrowseEntries = ref([]) // [{ name, path, kind }]
+const newThreadBrowseLoading = ref(false)
+const newThreadBrowseError = ref('')
+
 const settingsTab = ref('defaults') // defaults|machines|system
+
+const machinesForSelect = computed(() => {
+  return machines.value
+    .slice()
+    .sort((a, b) => {
+      const ao = machineIsOnline(a) ? 1 : 0
+      const bo = machineIsOnline(b) ? 1 : 0
+      if (ao !== bo) return bo - ao
+      return Number(b?.lastSeenMs ?? 0) - Number(a?.lastSeenMs ?? 0)
+    })
+})
+
+const newThreadSelectedMachine = computed(() => {
+  const mid = String(newThreadMachineId.value ?? '').trim()
+  if (!mid) return null
+  return machines.value.find((m) => m?.machineId === mid) ?? null
+})
+
+const newThreadSelectedMachineOnline = computed(() => {
+  const m = newThreadSelectedMachine.value
+  return m ? machineIsOnline(m) : false
+})
+
+const defaultsSelectedMachine = computed(() => {
+  const mid = String(defaults.machineId ?? '').trim()
+  if (!mid) return null
+  return machines.value.find((m) => m?.machineId === mid) ?? null
+})
+
+const deleteMachineRow = computed(() => {
+  const mid = String(deleteMachineId.value ?? '').trim()
+  if (!mid) return null
+  return machines.value.find((m) => m?.machineId === mid) ?? null
+})
 
 const appSettingsLoaded = ref(false)
 const appSettingsError = ref('')
@@ -112,13 +179,10 @@ const ideError = ref('')
 const sending = ref(false)
 const ideStarting = ref(false)
 
-const showDiff = ref(false)
 const showPlan = ref(false)
 
 const chatScrollEl = ref(null)
 const stickToBottom = ref(true)
-
-const sidebarCollapsed = ref(false)
 
 // Toast notifications delivered via SSE (host-generated).
 const toasts = ref([]) // [{ id, level, title, message, sessionId?, stickyUntilVisible? }]
@@ -147,6 +211,14 @@ const deleteSessionId = ref(null)
 const deleteWorking = ref(false)
 const deleteError = ref('')
 
+const deleteMachineOpen = ref(false)
+const deleteMachineId = ref(null)
+const deleteMachineWorking = ref(false)
+const deleteMachineError = ref('')
+
+const machineDisconnectWorkingId = ref(null)
+const machineDisconnectError = ref('')
+
 let markReadTimer = null
 const sessionLoading = ref(false)
 let loadSessionNonce = 0
@@ -162,12 +234,14 @@ function getSessionStore(sessionId) {
       diff: '',
       plan: null,
       planExplanation: null,
+      lastReasoningChunk: { text: null, tsMs: 0 },
       seen: new Set(),
       hasMoreBefore: true,
       nextBeforeSeq: null,
       loadingBefore: false,
       toolOutputByItemId: new Map(), // itemId -> { stdout, stderr, loaded, loading, hasMoreBefore, nextBeforeSeq }
-      toolExpanded: new Map() // itemId -> boolean
+      toolExpanded: new Map(), // itemId -> boolean
+      diffSelectedFileByEventId: new Map() // diffEventId -> path
     })
     sessionStores.set(sessionId, store)
   }
@@ -193,6 +267,29 @@ function bumpSessionToTop(sessionId) {
   if (idx <= 0) return
   const [row] = sessions.value.splice(idx, 1)
   sessions.value.unshift(row)
+}
+
+function removeMachineLocal(machineId) {
+  const mid = String(machineId ?? '').trim()
+  if (!mid) return
+
+  // Drop sessions first (also clears any selected view + cached stores).
+  for (let i = sessions.value.length - 1; i >= 0; i--) {
+    const s = sessions.value[i]
+    if (s?.machineId !== mid) continue
+    const sid = s?.sessionId
+    sessions.value.splice(i, 1)
+    if (sid) {
+      if (selectedSessionId.value === sid) selectedSessionId.value = null
+      try { sessionStores.delete(sid) } catch {}
+    }
+  }
+
+  const midx = machines.value.findIndex((m) => m?.machineId === mid)
+  if (midx >= 0) machines.value.splice(midx, 1)
+
+  if (defaults.machineId === mid) defaults.machineId = ''
+  if (newThreadMachineId.value === mid) newThreadMachineId.value = machinesForSelect.value[0]?.machineId ?? ''
 }
 
 function basenamePath(input) {
@@ -357,10 +454,10 @@ async function requestNotificationPermission() {
 
 function toastBorderClass(level) {
   const l = String(level ?? '')
-  if (l === 'error') return 'border-red-500/30 bg-red-500/10'
-  if (l === 'warning') return 'border-amber-500/30 bg-amber-500/10'
-  if (l === 'success') return 'border-emerald-500/30 bg-emerald-500/10'
-  return 'border-slate-800 bg-slate-950/70'
+  if (l === 'error') return 'border-red-200 bg-red-50'
+  if (l === 'warning') return 'border-amber-200 bg-amber-50'
+  if (l === 'success') return 'border-emerald-200 bg-emerald-50'
+  return 'border-slate-200 bg-white'
 }
 
 function dismissToast(id) {
@@ -534,6 +631,26 @@ function formatAgo(ts) {
   return `${day}d ago`
 }
 
+function formatAgeShort(ts) {
+  const ms = Number(ts ?? 0)
+  if (!Number.isFinite(ms) || ms <= 0) return '—'
+  const delta = Math.max(0, nowMs.value - ms)
+  const sec = Math.floor(delta / 1000)
+  if (sec < 60) return `${sec}s`
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min}m`
+  const hr = Math.floor(min / 60)
+  if (hr < 24) return `${hr}h`
+  const day = Math.floor(hr / 24)
+  if (day < 14) return `${day}d`
+  const wk = Math.floor(day / 7)
+  if (wk < 9) return `${wk}w`
+  const mo = Math.floor(day / 30)
+  if (mo < 24) return `${mo}mo`
+  const yr = Math.floor(day / 365)
+  return `${yr}y`
+}
+
 function formatCompactInt(value) {
   const n = Number(value ?? 0)
   if (!Number.isFinite(n)) return '—'
@@ -590,9 +707,24 @@ function maybeUpdateTokenUsage(sessionId, payload) {
 }
 
 function machineIsOnline(m) {
+  if (typeof m?.connected === 'boolean') return m.connected
   const last = Number(m?.lastSeenMs ?? 0)
   if (!Number.isFinite(last) || last <= 0) return false
   return (nowMs.value - last) < 45_000
+}
+
+function machineShowLastSeen(m) {
+  if (!m || machineIsOnline(m)) return false
+  const last = Number(m?.lastSeenMs ?? 0)
+  if (!Number.isFinite(last) || last <= 0) return false
+  return (nowMs.value - last) >= 5 * 60_000
+}
+
+function machineStatusLabel(m) {
+  if (!m) return ''
+  if (machineIsOnline(m)) return 'online'
+  if (machineShowLastSeen(m)) return `last seen ${formatAgo(m.lastSeenMs)}`
+  return 'offline'
 }
 
 async function markSessionRead(sessionId) {
@@ -874,6 +1006,33 @@ function appendCapped(prev, delta, cap = 200_000) {
   return next.slice(next.length - cap)
 }
 
+function shouldDropReasoningChunk(store, text) {
+  const t = String(text ?? '')
+  if (!t) return true
+  const now = Date.now()
+  const last = store?.lastReasoningChunk ?? null
+  if (last && last.text === t && (now - Number(last.tsMs ?? 0)) < 500) return true
+  if (store) store.lastReasoningChunk = { text: t, tsMs: now }
+  return false
+}
+
+function toolOutputHasMeaningfulText(output) {
+  if (!output) return false
+  const stdout = String(output?.stdout ?? '')
+  const stderr = String(output?.stderr ?? '')
+  const combined = `${stdout}\n${stderr}`.trim()
+  if (!combined) return false
+
+  const lines = combined.split(/\r?\n/).map((l) => String(l ?? '').trim()).filter(Boolean)
+  if (!lines.length) return false
+
+  // Ignore Codex internal "terminal interaction" markers (not useful to users).
+  const allInternal = lines.every((l) => l.startsWith('[codex] terminal interaction'))
+  if (allInternal) return false
+
+  return true
+}
+
 function getToolOutputState(store, itemId) {
   const key = String(itemId ?? '')
   if (!key) return null
@@ -978,6 +1137,30 @@ function toggleToolExpanded(itemId) {
   if (next) ensureToolOutputLoaded(sid, key).catch(() => {})
 }
 
+function onToolDetailsToggle(itemId, ev) {
+  const sid = selectedSessionId.value
+  if (!sid || !itemId) return
+  const open = Boolean(ev?.target?.open)
+  const store = getSessionStore(sid)
+  const key = String(itemId)
+  const current = Boolean(store.toolExpanded.get(key))
+  if (current === open) return
+  store.toolExpanded.set(key, open)
+  if (open) ensureToolOutputLoaded(sid, key).catch(() => {})
+}
+
+function toolDisplayCommand(m) {
+  const actions = Array.isArray(m?.commandActions) ? m.commandActions : null
+  if (actions) {
+    for (const a of actions) {
+      const c = (a && typeof a === 'object' && typeof a.command === 'string') ? a.command.trim() : ''
+      if (c) return c
+    }
+  }
+  const cmd = String(m?.command ?? '').trim()
+  return cmd
+}
+
 function handleEnvelope(env) {
   if (!env || typeof env.type !== 'string') return
 
@@ -1016,6 +1199,12 @@ function handleEnvelope(env) {
 
   if (env.type === 'registry.machine.upsert') {
     upsertById(machines.value, 'machineId', env.payload)
+    return
+  }
+
+  if (env.type === 'registry.machine.delete') {
+    const mid = env.payload?.machineId ?? env.scope?.machineId
+    if (mid) removeMachineLocal(mid)
     return
   }
 
@@ -1103,6 +1292,11 @@ function handleEnvelope(env) {
   }
 
   if (selectedSessionId.value === sessionId) {
+    if (env.type === 'turn.started') {
+      const store = getSessionStore(sessionId)
+      store.lastReasoningChunk = { text: null, tsMs: 0 }
+    }
+
     // Compact history view: keep big events in the main list; route tool output
     // streams into per-item buffers that can be expanded on demand.
     if (env.type === 'session.output') {
@@ -1113,10 +1307,13 @@ function handleEnvelope(env) {
         appendToolOutput(sessionId, String(itemId), stream, String(text ?? ''))
         return
       }
-      if (stream === 'reasoning' || stream === 'plan') {
-        // These can be extremely chatty; keep them out of the main feed for now.
-        return
+      if (stream === 'reasoning') {
+        const store = getSessionStore(sessionId)
+        const chunk = String(text ?? '')
+        if (shouldDropReasoningChunk(store, chunk)) return
+        // Fall through: reasoning is rendered as interleaved "step lines" in the timeline.
       }
+      if (stream === 'plan') return
     }
 
     addSessionEvent(sessionId, {
@@ -1144,14 +1341,19 @@ async function loadSession(sessionId) {
     store.diff = ''
     store.plan = null
     store.planExplanation = null
+    store.lastReasoningChunk = { text: null, tsMs: 0 }
     store.hasMoreBefore = true
     store.nextBeforeSeq = null
     store.loadingBefore = false
     store.toolOutputByItemId.clear()
     store.toolExpanded.clear()
+    try { store.diffSelectedFileByEventId?.clear?.() } catch {}
 
     // Load the newest page (summary/"big events" mode).
-    const pageRes = await apiFetch(`/api/sessions/${sessionId}/events?mode=summary&limit=200`)
+    // Summary mode now includes reasoning; bump the initial page size so we
+    // reliably include the triggering user message + tool steps (reasoning can
+    // be chunked into many events).
+    const pageRes = await apiFetch(`/api/sessions/${sessionId}/events?mode=summary&limit=2000`)
     if (!pageRes.ok) return
     const page = await pageRes.json().catch(() => null)
     if (nonce !== loadSessionNonce) return
@@ -1159,17 +1361,32 @@ async function loadSession(sessionId) {
     for (const e of events) addSessionEvent(sessionId, e, { atStart: false, applyDerived: true })
     store.hasMoreBefore = Boolean(page?.hasMoreBefore)
     store.nextBeforeSeq = page?.nextBeforeSeq ?? null
+
+    // Cache a few pages back so streamed reasoning headlines aren't cut mid-line.
+    await loadMoreBefore(sessionId, { pages: 3 })
+
+    // Ensure the loaded window includes at least the most recent user message.
+    // (Reasoning can be chunked into many events and push the `session.input`
+    // out of the first page.)
+    for (let i = 0; i < 8; i++) {
+      if (nonce !== loadSessionNonce) break
+      if (store.events.some((ev) => ev?.type === 'session.input')) break
+      if (!store.hasMoreBefore || !store.nextBeforeSeq) break
+      await loadMoreBefore(sessionId, { pages: 3 })
+    }
   } finally {
     if (nonce === loadSessionNonce) sessionLoading.value = false
   }
 }
 
-async function loadMoreBefore(sessionId) {
+async function loadMoreBefore(sessionId, { pages = 1, limit = 200 } = {}) {
   const store = getSessionStore(sessionId)
   if (store.loadingBefore) return
   if (!store.hasMoreBefore) return
-  const beforeSeq = store.nextBeforeSeq
-  if (!beforeSeq) return
+  if (!store.nextBeforeSeq) return
+
+  const pageCount = Math.max(1, Math.min(10, Number(pages) || 1))
+  const pageLimit = Math.max(1, Math.min(2000, Number(limit) || 200))
 
   store.loadingBefore = true
   try {
@@ -1177,20 +1394,35 @@ async function loadMoreBefore(sessionId) {
     const prevHeight = el ? el.scrollHeight : null
     const prevTop = el ? el.scrollTop : null
 
-    const res = await apiFetch(`/api/sessions/${sessionId}/events?mode=summary&limit=200&beforeSeq=${encodeURIComponent(String(beforeSeq))}`)
-    if (!res.ok) return
-    const page = await res.json().catch(() => null)
-    const events = Array.isArray(page?.events) ? page.events : []
+    let fetchedAny = false
+    for (let p = 0; p < pageCount; p++) {
+      if (!store.hasMoreBefore) break
+      const beforeSeq = store.nextBeforeSeq
+      if (!beforeSeq) break
 
-    // Prepend in reverse so overall ordering stays chronological.
-    for (let i = events.length - 1; i >= 0; i--) {
-      addSessionEvent(sessionId, events[i], { atStart: true, applyDerived: false })
+      const res = await apiFetch(`/api/sessions/${sessionId}/events?mode=summary&limit=${encodeURIComponent(String(pageLimit))}&beforeSeq=${encodeURIComponent(String(beforeSeq))}`)
+      if (!res.ok) break
+      const page = await res.json().catch(() => null)
+      const events = Array.isArray(page?.events) ? page.events : []
+
+      // Prepend in one batch (chronological order within page is oldest-first).
+      const toAdd = []
+      for (const ev of events) {
+        if (!ev?.eventId) continue
+        if (store.seen.has(ev.eventId)) continue
+        store.seen.add(ev.eventId)
+        toAdd.push(ev)
+      }
+      if (toAdd.length) store.events.unshift(...toAdd)
+
+      store.hasMoreBefore = Boolean(page?.hasMoreBefore)
+      store.nextBeforeSeq = page?.nextBeforeSeq ?? store.nextBeforeSeq
+      fetchedAny = fetchedAny || Boolean(events.length)
+      if (!events.length) break
     }
-    store.hasMoreBefore = Boolean(page?.hasMoreBefore)
-    store.nextBeforeSeq = page?.nextBeforeSeq ?? store.nextBeforeSeq
 
     await nextTick()
-    if (el && prevHeight !== null && prevTop !== null) {
+    if (el && prevHeight !== null && prevTop !== null && fetchedAny) {
       const nextHeight = el.scrollHeight
       el.scrollTop = prevTop + (nextHeight - prevHeight)
     }
@@ -1227,16 +1459,1003 @@ const selectedSession = computed(() => sessions.value.find((s) => s.sessionId ==
 const selectedStore = computed(() => selectedSessionId.value ? sessionStores.get(selectedSessionId.value) : null)
 const selectedTokenUsage = computed(() => selectedSessionId.value ? (tokenUsageBySessionId.get(selectedSessionId.value) ?? null) : null)
 
+const recentModels = computed(() => {
+  const seen = new Set()
+  const out = []
+  const add = (v) => {
+    const s = String(v ?? '').trim()
+    if (!s || seen.has(s)) return
+    seen.add(s)
+    out.push(s)
+  }
+  // Prefer the current session + defaults, then the rest of recent sessions.
+  add(selectedSession.value?.model)
+  add(defaults.model)
+  for (const s of sessions.value) add(s?.model)
+  return out.slice(0, 20)
+})
+
+const modelCatalog = ref([]) // Codex app-server model/list (per machine)
+const modelCatalogMachineId = ref('')
+const modelCatalogUpdatedMs = ref(0)
+const modelCatalogLoading = ref(false)
+const modelCatalogError = ref('')
+
+const composerModelsMachineId = computed(() => {
+  const sid = selectedSession.value?.machineId
+  if (sid) return String(sid)
+  const dmid = String(defaults.machineId ?? '').trim()
+  if (dmid) return dmid
+  const online = machinesForSelect.value.find((m) => machineIsOnline(m))
+  return online?.machineId ?? ''
+})
+
+const composerModelsMachineOnline = computed(() => {
+  const mid = String(composerModelsMachineId.value ?? '').trim()
+  if (!mid) return false
+  const row = machines.value.find((m) => m?.machineId === mid) ?? null
+  return row ? machineIsOnline(row) : false
+})
+
+async function loadModelCatalog({ force = false } = {}) {
+  modelCatalogError.value = ''
+  const machineId = String(composerModelsMachineId.value ?? '').trim()
+  if (!machineId) return
+  if (!composerModelsMachineOnline.value) return
+
+  const now = Date.now()
+  if (!force && modelCatalogMachineId.value === machineId && modelCatalog.value.length && (now - modelCatalogUpdatedMs.value) < 60_000) {
+    return
+  }
+  if (modelCatalogLoading.value) return
+  modelCatalogLoading.value = true
+  try {
+    const cwd = selectedSession.value?.cwd ?? defaults.cwd ?? ''
+    const res = await apiFetch(`/api/models?machineId=${encodeURIComponent(machineId)}&cwd=${encodeURIComponent(String(cwd ?? ''))}`)
+    const data = await res.json().catch(() => null)
+    if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+    const list = Array.isArray(data?.models) ? data.models : []
+    modelCatalog.value = list
+    modelCatalogMachineId.value = machineId
+    modelCatalogUpdatedMs.value = now
+  } catch (err) {
+    modelCatalogError.value = String(err?.message ?? err)
+  } finally {
+    modelCatalogLoading.value = false
+  }
+}
+
+watch(
+  [() => authed.value, () => composerModelsMachineId.value, () => composerModelsMachineOnline.value],
+  ([isAuthed, machineId, online], prev = []) => {
+    const [wasAuthed, prevMachineId, prevOnline] = prev
+    if (!isAuthed) return
+    if (!machineId || !online) return
+    const changed = !wasAuthed || machineId !== prevMachineId || (online && !prevOnline)
+    if (changed) loadModelCatalog().catch(() => {})
+  },
+  { immediate: true }
+)
+
+function labelReasoningEffort(value) {
+  const raw = String(value ?? '').trim()
+  if (!raw) return ''
+  const norm = raw.toLowerCase().replace(/[\s_-]+/g, '')
+  if (norm === 'none') return 'None'
+  if (norm === 'minimal') return 'Minimal'
+  if (norm === 'low') return 'Low'
+  if (norm === 'medium') return 'Medium'
+  if (norm === 'high') return 'High'
+  if (norm === 'xhigh' || norm === 'extrahigh') return 'Extra High'
+  return raw
+    .split(/[-_\s]+/g)
+    .filter(Boolean)
+    .map((w) => w.slice(0, 1).toUpperCase() + w.slice(1).toLowerCase())
+    .join(' ')
+}
+
+const defaultCodexModel = computed(() => {
+  const list = Array.isArray(modelCatalog.value) ? modelCatalog.value : []
+  return list.find((m) => Boolean(m?.isDefault ?? m?.is_default ?? m?.default)) ?? null
+})
+
+const selectedCodexModel = computed(() => {
+  const list = Array.isArray(modelCatalog.value) ? modelCatalog.value : []
+  if (!list.length) return null
+  const id = String(composerModel.value ?? '').trim()
+  if (id) return list.find((m) => String(m?.id ?? m?.model ?? '').trim() === id) ?? null
+  return defaultCodexModel.value
+})
+
+const selectedCodexDefaultReasoningEffort = computed(() => {
+  const m = selectedCodexModel.value
+  if (!m) return null
+  const raw = m?.defaultReasoningEffort ?? m?.default_reasoning_effort ?? null
+  const e = String(raw ?? '').trim()
+  return e ? e : null
+})
+
+const composerModelOptions = computed(() => {
+  const list = Array.isArray(modelCatalog.value) ? modelCatalog.value : []
+  const out = []
+  const seen = new Set()
+
+  const defaultId = String(defaultCodexModel.value?.id ?? defaultCodexModel.value?.model ?? '').trim()
+
+  if (list.length) {
+    for (const m of list) {
+      if (!m || typeof m !== 'object') continue
+      const id = String(m.id ?? m.model ?? '').trim()
+      if (!id || seen.has(id)) continue
+      if (defaultId && id === defaultId) continue
+      seen.add(id)
+      out.push({
+        value: id,
+        label: String(m.displayName ?? m.display_name ?? id).trim() || id
+      })
+    }
+  } else {
+    for (const id of recentModels.value) {
+      if (!id || seen.has(id)) continue
+      seen.add(id)
+      out.push({ value: id, label: id })
+    }
+  }
+
+  // If the currently-selected model isn't present, keep it visible.
+  const current = String(composerModel.value ?? '').trim()
+  if (current && !seen.has(current) && current !== defaultId) {
+    out.unshift({ value: current, label: current })
+  }
+
+  return out
+})
+
+const composerReasoningEffortOptions = computed(() => {
+  const m = selectedCodexModel.value
+  const list = Array.isArray(m?.reasoningEffort)
+    ? m.reasoningEffort
+    : (
+        Array.isArray(m?.reasoning_effort)
+          ? m.reasoning_effort
+          : (
+              Array.isArray(m?.supportedReasoningEfforts)
+                ? m.supportedReasoningEfforts
+                : (Array.isArray(m?.supported_reasoning_efforts) ? m.supported_reasoning_efforts : null)
+            )
+      )
+  if (list && list.length) {
+    const out = []
+    const seen = new Set()
+    for (const e of list) {
+      let effort = null
+      if (typeof e === 'string') effort = e
+      else if (e && typeof e === 'object') {
+        if (typeof e.effort === 'string') effort = e.effort
+        else if (e.effort && typeof e.effort === 'object') {
+          effort = e.effort.value ?? e.effort.id ?? e.effort.name ?? null
+        } else if (typeof e.value === 'string') effort = e.value
+        else if (typeof e.id === 'string') effort = e.id
+        else if (typeof e.name === 'string') effort = e.name
+        else if (typeof e.key === 'string') effort = e.key
+        else if (typeof e.level === 'string') effort = e.level
+        else if (typeof e.reasoningEffort === 'string') effort = e.reasoningEffort
+        else if (typeof e.reasoning_effort === 'string') effort = e.reasoning_effort
+      }
+
+      effort = String(effort ?? '').trim()
+      if (!effort) continue
+      if (effort.toLowerCase() === 'auto') continue
+      if (seen.has(effort)) continue
+      seen.add(effort)
+
+      const label = (e && typeof e === 'object')
+        ? String(e.label ?? e.displayName ?? e.display_name ?? '').trim()
+        : ''
+      const desc = (e && typeof e === 'object') ? String(e.description ?? '').trim() : ''
+
+      out.push({
+        value: effort,
+        label: label || labelReasoningEffort(effort) || effort,
+        description: desc || null
+      })
+    }
+
+    // If the currently-selected effort isn't present, keep it visible.
+    const current = String((selectedSession.value ? selectedSession.value.reasoningEffort : defaults.reasoningEffort) ?? '').trim()
+    if (current && !seen.has(current)) {
+      out.unshift({ value: current, label: labelReasoningEffort(current) || current, description: null })
+    }
+    return out
+  }
+  return [
+    { value: 'none', label: 'None' },
+    { value: 'minimal', label: 'Minimal' },
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+    { value: 'xhigh', label: 'Extra High' }
+  ]
+})
+
+const composerOptionsError = ref('')
+
+async function patchSelectedSessionOptions(patch) {
+  composerOptionsError.value = ''
+  const sessionId = selectedSessionId.value
+  if (!sessionId) return false
+  try {
+    const res = await apiFetch(`/api/sessions/${sessionId}/options`, {
+      method: 'PUT',
+      body: JSON.stringify({ options: patch })
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => null)
+      composerOptionsError.value = err?.error ?? `HTTP ${res.status}`
+      return false
+    }
+    const data = await res.json().catch(() => null)
+    if (data?.session) upsertSessionRow(data.session)
+    return true
+  } catch (err) {
+    composerOptionsError.value = String(err?.message ?? err)
+    return false
+  }
+}
+
+const composerModel = computed({
+  get() {
+    return String((selectedSession.value ? selectedSession.value.model : defaults.model) ?? '')
+  },
+  set(v) {
+    const next = String(v ?? '').trim()
+    const current = String((selectedSession.value ? selectedSession.value.model : defaults.model) ?? '').trim()
+    if (next === current) return
+    if (selectedSession.value) patchSelectedSessionOptions({ model: next || null })
+    else defaults.model = next
+  }
+})
+
+const composerReasoningEffort = computed({
+  get() {
+    return String((selectedSession.value ? selectedSession.value.reasoningEffort : defaults.reasoningEffort) ?? '')
+  },
+  set(v) {
+    const next = String(v ?? '').trim()
+    const current = String((selectedSession.value ? selectedSession.value.reasoningEffort : defaults.reasoningEffort) ?? '').trim()
+    if (next === current) return
+    if (selectedSession.value) patchSelectedSessionOptions({ reasoningEffort: next || null })
+    else defaults.reasoningEffort = next
+  }
+})
+
+const composerApprovalPolicy = computed({
+  get() {
+    const v = selectedSession.value ? selectedSession.value.approvalPolicy : defaults.approvalPolicy
+    return String(v ?? defaults.approvalPolicy ?? 'on-request')
+  },
+  set(v) {
+    const next = String(v ?? '').trim()
+    if (!next) return
+    const current = String((selectedSession.value ? selectedSession.value.approvalPolicy : defaults.approvalPolicy) ?? '').trim()
+    if (next === current) return
+    if (selectedSession.value) patchSelectedSessionOptions({ approvalPolicy: next })
+    else defaults.approvalPolicy = next
+  }
+})
+
+const composerSandbox = computed({
+  get() {
+    const v = selectedSession.value ? selectedSession.value.sandbox : defaults.sandbox
+    return String(v ?? defaults.sandbox ?? 'workspace-write')
+  },
+  set(v) {
+    const next = String(v ?? '').trim()
+    if (!next) return
+    const current = String((selectedSession.value ? selectedSession.value.sandbox : defaults.sandbox) ?? '').trim()
+    if (next === current) return
+    if (selectedSession.value) patchSelectedSessionOptions({ sandbox: next })
+    else defaults.sandbox = next
+  }
+})
+
+function splitShellStatements(cmd) {
+  const s = String(cmd ?? '')
+  const out = []
+  let cur = ''
+  let quote = null
+
+  const push = () => {
+    const v = cur.trim()
+    cur = ''
+    if (v) out.push(v)
+  }
+
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (quote) {
+      if (ch === quote) {
+        quote = null
+        cur += ch
+        continue
+      }
+      if (quote === '"' && ch === '\\' && i + 1 < s.length) {
+        cur += ch + s[i + 1]
+        i += 1
+        continue
+      }
+      cur += ch
+      continue
+    }
+
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      cur += ch
+      continue
+    }
+
+    if (ch === ';' || ch === '\n') {
+      push()
+      continue
+    }
+
+    if (ch === '&' && s[i + 1] === '&') {
+      push()
+      i += 1
+      continue
+    }
+
+    cur += ch
+  }
+  push()
+  return out
+}
+
+function beforeFirstPipe(seg) {
+  const s = String(seg ?? '')
+  let quote = null
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (quote) {
+      if (ch === quote) quote = null
+      else if (quote === '"' && ch === '\\' && i + 1 < s.length) i += 1
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      continue
+    }
+    if (ch === '|') return s.slice(0, i).trim()
+  }
+  return s.trim()
+}
+
+function stripOuterParens(s) {
+  let v = String(s ?? '').trim()
+  for (let i = 0; i < 4; i++) {
+    if (v.startsWith('(') && v.endsWith(')')) v = v.slice(1, -1).trim()
+    else break
+  }
+  return v
+}
+
+function shellSplitWords(s) {
+  const input = String(s ?? '')
+  const out = []
+  let cur = ''
+  let quote = null
+  let tokenStarted = false
+
+  const push = () => {
+    out.push(cur)
+    cur = ''
+    tokenStarted = false
+  }
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
+    if (quote) {
+      if (ch === quote) {
+        quote = null
+        tokenStarted = true
+        continue
+      }
+      if (quote === '"' && ch === '\\' && i + 1 < input.length) {
+        cur += input[i + 1]
+        i += 1
+        tokenStarted = true
+        continue
+      }
+      cur += ch
+      tokenStarted = true
+      continue
+    }
+
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      tokenStarted = true
+      continue
+    }
+
+    if (/\s/.test(ch)) {
+      if (tokenStarted) push()
+      continue
+    }
+
+    if (ch === '\\' && i + 1 < input.length) {
+      cur += input[i + 1]
+      i += 1
+      tokenStarted = true
+      continue
+    }
+
+    cur += ch
+    tokenStarted = true
+  }
+  if (tokenStarted) push()
+  return out
+}
+
+function looksLikePath(token) {
+  const t = String(token ?? '').trim()
+  if (!t) return false
+  if (t === '.' || t === '..') return true
+  if (t.includes('/')) return true
+  if (t.startsWith('.')) return true
+  if (/\.[a-z0-9]{1,8}$/i.test(t)) return true
+  if (/^(README|LICENSE|Makefile|Dockerfile)$/i.test(t)) return true
+  if (/^(Cargo\.toml|Cargo\.lock|package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/i.test(t)) return true
+  return false
+}
+
+function looksLikeFileToken(token) {
+  const t = String(token ?? '').trim()
+  if (!t) return false
+  if (t.endsWith('/')) return false
+  const base = t.split('/').pop() || t
+  const lower = base.toLowerCase()
+  if (lower === '.vscode' || lower === '.git' || lower === '.github' || lower === '.rootgrid') return false
+  if (lower === '.gitignore' || lower === '.env' || lower === '.npmrc' || lower === '.editorconfig') return true
+  if (!base.startsWith('.') && base.includes('.')) return true
+  return false
+}
+
+function formatExploreTitle({ files = 0, searches = 0, lists = 0 } = {}) {
+  const parts = []
+  const pl = (n, one, many) => (Number(n) === 1 ? one : many)
+  if (files) parts.push(`${files} ${pl(files, 'file', 'files')}`)
+  if (searches) parts.push(`${searches} ${pl(searches, 'search', 'searches')}`)
+  if (lists) parts.push(`${lists} ${pl(lists, 'list', 'lists')}`)
+  if (!parts.length) return 'Explored'
+  return `Explored ${parts.join(', ')}`
+}
+
+function parseExploreActionsFromCommand(command) {
+  const cmd = String(command ?? '').trim()
+  if (!cmd) return { actions: [], hasNonExplore: false }
+
+  const segs = splitShellStatements(cmd)
+  const actions = []
+  let hasNonExplore = false
+
+  const commandName = (word0) => {
+    let n = String(word0 ?? '').trim()
+    n = n.replace(/^[({]+/, '').replace(/[)}]+$/, '')
+    if (n.includes('/')) n = n.split('/').pop()
+    return n
+  }
+
+  for (const seg0 of segs) {
+    let seg = beforeFirstPipe(seg0)
+    seg = stripOuterParens(seg)
+    if (!seg) continue
+
+    const words0 = shellSplitWords(seg)
+    if (!words0.length) continue
+
+    let words = words0
+    let name = commandName(words[0])
+    if (!name) continue
+
+    // Ignore leading `cd ...` segments.
+    if (name === 'cd') continue
+
+    // Unwrap sudo.
+    if (name === 'sudo' && words.length > 1) {
+      words = words.slice(1)
+      name = commandName(words[0])
+      if (!name) continue
+    }
+
+    // Ignore simple no-ops.
+    if (name === 'true' || name === ':') continue
+
+    if (name === 'ls') {
+      const paths = []
+      for (const w of words.slice(1)) {
+        if (!w) continue
+        if (w === '--') continue
+        if (w.startsWith('-')) continue
+        paths.push(w)
+      }
+      if (!paths.length) paths.push('.')
+      for (const p of paths) {
+        const label = (p === '.' || p === '..')
+          ? `Listed files in ${p}`
+          : (looksLikeFileToken(p) ? `Listed ${p}` : `Listed files in ${p}`)
+        actions.push({ kind: 'list', label })
+      }
+      continue
+    }
+
+    if (name === 'find') {
+      let root = null
+      for (const w of words.slice(1)) {
+        if (!w) continue
+        if (w.startsWith('-')) break
+        root = w
+        break
+      }
+      root = root || '.'
+      actions.push({ kind: 'list', label: `Listed files in ${root}` })
+      continue
+    }
+
+    if (name === 'rg' || name === 'grep') {
+      const rest = words.slice(1)
+      let i = 0
+      while (i < rest.length) {
+        const w = rest[i]
+        if (w === '--') { i += 1; break }
+        if (!(w && w.startsWith('-'))) break
+        i += 1
+      }
+      const pattern = (i < rest.length) ? rest[i] : ''
+      i += 1
+      const paths = rest.slice(i).filter((w) => w && w !== '--')
+
+      const base = (pattern ? `Searched for ${pattern.length > 40 ? `${pattern.slice(0, 37)}…` : pattern}` : 'Searched for files')
+      const pathLabel = (paths.length && !(paths.length === 1 && (paths[0] === '.' || paths[0] === './')))
+        ? ` in ${paths.join(', ')}`
+        : ''
+      actions.push({ kind: 'search', label: base + pathLabel })
+      continue
+    }
+
+    if (name === 'cat') {
+      const files = words.slice(1).filter((w) => w && !w.startsWith('-') && looksLikePath(w))
+      if (!files.length) { hasNonExplore = true; continue }
+      for (const f of files) actions.push({ kind: 'read', label: `Read ${f}` })
+      continue
+    }
+
+    if (name === 'sed') {
+      const candidates = words.slice(1).filter((w) => w && !w.startsWith('-') && looksLikePath(w))
+      const f = candidates.length ? candidates[candidates.length - 1] : null
+      if (!f) { hasNonExplore = true; continue }
+      actions.push({ kind: 'read', label: `Read ${f}` })
+      continue
+    }
+
+    if (name === 'nl') {
+      const candidates = words.slice(1).filter((w) => w && !w.startsWith('-') && looksLikePath(w))
+      const f = candidates.length ? candidates[candidates.length - 1] : null
+      if (!f) { hasNonExplore = true; continue }
+      actions.push({ kind: 'read', label: `Read ${f}` })
+      continue
+    }
+
+    // Ignore truncation/formatting helpers.
+    if (name === 'head' || name === 'tail' || name === 'wc' || name === 'cut') continue
+
+    hasNonExplore = true
+  }
+
+  return { actions, hasNonExplore }
+}
+
+function normalizeDiffPath(p) {
+  let s = String(p ?? '').trim()
+  if (!s) return null
+  // Strip timestamps in `--- a/file\t2024-...` form.
+  s = s.split('\t')[0].trim()
+  if (!s || s === '/dev/null') return null
+  if (s.startsWith('a/') || s.startsWith('b/')) s = s.slice(2)
+  return s || null
+}
+
+function parseUnifiedDiff(diffText, { maxBytes = 2_000_000, maxLines = 50_000 } = {}) {
+  let text = String(diffText ?? '')
+  if (!text.trim()) return []
+  if (text.length > maxBytes) text = text.slice(0, maxBytes)
+  text = text.replace(/\r/g, '')
+
+  const lines = text.split('\n')
+  const files = []
+
+  let cur = null
+  let curRaw = []
+  let inHunk = false
+  let oldLine = 0
+  let newLine = 0
+
+  const finish = () => {
+    if (!cur) return
+    cur.raw = curRaw.join('\n')
+    if (!cur.path) cur.path = cur.newPath || cur.oldPath || 'edited'
+    files.push(cur)
+    cur = null
+    curRaw = []
+    inHunk = false
+    oldLine = 0
+    newLine = 0
+  }
+
+  const ensureFile = (hintId) => {
+    if (cur) return cur
+    cur = {
+      id: hintId || `f-${files.length + 1}`,
+      oldPath: null,
+      newPath: null,
+      path: null,
+      added: 0,
+      removed: 0,
+      lines: [],
+      raw: ''
+    }
+    curRaw = []
+    inHunk = false
+    oldLine = 0
+    newLine = 0
+    return cur
+  }
+
+  const parseHunk = (line) => {
+    const m = String(line ?? '').match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/)
+    if (!m) return null
+    return { oldStart: Number(m[1]) || 0, newStart: Number(m[3]) || 0 }
+  }
+
+  const pushLine = (obj) => {
+    if (!cur) return
+    cur.lines.push(obj)
+    if (cur.lines.length > maxLines) {
+      // Stop parsing huge diffs; keep raw for copy.
+      inHunk = false
+    }
+  }
+
+  for (const line of lines) {
+    if (line.startsWith('diff --git ')) {
+      finish()
+      const m = line.match(/^diff --git\s+a\/(.+?)\s+b\/(.+)$/)
+      const oldPath = m ? m[1] : null
+      const newPath = m ? m[2] : null
+      const f = ensureFile(`diff-${files.length + 1}`)
+      f.oldPath = oldPath
+      f.newPath = newPath
+      f.path = newPath || oldPath || f.path
+      curRaw.push(line)
+      continue
+    }
+
+    // Start a file section even if there is no `diff --git` header.
+    if (!cur && (line.startsWith('--- ') || line.startsWith('+++ '))) {
+      ensureFile(`diff-${files.length + 1}`)
+    }
+
+    if (cur) curRaw.push(line)
+    if (!cur) continue
+
+    if (line.startsWith('--- ')) {
+      cur.oldPath = normalizeDiffPath(line.slice(4))
+      if (!cur.path) cur.path = cur.oldPath
+      continue
+    }
+
+    if (line.startsWith('+++ ')) {
+      cur.newPath = normalizeDiffPath(line.slice(4))
+      cur.path = cur.newPath || cur.oldPath || cur.path
+      continue
+    }
+
+    if (line.startsWith('@@ ')) {
+      const info = parseHunk(line)
+      if (info) {
+        inHunk = true
+        oldLine = info.oldStart
+        newLine = info.newStart
+        pushLine({ kind: 'hunk', oldLine: null, newLine: null, text: line })
+      }
+      continue
+    }
+
+    if (!inHunk) continue
+
+    if (line.startsWith('+') && !line.startsWith('+++ ')) {
+      cur.added += 1
+      pushLine({ kind: 'add', oldLine: null, newLine, text: line.slice(1) })
+      newLine += 1
+      continue
+    }
+
+    if (line.startsWith('-') && !line.startsWith('--- ')) {
+      cur.removed += 1
+      pushLine({ kind: 'del', oldLine, newLine: null, text: line.slice(1) })
+      oldLine += 1
+      continue
+    }
+
+    if (line.startsWith(' ')) {
+      pushLine({ kind: 'ctx', oldLine, newLine, text: line.slice(1) })
+      oldLine += 1
+      newLine += 1
+      continue
+    }
+
+    if (line.startsWith('\\')) {
+      pushLine({ kind: 'meta', oldLine: null, newLine: null, text: line })
+    }
+  }
+
+  finish()
+
+  // Drop empty file records (can happen with truncated/partial diffs).
+  return files.filter((f) => (Array.isArray(f.lines) && f.lines.length) || String(f.raw ?? '').trim())
+}
+
+async function copyText(text) {
+  const t = String(text ?? '')
+  if (!t) return
+  try {
+    await navigator.clipboard.writeText(t)
+    return
+  } catch {
+  }
+  try {
+    const el = document.createElement('textarea')
+    el.value = t
+    el.setAttribute('readonly', 'true')
+    el.style.position = 'fixed'
+    el.style.left = '-9999px'
+    document.body.appendChild(el)
+    el.select()
+    document.execCommand('copy')
+    document.body.removeChild(el)
+  } catch {
+  }
+}
+
+function diffStepSelectedPath(stepId, files) {
+  const sid = selectedSessionId.value
+  if (!sid) return ''
+  const store = getSessionStore(sid)
+  const list = Array.isArray(files) ? files : []
+  const key = String(stepId ?? '')
+  if (!key) return list[0]?.path ?? ''
+
+  const existing = String(store?.diffSelectedFileByEventId?.get?.(key) ?? '').trim()
+  if (existing && list.some((f) => f?.path === existing)) return existing
+
+  const fallback = String(list[0]?.path ?? '').trim()
+  if (fallback) {
+    try { store.diffSelectedFileByEventId.set(key, fallback) } catch {}
+  }
+  return fallback
+}
+
+function setDiffStepSelectedPath(stepId, path) {
+  const sid = selectedSessionId.value
+  if (!sid) return
+  const store = getSessionStore(sid)
+  const key = String(stepId ?? '')
+  if (!key) return
+  try { store.diffSelectedFileByEventId.set(key, String(path ?? '')) } catch {}
+}
+
+function diffStepSelectedFile(stepId, files) {
+  const list = Array.isArray(files) ? files : []
+  if (!list.length) return null
+  const path = diffStepSelectedPath(stepId, list)
+  return list.find((f) => f?.path === path) ?? list[0] ?? null
+}
+
 function buildChatMessages(store) {
   const events = store?.events ?? []
   const msgs = []
-  const toolByItemId = new Map() // itemId -> msg
+  let currentAssistant = null
+  /** @type {Map<string, any>} */
+  const toolMsgByItemId = new Map()
+
+  // VS Code-like folding: collapse consecutive file reads/search/list commands
+  // (shell-based "exploration") into a single expandable "Explored …" line.
+  let exploreCurrent = null
+  let exploreSeq = 0
+  const exploreSeenItemIds = new Set()
+  const resetExplore = () => { exploreCurrent = null }
+  const ensureExploreGroup = (idHint) => {
+    if (exploreCurrent) return exploreCurrent
+    const msg = {
+      id: `explore-${idHint ?? (++exploreSeq)}`,
+      role: 'step',
+      stepKind: 'explore',
+      title: 'Explored',
+      files: 0,
+      searches: 0,
+      lists: 0,
+      entries: []
+    }
+    exploreCurrent = msg
+    msgs.push(msg)
+    return msg
+  }
+
+  let lastDiffText = null
+
+  // Reasoning is streamed as markdown with section headings like "**Title**"
+  // on their own line. Render each heading as a single expandable "step line".
+  let reasoningCurrent = null
+  let reasoningBuf = ''
+  let lastReasoningEventId = null
+  /** @type {Map<string, number>} */
+  const reasoningStepIdxByEventId = new Map()
+
+  const ensureAssistant = (idHint) => {
+    if (currentAssistant) return currentAssistant
+    resetExplore()
+    currentAssistant = { id: idHint, role: 'assistant', text: '' }
+    msgs.push(currentAssistant)
+    return currentAssistant
+  }
+
+  const nextReasoningStepId = (eventId) => {
+    const key = String(eventId ?? 'reasoning')
+    const next = (reasoningStepIdxByEventId.get(key) ?? 0) + 1
+    reasoningStepIdxByEventId.set(key, next)
+    return `reason-${key}-${next}`
+  }
+
+  const startReasoningStep = (eventId, title) => {
+    resetExplore()
+    const msg = {
+      id: nextReasoningStepId(eventId),
+      role: 'step',
+      stepKind: 'reasoning',
+      _placeholder: false,
+      title: String(title ?? '').trim(),
+      body: ''
+    }
+    msgs.push(msg)
+    reasoningCurrent = msg
+    return msg
+  }
+
+  const appendReasoningBody = (eventId, text) => {
+    const chunk = String(text ?? '')
+    if (!chunk) return
+    if (!reasoningCurrent) {
+      if (!chunk.trim()) return
+      startReasoningStep(eventId, 'Reasoning')
+    }
+    reasoningCurrent.body = appendCapped(reasoningCurrent.body, chunk, 500_000)
+  }
+
+  const parseReasoningHeading = (line) => {
+    const raw = String(line ?? '')
+    const ltrim = raw.replace(/^\s+/, '')
+    if (!ltrim.startsWith('**')) return null
+    const close = ltrim.indexOf('**', 2)
+    if (close < 0) return null
+    const title = ltrim.slice(2, close).trim()
+    if (!title) return null
+    const rest = ltrim.slice(close + 2)
+    return { title, rest }
+  }
+
+  const handleReasoningLine = (eventId, line, trailingNewline) => {
+    const raw = String(line ?? '')
+    const heading = parseReasoningHeading(raw)
+    if (heading) {
+      const baseTitle = String(heading.title ?? '').trim()
+      const rest = String(heading.rest ?? '')
+      const title = (rest.trim() ? `${baseTitle}${rest}` : baseTitle).trim()
+      if (reasoningCurrent?._placeholder && !String(reasoningCurrent?.body ?? '').trim()) {
+        reasoningCurrent.title = title
+        reasoningCurrent._placeholder = false
+      } else {
+        startReasoningStep(eventId, title)
+      }
+      return
+    }
+    if (!reasoningCurrent && !raw.trim()) return
+    appendReasoningBody(eventId, raw + (trailingNewline ? '\n' : ''))
+  }
+
+  const feedReasoning = (eventId, chunk) => {
+    lastReasoningEventId = eventId
+    reasoningBuf += String(chunk ?? '')
+    let idx
+    while ((idx = reasoningBuf.indexOf('\n')) >= 0) {
+      let line = reasoningBuf.slice(0, idx)
+      if (line.endsWith('\r')) line = line.slice(0, -1)
+      reasoningBuf = reasoningBuf.slice(idx + 1)
+      handleReasoningLine(eventId, line, true)
+    }
+
+    // If we have started receiving reasoning but haven't reached a newline yet,
+    // still show a single expandable "Reasoning" line immediately.
+    if (!reasoningCurrent && reasoningBuf.trim()) {
+      const msg = startReasoningStep(eventId, 'Reasoning')
+      msg._placeholder = true
+    }
+  }
+
+  const flushReasoningBuf = (eventId) => {
+    if (!reasoningBuf) return
+    const id = eventId ?? lastReasoningEventId ?? 'reasoning'
+    handleReasoningLine(id, reasoningBuf, false)
+    reasoningBuf = ''
+  }
 
   for (const e of events) {
     if (e.type === 'session.input') {
+      flushReasoningBuf()
       const text = e.payload?.text ?? ''
       const atts = Array.isArray(e.payload?.attachments) ? e.payload.attachments : []
       msgs.push({ id: e.eventId, role: 'user', text, attachments: atts })
+      currentAssistant = null
+      resetExplore()
+      exploreSeenItemIds.clear()
+      toolMsgByItemId.clear()
+      reasoningCurrent = null
+      reasoningBuf = ''
+      lastReasoningEventId = null
+      reasoningStepIdxByEventId.clear()
+      continue
+    }
+
+    if (e.type === 'turn.started') {
+      flushReasoningBuf()
+      currentAssistant = null
+      resetExplore()
+      exploreSeenItemIds.clear()
+      toolMsgByItemId.clear()
+      reasoningCurrent = null
+      reasoningBuf = ''
+      lastReasoningEventId = null
+      reasoningStepIdxByEventId.clear()
+      continue
+    }
+
+    if (e.type === 'turn.completed') {
+      flushReasoningBuf()
+      currentAssistant = null
+      resetExplore()
+      exploreSeenItemIds.clear()
+      reasoningCurrent = null
+      reasoningBuf = ''
+      lastReasoningEventId = null
+      reasoningStepIdxByEventId.clear()
+      continue
+    }
+
+    if (e.type === 'diff.updated') {
+      flushReasoningBuf()
+      resetExplore()
+      const diff = (typeof e.payload?.diff === 'string') ? e.payload.diff : ''
+      const trimmed = String(diff ?? '').trim()
+      if (!trimmed) continue
+      if (lastDiffText === diff) continue
+      lastDiffText = diff
+
+      const files = parseUnifiedDiff(diff)
+      msgs.push({
+        id: e.eventId,
+        role: 'step',
+        stepKind: 'diff',
+        files,
+        raw: diff
+      })
       continue
     }
 
@@ -1244,67 +2463,93 @@ function buildChatMessages(store) {
       const stream = e.payload?.stream ?? 'normalized'
       const text = e.payload?.text ?? ''
       if (stream === 'normalized') {
-        if (!msgs.length || msgs[msgs.length - 1].role !== 'assistant') {
-          msgs.push({ id: e.eventId, role: 'assistant', text: '' })
-        }
-        msgs[msgs.length - 1].text += text
-      } else if (stream === 'stderr') {
-        // Un-attributed stderr (important enough to show).
-        msgs.push({ id: e.eventId, role: 'system', text: String(text ?? '') })
+        const a = ensureAssistant(currentAssistant?.id ?? e.eventId)
+        a.text += text
+      } else if (stream === 'reasoning') {
+        feedReasoning(e.eventId, String(text ?? ''))
+      } else if ((stream === 'stderr' || stream === 'stdout') && !e.payload?.itemId) {
+        // Un-attributed stdout/stderr (important enough to show).
+        resetExplore()
+        msgs.push({ id: e.eventId, role: 'system', stream, text: String(text ?? '') })
       }
       continue
     }
 
     if (e.type === 'session.status' && e.payload?.status === 'failed') {
+      resetExplore()
       msgs.push({ id: e.eventId, role: 'system', text: `Session failed: ${e.payload?.error ?? 'unknown error'}` })
     }
 
-    if (e.type === 'tool.started') {
+    if (e.type === 'tool.started' || e.type === 'tool.completed') {
       const tool = e.payload?.tool
       const itemId = String(e.payload?.itemId ?? '')
       if (!itemId) continue
-      const msg = {
-        id: `tool-${itemId}`,
-        role: 'toolcall',
-        tool,
-        itemId,
-        command: e.payload?.command ?? null,
-        cwd: e.payload?.cwd ?? null,
-        changes: Array.isArray(e.payload?.changes) ? e.payload.changes : null,
-        status: e.payload?.status ?? 'running',
-        exitCode: null,
-        expanded: Boolean(store?.toolExpanded?.get?.(itemId)),
-        output: store?.toolOutputByItemId?.get?.(itemId) ?? null
-      }
-      msgs.push(msg)
-      toolByItemId.set(itemId, msg)
-    }
 
-    if (e.type === 'tool.completed') {
-      const tool = e.payload?.tool
-      const itemId = String(e.payload?.itemId ?? '')
-      if (!itemId) continue
-      const existing = toolByItemId.get(itemId)
-      if (existing) {
-        existing.status = e.payload?.status ?? 'completed'
-        existing.exitCode = e.payload?.exitCode ?? null
-        existing.output = store?.toolOutputByItemId?.get?.(itemId) ?? existing.output
-      } else {
-        const msg = {
+      // Fold "exploration" commands (ls/find/rg/sed/cat/...) into a single
+      // VS Code-like "Explored …" group instead of showing raw command steps.
+      if (String(tool ?? '').toLowerCase() === 'commandexecution') {
+        const cmd = toolDisplayCommand({ commandActions: e.payload?.commandActions ?? null, command: e.payload?.command ?? null })
+        const parsed = parseExploreActionsFromCommand(cmd)
+        const exitCode = (e.payload?.exitCode === null || e.payload?.exitCode === undefined) ? null : Number(e.payload.exitCode)
+        const allowExit = (exitCode === null || exitCode === 0 || (exitCode === 1 && parsed.actions.some((a) => a.kind === 'search')))
+
+        if (parsed.actions.length && !parsed.hasNonExplore && allowExit) {
+          if (!exploreSeenItemIds.has(itemId)) {
+            const g = ensureExploreGroup(e.eventId)
+            for (const a of parsed.actions) {
+              const kind = a.kind
+              const label = String(a.label ?? '').trim()
+              if (!kind || !label) continue
+              g.entries.push({
+                id: `explore-${itemId}-${g.entries.length + 1}`,
+                kind,
+                label,
+                itemId
+              })
+              if (kind === 'read') g.files += 1
+              else if (kind === 'search') g.searches += 1
+              else g.lists += 1
+            }
+            g.title = formatExploreTitle(g)
+            exploreSeenItemIds.add(itemId)
+          }
+          continue
+        }
+      }
+
+      // Any non-folded tool step breaks the current explore group.
+      resetExplore()
+
+      let msg = toolMsgByItemId.get(itemId) ?? null
+      if (!msg) {
+        msg = {
           id: `tool-${itemId}`,
-          role: 'toolcall',
+          role: 'step',
+          stepKind: 'tool',
           tool,
           itemId,
           command: e.payload?.command ?? null,
+          commandActions: e.payload?.commandActions ?? null,
           cwd: e.payload?.cwd ?? null,
           changes: Array.isArray(e.payload?.changes) ? e.payload.changes : null,
-          status: e.payload?.status ?? 'completed',
+          status: e.payload?.status ?? (e.type === 'tool.started' ? 'running' : 'completed'),
           exitCode: e.payload?.exitCode ?? null,
           expanded: Boolean(store?.toolExpanded?.get?.(itemId)),
           output: store?.toolOutputByItemId?.get?.(itemId) ?? null
         }
         msgs.push(msg)
-        toolByItemId.set(itemId, msg)
+        toolMsgByItemId.set(itemId, msg)
+      } else {
+        msg.tool = tool ?? msg.tool
+        msg.command = e.payload?.command ?? msg.command
+        msg.commandActions = e.payload?.commandActions ?? msg.commandActions
+        msg.cwd = e.payload?.cwd ?? msg.cwd
+        msg.changes = Array.isArray(e.payload?.changes) ? e.payload.changes : msg.changes
+        msg.status = e.payload?.status ?? msg.status
+        if (!msg.status) msg.status = (e.type === 'tool.started') ? 'running' : 'completed'
+        if (e.payload?.exitCode !== undefined) msg.exitCode = e.payload.exitCode
+        msg.expanded = Boolean(store?.toolExpanded?.get?.(itemId))
+        msg.output = store?.toolOutputByItemId?.get?.(itemId) ?? msg.output
       }
     }
   }
@@ -1314,11 +2559,107 @@ function buildChatMessages(store) {
 
 const chatMessages = computed(() => buildChatMessages(selectedStore.value ?? null))
 
+function openNewThreadDialog() {
+  newThreadError.value = ''
+  newThreadBrowseError.value = ''
+  newThreadBrowseOpen.value = false
+  newThreadBrowsePath.value = ''
+  newThreadBrowseParent.value = null
+  newThreadBrowseEntries.value = []
+
+  // Prefer current defaults, but ensure the selected machine exists and is online.
+  const preferred = String(defaults.machineId ?? '').trim()
+  const preferredRow = preferred ? (machines.value.find((m) => m.machineId === preferred) ?? null) : null
+  const preferredOnline = preferredRow ? machineIsOnline(preferredRow) : false
+  newThreadMachineId.value = preferredOnline ? preferred : (machinesForSelect.value[0]?.machineId ?? '')
+
+  newThreadCwd.value = String(defaults.cwd ?? '')
+  newThreadOpen.value = true
+}
+
+function closeNewThreadDialog() {
+  newThreadOpen.value = false
+  newThreadError.value = ''
+  newThreadBrowseOpen.value = false
+  newThreadBrowseError.value = ''
+}
+
+async function loadNewThreadBrowse(path) {
+  newThreadBrowseLoading.value = true
+  newThreadBrowseError.value = ''
+  try {
+    const machineId = String(newThreadMachineId.value ?? '').trim()
+    if (!machineId) throw new Error('Select a machine first.')
+    if (!newThreadSelectedMachineOnline.value) throw new Error('runner not connected')
+
+    const res = await apiFetch(`/api/fs/list?machineId=${encodeURIComponent(machineId)}&path=${encodeURIComponent(String(path ?? ''))}`)
+    const data = await res.json().catch(() => null)
+    if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+
+    newThreadBrowsePath.value = String(data?.path ?? '')
+    newThreadBrowseParent.value = (data?.parent === null || data?.parent === undefined) ? null : String(data.parent)
+    newThreadBrowseEntries.value = Array.isArray(data?.entries) ? data.entries : []
+  } catch (err) {
+    newThreadBrowseError.value = String(err?.message ?? err)
+  } finally {
+    newThreadBrowseLoading.value = false
+  }
+}
+
+function openNewThreadBrowse() {
+  if (!String(newThreadMachineId.value ?? '').trim()) {
+    newThreadError.value = 'Machine is required.'
+    return
+  }
+  if (!newThreadSelectedMachineOnline.value) {
+    newThreadError.value = 'Runner not connected for this machine. Choose an online machine.'
+    return
+  }
+  newThreadBrowseOpen.value = true
+  loadNewThreadBrowse(newThreadCwd.value || '').catch(() => {})
+}
+
+function selectNewThreadBrowseFolder() {
+  if (!newThreadBrowsePath.value) return
+  newThreadCwd.value = newThreadBrowsePath.value
+  newThreadBrowseOpen.value = false
+}
+
+function confirmNewThreadDialog() {
+  newThreadError.value = ''
+  const machineId = String(newThreadMachineId.value ?? '').trim()
+  const cwd = String(newThreadCwd.value ?? '').trim()
+
+  if (!machineId) {
+    newThreadError.value = 'Machine is required.'
+    return
+  }
+  if (!newThreadSelectedMachineOnline.value) {
+    newThreadError.value = 'Runner not connected for this machine. Choose an online machine.'
+    return
+  }
+  if (!cwd) {
+    newThreadError.value = 'Workspace is required.'
+    return
+  }
+
+  defaults.machineId = machineId
+  defaults.cwd = cwd
+
+  closeNewThreadDialog()
+  newChat()
+}
+
+watch(newThreadMachineId, () => {
+  // Folder browser depends on machine selection.
+  if (!newThreadBrowseOpen.value) return
+  loadNewThreadBrowse('').catch(() => {})
+})
+
 function newChat() {
   selectedSessionId.value = null
   messageDraft.value = ''
   attachments.value.splice(0, attachments.value.length)
-  showDiff.value = false
   showPlan.value = false
 }
 
@@ -1326,7 +2667,7 @@ function onChatScroll() {
   const el = chatScrollEl.value
   if (!el) return
   if (selectedSessionId.value && el.scrollTop <= 80) {
-    loadMoreBefore(selectedSessionId.value).catch(() => {})
+    loadMoreBefore(selectedSessionId.value, { pages: 3 }).catch(() => {})
   }
   const nearBottom = (el.scrollTop + el.clientHeight) >= (el.scrollHeight - 80)
   const was = stickToBottom.value
@@ -1471,6 +2812,7 @@ async function createSessionFromDraft(prompt) {
 
   const options = {
     ...(defaults.model.trim() ? { model: defaults.model.trim() } : {}),
+    ...(String(defaults.reasoningEffort ?? '').trim() ? { reasoningEffort: String(defaults.reasoningEffort).trim() } : {}),
     approvalPolicy: defaults.approvalPolicy,
     sandbox: defaults.sandbox
   }
@@ -1506,6 +2848,10 @@ async function createSessionFromDraft(prompt) {
 
 async function submit() {
   sendError.value = ''
+  if (selectedSession.value?.turnState === 'running') {
+    await stopGenerating()
+    return
+  }
   const text = messageDraft.value.trim()
   if (!text && !attachments.value.length) return
   if (sending.value) return
@@ -1640,6 +2986,57 @@ async function confirmDeleteSession() {
     if (idx >= 0) archivedSessions.value.splice(idx, 1)
   } finally {
     deleteWorking.value = false
+  }
+}
+
+function openDeleteMachineModal(machineId) {
+  deleteMachineError.value = ''
+  deleteMachineId.value = machineId
+  deleteMachineOpen.value = true
+}
+
+async function confirmDeleteMachine() {
+  deleteMachineError.value = ''
+  const machineId = String(deleteMachineId.value ?? '').trim()
+  if (!machineId) return
+  if (deleteMachineWorking.value) return
+
+  const m = machines.value.find((row) => row?.machineId === machineId) ?? null
+  if (m && machineIsOnline(m)) {
+    deleteMachineError.value = 'Machine is online. Disconnect the runner before deleting.'
+    return
+  }
+
+  deleteMachineWorking.value = true
+  try {
+    const res = await apiFetch(`/api/machines/${encodeURIComponent(machineId)}`, { method: 'DELETE' })
+    if (!res.ok) {
+      const err = await res.json().catch(() => null)
+      deleteMachineError.value = err?.error ?? `HTTP ${res.status}`
+      return
+    }
+    deleteMachineOpen.value = false
+    removeMachineLocal(machineId)
+  } finally {
+    deleteMachineWorking.value = false
+  }
+}
+
+async function disconnectMachine(machineId) {
+  machineDisconnectError.value = ''
+  const mid = String(machineId ?? '').trim()
+  if (!mid) return
+  if (machineDisconnectWorkingId.value) return
+  machineDisconnectWorkingId.value = mid
+  try {
+    const res = await apiFetch(`/api/machines/${encodeURIComponent(mid)}/disconnect`, { method: 'POST' })
+    if (!res.ok) {
+      const err = await res.json().catch(() => null)
+      machineDisconnectError.value = err?.error ?? `HTTP ${res.status}`
+      return
+    }
+  } finally {
+    machineDisconnectWorkingId.value = null
   }
 }
 
@@ -1905,25 +3302,12 @@ onMounted(async () => {
   } catch {
   }
 
-  try {
-    const raw = localStorage.getItem('rootgrid.sidebarCollapsed')
-    if (raw === '1') sidebarCollapsed.value = true
-  } catch {
-  }
-
   watch(defaults, () => {
     try {
       localStorage.setItem('rootgrid.defaults', JSON.stringify(defaults))
     } catch {
     }
   }, { deep: true })
-
-  watch(sidebarCollapsed, () => {
-    try {
-      localStorage.setItem('rootgrid.sidebarCollapsed', sidebarCollapsed.value ? '1' : '0')
-    } catch {
-    }
-  })
 
   // Network offline/online banner support.
   try {
@@ -1948,6 +3332,7 @@ onMounted(async () => {
       else if (defaultsOpen.value) defaultsOpen.value = false
       else if (sessionPolicyOpen.value) sessionPolicyOpen.value = false
       else if (deleteOpen.value) deleteOpen.value = false
+      else if (deleteMachineOpen.value) deleteMachineOpen.value = false
       else if (archiveOpen.value) archiveOpen.value = false
     }
   }
@@ -2024,26 +3409,26 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="h-screen w-screen">
+  <div class="h-screen w-screen bg-slate-50 text-slate-900">
     <div v-if="!authed" class="h-full flex items-center justify-center px-6">
-      <div class="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-950/60 p-6 shadow-lg">
-        <div class="text-xl font-semibold tracking-tight">Rootgrid</div>
-        <div class="mt-1 text-sm text-slate-400">Enter your client token to connect.</div>
+      <div class="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+        <div class="text-xl font-semibold tracking-tight text-slate-900">Rootgrid</div>
+        <div class="mt-1 text-sm text-slate-600">Enter your client token to connect.</div>
 
         <div class="mt-6">
           <label class="text-xs uppercase tracking-wider text-slate-500">Client token</label>
           <input
             v-model="authToken"
             type="password"
-            class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+            class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
             placeholder="paste token from ~/.rootgrid/config.json"
             @keydown.enter.prevent="login"
           />
-          <div v-if="authError" class="mt-2 text-sm text-red-400">{{ authError }}</div>
+          <div v-if="authError" class="mt-2 text-sm text-red-600">{{ authError }}</div>
         </div>
 
         <button
-          class="mt-4 w-full rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60"
+          class="mt-4 w-full rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
           @click="login"
         >
           Connect
@@ -2054,14 +3439,14 @@ onBeforeUnmount(() => {
     <div v-else class="h-full flex flex-col">
       <div
         v-if="connectionBanner"
-        class="shrink-0 border-b border-slate-900 bg-slate-950/70 backdrop-blur supports-[backdrop-filter]:bg-slate-950/40"
+        class="shrink-0 border-b border-slate-200 bg-white/80 backdrop-blur supports-[backdrop-filter]:bg-white/60"
       >
         <div class="flex items-center justify-between gap-3 px-4 py-2 text-xs">
-          <div class="min-w-0 truncate" :class="connectionBanner.tone === 'error' ? 'text-red-200' : 'text-amber-200'">
+          <div class="min-w-0 truncate" :class="connectionBanner.tone === 'error' ? 'text-red-700' : 'text-amber-700'">
             {{ connectionBanner.text }}
           </div>
           <button
-            class="shrink-0 rounded-md bg-slate-200/10 px-3 py-1.5 text-xs text-slate-100 transition-colors hover:bg-slate-200/15 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+            class="shrink-0 rounded-md bg-slate-100 px-3 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
             @click="connectSse"
             :disabled="!networkOnline"
           >
@@ -2072,144 +3457,101 @@ onBeforeUnmount(() => {
 
       <div class="flex flex-1 min-h-0">
         <!-- Sidebar -->
-        <aside
-          class="shrink-0 border-r border-slate-900 bg-slate-950/40 backdrop-blur supports-[backdrop-filter]:bg-slate-950/30 transition-[width] duration-200 ease-out flex flex-col overflow-hidden"
-          :class="sidebarCollapsed ? 'w-[76px]' : 'w-[320px]'"
-        >
-        <div class="shrink-0 px-3 py-4 border-b border-slate-900/80">
-          <div class="flex items-center justify-between gap-3">
-            <div class="flex items-center gap-2 min-w-0">
-              <button
-                class="inline-flex h-8 w-8 items-center justify-center rounded-md bg-slate-200/10 text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/50 active:scale-[0.98]"
-                @click="sidebarCollapsed = !sidebarCollapsed"
-                :title="sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'"
-              >
-                <component :is="sidebarCollapsed ? PanelLeftOpen : PanelLeftClose" class="h-4 w-4" />
-              </button>
-              <div v-if="!sidebarCollapsed" class="font-semibold tracking-tight">Rootgrid</div>
+        <aside class="shrink-0 w-[320px] border-r border-slate-200 bg-white flex flex-col">
+          <div class="shrink-0 px-4 py-4">
+            <div class="flex items-center justify-between gap-3">
+              <div class="font-semibold tracking-tight text-slate-900">Rootgrid</div>
+              <span
+                class="h-2 w-2 rounded-full"
+                :class="sseStatus === 'connected' ? 'bg-emerald-500' : (sseStatus === 'error' ? 'bg-red-500' : 'bg-amber-500')"
+                :title="`SSE: ${sseStatus}`"
+              />
             </div>
 
-            <div class="flex items-center gap-2" :class="sidebarCollapsed ? 'flex-col' : ''">
-	              <button
-	                class="inline-flex items-center justify-center gap-2 rounded-md bg-slate-200/10 px-2.5 py-1.5 text-xs text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/50 active:scale-[0.98]"
-	                @click="openSettings('defaults')"
-	                title="Settings"
-	              >
-	                <Settings class="h-3.5 w-3.5" />
-	              </button>
-	              <button
-	                class="inline-flex items-center justify-center gap-2 rounded-md bg-slate-200/10 px-2.5 py-1.5 text-xs text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/50 active:scale-[0.98]"
-	                @click="openArchiveModal"
-	                title="Archived chats"
-	              >
-	                <Archive class="h-3.5 w-3.5" />
-	              </button>
+            <div class="mt-4 space-y-1">
               <button
-                class="inline-flex items-center justify-center gap-2 rounded-md bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60 active:scale-[0.98]"
-                @click="newChat"
-                title="New chat"
+                class="w-full inline-flex items-center gap-3 rounded-lg px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 active:scale-[0.99]"
+                @click="openNewThreadDialog"
               >
-                <Plus class="h-3.5 w-3.5" />
-                <span v-if="!sidebarCollapsed">New</span>
+                <Plus class="h-4 w-4 text-slate-500" />
+                New thread
               </button>
             </div>
           </div>
 
-          <div v-if="!sidebarCollapsed" class="mt-2 text-xs text-slate-500">
-            SSE:
-            <span :class="sseStatus === 'connected' ? 'text-emerald-400' : (sseStatus === 'error' ? 'text-red-400' : 'text-amber-400')">
-              {{ sseStatus }}
-            </span>
-          </div>
-          <div v-else class="mt-2 flex items-center justify-center">
-            <span
-              class="h-2 w-2 rounded-full"
-              :class="sseStatus === 'connected' ? 'bg-emerald-400' : (sseStatus === 'error' ? 'bg-red-400' : 'bg-amber-400')"
-            />
-          </div>
-        </div>
-
-        <div class="flex-1 overflow-auto px-2 py-2">
-          <div v-if="!sidebarCollapsed" class="px-2 py-2 text-[11px] uppercase tracking-wider text-slate-500">Chats</div>
-          <div v-else class="h-2"></div>
-
-          <div v-if="!hasSnapshot" class="space-y-2 px-2 py-2">
-            <div
-              v-for="i in 7"
-              :key="i"
-              class="animate-pulse rounded-xl bg-slate-900/40"
-              :class="sidebarCollapsed ? 'h-10' : 'h-12'"
-            />
+          <div class="shrink-0 px-4 pb-2">
+            <div class="flex items-center justify-between gap-2">
+              <div class="text-[11px] uppercase tracking-wider text-slate-500">Threads</div>
+              <button
+                class="inline-flex h-8 w-8 items-center justify-center rounded-md text-slate-600 transition-colors hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                @click="openArchiveModal"
+                title="Archived threads"
+              >
+                <Archive class="h-4 w-4" />
+              </button>
+            </div>
           </div>
 
-          <div v-else>
-            <div v-if="!visibleSessions.length" class="px-3 py-10 text-center text-xs text-slate-500">
-              <span v-if="!sidebarCollapsed">No chats yet.</span>
+          <div class="flex-1 overflow-auto px-2 pb-2">
+            <div v-if="!hasSnapshot" class="space-y-2 px-2 py-2">
+              <div
+                v-for="i in 7"
+                :key="i"
+                class="h-11 animate-pulse rounded-lg bg-slate-100"
+              />
             </div>
 
-            <button
-              v-for="s in visibleSessions"
-              :key="s.sessionId"
-              class="group w-full rounded-xl text-left transition-colors hover:bg-slate-900/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 active:scale-[0.99]"
-              :class="[
-                sidebarCollapsed ? 'px-2 py-2' : 'px-3 py-2',
-                selectedSessionId === s.sessionId ? 'bg-slate-900/70 ring-1 ring-slate-800/80' : 'ring-1 ring-transparent'
-              ]"
-              :title="sessionTooltip(s)"
-              @click="selectedSessionId = s.sessionId"
-            >
-              <div :class="sidebarCollapsed ? 'flex items-center gap-2' : 'flex items-start gap-2'">
-                <span
-                  class="h-2.5 w-2.5 rounded-full ring-1 ring-black/25 shadow-sm"
-                  :class="[
-                    indicatorDotClass(sessionIndicator(s)),
-                    sidebarCollapsed ? '' : 'mt-1.5'
-                  ]"
-                />
-
-                <div v-if="sidebarCollapsed" class="flex-1 flex items-center justify-center">
-                  <div class="h-8 w-8 rounded-lg bg-slate-200/5 ring-1 ring-slate-800/70 flex items-center justify-center text-[11px] font-semibold text-slate-200">
-                    {{ sessionInitial(s) }}
-                  </div>
-                </div>
-
-                <div v-else class="min-w-0 flex-1">
-                  <div class="flex items-center justify-between gap-2">
-                    <div class="truncate text-sm font-medium text-slate-100">{{ sessionListTitle(s) }}</div>
-                    <div
-                      class="shrink-0 rounded-md border px-2 py-0.5 text-[10px] uppercase tracking-wider"
-                      :class="statusChipClass(s.status)"
-                    >
-                      {{ (s.status ?? 'unknown') }}
-                    </div>
-                  </div>
-
-                  <div class="mt-1 flex min-w-0 items-center gap-2 text-[11px] text-slate-500">
-                    <button
-                      class="shrink-0 max-w-[130px] truncate rounded-md bg-slate-200/5 px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-300 transition-colors hover:bg-slate-200/10 group-hover:bg-slate-200/10"
-                      :title="s.cwd"
-                      @click.stop="openRenameSession(s, { focus: 'project' })"
-                    >
-                      {{ sessionProject(s) }}
-                    </button>
-                    <span class="shrink-0 text-slate-700">·</span>
-                    <span class="shrink-0">{{ sessionHostName(s) }}</span>
-                  </div>
-
-                  <div class="mt-1 min-w-0 truncate text-xs text-slate-400/90">
-                    {{ s.preview ?? '' }}
-                  </div>
-                </div>
+            <div v-else>
+              <div v-if="!visibleSessions.length" class="px-3 py-10 text-center text-xs text-slate-500">
+                No threads yet.
               </div>
+
+              <button
+                v-for="s in visibleSessions"
+                :key="s.sessionId"
+                class="group w-full rounded-lg px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 active:scale-[0.99]"
+                :class="selectedSessionId === s.sessionId ? 'bg-slate-100' : 'hover:bg-slate-50'"
+                :title="sessionTooltip(s)"
+                @click="selectedSessionId = s.sessionId"
+              >
+                <div class="flex items-center justify-between gap-3">
+                  <div class="min-w-0 flex items-center gap-2">
+                    <span class="h-2 w-2 rounded-full" :class="indicatorDotClass(sessionIndicator(s))" />
+                    <div class="truncate text-sm font-medium text-slate-900">{{ sessionListTitle(s) }}</div>
+                  </div>
+                  <div class="shrink-0 text-xs text-slate-500">{{ formatAgeShort(s.updatedMs) }}</div>
+                </div>
+
+                <div class="mt-0.5 flex min-w-0 items-center gap-2 text-xs text-slate-500">
+                  <button
+                    class="shrink-0 max-w-[160px] truncate rounded-md px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-600 transition-colors hover:bg-slate-200/60"
+                    :title="s.cwd"
+                    @click.stop="openRenameSession(s, { focus: 'project' })"
+                  >
+                    {{ sessionProject(s) }}
+                  </button>
+                  <span class="shrink-0 text-slate-300">·</span>
+                  <span class="truncate">{{ sessionHostName(s) }}</span>
+                </div>
+              </button>
+            </div>
+          </div>
+
+          <div class="shrink-0 border-t border-slate-200 p-2">
+            <button
+              class="w-full inline-flex items-center gap-3 rounded-lg px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 active:scale-[0.99]"
+              @click="openSettings('defaults')"
+            >
+              <Settings class="h-4 w-4 text-slate-500" />
+              Settings
             </button>
           </div>
-        </div>
-      </aside>
+        </aside>
 
       <!-- Main -->
-      <main class="flex-1 grid grid-cols-1" :class="(showDiff || showPlan) ? 'lg:grid-cols-[1fr_520px]' : ''">
-        <section class="min-w-0 flex flex-col">
-          <header class="border-b border-slate-900 bg-slate-950/40 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-slate-950/25">
+      <main class="flex-1 grid grid-cols-1 bg-slate-50" :class="showPlan ? 'lg:grid-cols-[1fr_520px]' : ''">
+        <section class="min-w-0 flex flex-col bg-white">
+          <header class="border-b border-slate-200 bg-white px-4 py-3">
             <div class="flex items-center justify-between gap-4">
               <div class="min-w-0">
                 <div class="flex items-center gap-2">
@@ -2218,108 +3560,58 @@ onBeforeUnmount(() => {
                     class="h-2.5 w-2.5 rounded-full ring-1 ring-black/25 shadow-sm"
                     :class="indicatorDotClass(sessionIndicator(selectedSession))"
                   />
-                  <button
-                    v-if="selectedSession"
-                    class="truncate text-sm font-medium text-slate-100 transition-colors hover:text-white hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 rounded"
-                    title="Rename chat"
-                    @click="openRenameSession(selectedSession, { focus: 'title' })"
-                  >
-                    {{ sessionListTitle(selectedSession) }}
-                  </button>
-                  <div v-else class="truncate text-sm font-medium text-slate-100">New chat</div>
+                  <div v-if="selectedSession" class="min-w-0 flex items-center gap-2">
+                    <button
+                      class="truncate text-sm font-medium text-slate-900 transition-colors hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 rounded"
+                      title="Rename thread"
+                      @click="openRenameSession(selectedSession, { focus: 'title' })"
+                    >
+                      {{ sessionListTitle(selectedSession) }}
+                    </button>
+                    <button
+                      class="shrink-0 rounded-md bg-slate-100 px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-700 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                      title="Rename project label"
+                      @click="openRenameSession(selectedSession, { focus: 'project' })"
+                    >
+                      {{ sessionProject(selectedSession) }}
+                    </button>
+                  </div>
+                  <div v-else class="truncate text-sm font-medium text-slate-900">New thread</div>
                 </div>
-                <div class="mt-1 truncate text-xs text-slate-500" :title="selectedSession?.cwd ?? defaults.cwd">
+                <div class="mt-1 truncate text-xs text-slate-600" :title="selectedSession?.cwd ?? defaults.cwd">
                   {{ selectedSession?.cwd ?? (defaults.cwd ? defaults.cwd : 'Pick a workspace to start') }}
                 </div>
                 <div v-if="selectedTokenUsage" class="mt-1 flex items-center gap-2 text-[11px] text-slate-500">
                   <span class="truncate">
                     Tokens:
-                    <span v-if="selectedTokenUsage.lastTotalTokens !== null" class="text-slate-300">last {{ formatCompactInt(selectedTokenUsage.lastTotalTokens) }}</span>
-                    <span v-else class="text-slate-400">last —</span>
-                    <span class="text-slate-700">·</span>
-                    <span v-if="selectedTokenUsage.totalTotalTokens !== null" class="text-slate-300">total {{ formatCompactInt(selectedTokenUsage.totalTotalTokens) }}</span>
-                    <span v-else class="text-slate-400">total —</span>
-                    <span v-if="selectedTokenUsage.modelContextWindow !== null" class="text-slate-700">·</span>
-                    <span v-if="selectedTokenUsage.modelContextWindow !== null" class="text-slate-400">ctx {{ formatCompactInt(selectedTokenUsage.modelContextWindow) }}</span>
+                    <span v-if="selectedTokenUsage.lastTotalTokens !== null" class="text-slate-700">last {{ formatCompactInt(selectedTokenUsage.lastTotalTokens) }}</span>
+                    <span v-else class="text-slate-500">last —</span>
+                    <span class="text-slate-300">·</span>
+                    <span v-if="selectedTokenUsage.totalTotalTokens !== null" class="text-slate-700">total {{ formatCompactInt(selectedTokenUsage.totalTotalTokens) }}</span>
+                    <span v-else class="text-slate-500">total —</span>
+                    <span v-if="selectedTokenUsage.modelContextWindow !== null" class="text-slate-300">·</span>
+                    <span v-if="selectedTokenUsage.modelContextWindow !== null" class="text-slate-500">ctx {{ formatCompactInt(selectedTokenUsage.modelContextWindow) }}</span>
                   </span>
                 </div>
               </div>
 
               <div class="flex items-center gap-2">
                 <button
-                  v-if="selectedSessionId"
-                  class="inline-flex items-center gap-2 rounded-md bg-slate-200/10 px-3 py-1.5 text-xs text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
-                  @click="openSessionPolicy"
-                  title="Approval & sandbox settings"
-                >
-                  <Settings class="h-3.5 w-3.5" />
-                  Policies
-                </button>
-                <button
-                  class="inline-flex items-center gap-2 rounded-md bg-slate-200/10 px-3 py-1.5 text-xs text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
-                  @click="showDiff = !showDiff"
-                >
-                  <component :is="showDiff ? PanelRightClose : PanelRightOpen" class="h-3.5 w-3.5" />
-                  Diff
-                </button>
-                <button
-                  class="inline-flex items-center gap-2 rounded-md bg-slate-200/10 px-3 py-1.5 text-xs text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
+                  class="inline-flex items-center gap-2 rounded-md bg-slate-100 px-3 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
                   @click="showPlan = !showPlan"
                 >
                   <component :is="showPlan ? PanelRightClose : PanelRightOpen" class="h-3.5 w-3.5" />
                   Plan
                 </button>
                 <button
-                  class="inline-flex items-center gap-2 rounded-md bg-slate-200/10 px-3 py-1.5 text-xs text-slate-100 transition-colors hover:bg-slate-200/15 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 active:scale-[0.99]"
+                  class="inline-flex items-center gap-2 rounded-md bg-slate-100 px-3 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 active:scale-[0.99]"
                   @click="openVSCode"
                   title="Open VS Code web (code-server)"
                   :disabled="ideStarting"
                 >
                   <Loader2 v-if="ideStarting" class="h-3.5 w-3.5 animate-spin" />
                   <Code v-else class="h-3.5 w-3.5" />
-                  VS Code
-                </button>
-                <button
-                  v-if="selectedSessionId && !selectedSession?.archivedMs"
-                  class="inline-flex items-center gap-2 rounded-md bg-slate-200/10 px-3 py-1.5 text-xs text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 active:scale-[0.99]"
-                  @click="archiveCurrentSession"
-                  title="Archive chat"
-                >
-                  <Archive class="h-3.5 w-3.5" />
-                  Archive
-                </button>
-                <button
-                  v-if="selectedSessionId && selectedSession?.archivedMs"
-                  class="inline-flex items-center gap-2 rounded-md bg-slate-200/10 px-3 py-1.5 text-xs text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 active:scale-[0.99]"
-                  @click="unarchiveSessionById(selectedSessionId)"
-                  title="Unarchive chat"
-                >
-                  <Archive class="h-3.5 w-3.5" />
-                  Unarchive
-                </button>
-                <button
-                  v-if="selectedSessionId"
-                  class="inline-flex items-center gap-2 rounded-md bg-red-500/10 px-3 py-1.5 text-xs text-red-200 transition-colors hover:bg-red-500/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/40 active:scale-[0.99]"
-                  @click="openDeleteModal(selectedSessionId)"
-                  title="Delete chat"
-                >
-                  <Trash2 class="h-3.5 w-3.5" />
-                  Delete
-                </button>
-                <button
-                  v-if="selectedSession?.turnState === 'running'"
-                  class="inline-flex items-center gap-2 rounded-md bg-amber-500/10 px-3 py-1.5 text-xs text-amber-200 transition-colors hover:bg-amber-500/15 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40"
-                  @click="stopGenerating"
-                >
-                  <Square class="h-3.5 w-3.5" />
-                  Stop generating
-                </button>
-                <button
-                  class="inline-flex items-center gap-2 rounded-md bg-red-500/10 px-3 py-1.5 text-xs text-red-200 transition-colors hover:bg-red-500/15 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/40"
-                  :disabled="!selectedSessionId"
-                  @click="stopSession"
-                >
-                  End session
+                  Open
                 </button>
               </div>
             </div>
@@ -2330,128 +3622,222 @@ onBeforeUnmount(() => {
               <div class="mx-auto w-full max-w-3xl">
               <div v-if="selectedSessionId && sessionLoading" class="py-10">
                 <div class="space-y-3 animate-pulse">
-                  <div class="h-8 w-2/3 rounded-xl bg-slate-900/40" />
-                  <div class="h-6 w-1/3 rounded-xl bg-slate-900/35" />
-                  <div class="h-20 w-full rounded-2xl bg-slate-900/35" />
-                  <div class="h-20 w-11/12 rounded-2xl bg-slate-900/30" />
+                  <div class="h-8 w-2/3 rounded-xl bg-slate-100" />
+                  <div class="h-6 w-1/3 rounded-xl bg-slate-100" />
+                  <div class="h-20 w-full rounded-2xl bg-slate-100" />
+                  <div class="h-20 w-11/12 rounded-2xl bg-slate-100" />
                 </div>
               </div>
 
               <div v-else-if="!selectedSessionId && !chatMessages.length" class="py-16 text-center">
-                <div class="text-lg font-semibold text-slate-200">Start a chat</div>
-                <div class="mt-2 text-sm text-slate-500">
+                <div class="text-lg font-semibold text-slate-900">Start a thread</div>
+                <div class="mt-2 text-sm text-slate-600">
                   Type a message below to start a new Codex session in your workspace.
                 </div>
               </div>
 
               <div v-else-if="selectedSessionId && !chatMessages.length" class="py-16 text-center">
-                <div class="text-sm font-medium text-slate-200">No messages yet</div>
-                <div class="mt-2 text-sm text-slate-500">Waiting for events…</div>
+                <div class="text-sm font-medium text-slate-900">No messages yet</div>
+                <div class="mt-2 text-sm text-slate-600">Waiting for events…</div>
               </div>
 
               <div v-else>
               <div v-if="selectedStore?.loadingBefore" class="pb-4 text-center text-xs text-slate-500">Loading earlier…</div>
-              <transition-group name="rg-msg" tag="div" class="space-y-5">
+              <transition-group name="rg-msg" tag="div" class="space-y-3">
                 <div
                   v-for="m in chatMessages"
                   :key="m.id"
                   class="flex"
                   :class="m.role === 'user' ? 'justify-end' : 'justify-start'"
                 >
-                  <div
-                    v-if="m.role === 'system'"
-                    class="w-full rounded-lg border border-slate-900 bg-slate-950/30 px-3 py-2 text-xs text-slate-400"
-                  >
-                    {{ m.text }}
-                  </div>
+                  <!-- Interleaved "step lines" (reasoning sections + tools) -->
+                  <div v-if="m.role === 'step'" class="w-full">
+                    <!-- Reasoning step -->
+                    <details v-if="m.stepKind === 'reasoning'" class="group w-full">
+                      <summary class="cursor-pointer select-none truncate text-xs font-medium text-slate-700 hover:text-slate-900">
+                        {{ m.title || 'Reasoning' }}
+                      </summary>
+                      <div v-if="String(m.body ?? '').trim()" class="mt-2 border-l border-slate-200 pl-4">
+                        <MarkdownView :source="m.body" />
+                      </div>
+                    </details>
 
-                  <div
-                    v-else-if="m.role === 'toolcall'"
-                    class="max-w-[860px] rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3 text-sm text-slate-100 shadow-sm"
-                  >
-                    <div class="flex items-start justify-between gap-3">
-                      <div class="min-w-0">
-                        <div class="text-[11px] uppercase tracking-wider text-slate-500">
-                          {{ m.tool === 'commandExecution' ? 'Command' : (m.tool === 'fileChange' ? 'File changes' : 'Tool') }}
-                          <span class="text-slate-700">·</span>
-                          <span class="text-slate-300">{{ String(m.status ?? '') }}</span>
-                          <span v-if="m.exitCode !== null && m.exitCode !== undefined" class="text-slate-700">·</span>
-                          <span v-if="m.exitCode !== null && m.exitCode !== undefined" class="text-slate-300">exit {{ m.exitCode }}</span>
-                        </div>
-                        <div v-if="m.command" class="mt-1 truncate text-xs font-mono text-slate-200" :title="m.command">{{ m.command }}</div>
-                        <div v-else-if="m.tool === 'fileChange'" class="mt-1 text-xs text-slate-300">
-                          {{ Array.isArray(m.changes) ? `${m.changes.length} file(s)` : 'file changes' }}
+                    <!-- Explore fold (derived from read/search/list commands) -->
+                    <details v-else-if="m.stepKind === 'explore'" class="group w-full">
+                      <summary class="cursor-pointer select-none truncate text-xs font-medium text-slate-700 hover:text-slate-900">
+                        {{ m.title || 'Explored' }}
+                      </summary>
+                      <div v-if="Array.isArray(m.entries) && m.entries.length" class="mt-2 border-l border-slate-200 pl-4">
+                        <div class="space-y-1 text-xs text-slate-700">
+                          <div v-for="e in m.entries" :key="e.id" class="truncate" :title="e.label">{{ e.label }}</div>
                         </div>
                       </div>
+                    </details>
 
-                      <button
-                        class="shrink-0 rounded-md bg-slate-200/10 px-2.5 py-1.5 text-xs text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 active:scale-[0.99]"
-                        @click="toggleToolExpanded(m.itemId)"
-                      >
-                        {{ m.expanded ? 'Hide' : 'Details' }}
-                      </button>
-                    </div>
-
-                    <div v-if="m.expanded" class="mt-3 space-y-3">
-                      <div v-if="m.tool === 'fileChange' && Array.isArray(m.changes) && m.changes.length" class="rounded-lg border border-slate-900 bg-slate-950/40 p-3">
-                        <div class="text-[11px] uppercase tracking-wider text-slate-500">Files</div>
-                        <div class="mt-2 space-y-1 text-xs font-mono text-slate-200">
-                          <div v-for="(c, idx) in m.changes.slice(0, 50)" :key="idx" class="truncate" :title="c.path">{{ c.path }}</div>
-                          <div v-if="m.changes.length > 50" class="text-[11px] text-slate-500">…and {{ m.changes.length - 50 }} more</div>
-                        </div>
-                      </div>
-
-                      <div class="rounded-lg border border-slate-900 bg-slate-950/40 p-3">
-                        <div class="flex items-center justify-between gap-3">
-                          <div class="text-[11px] uppercase tracking-wider text-slate-500">Output</div>
-                          <button
-                            v-if="m.output?.hasMoreBefore"
-                            class="rounded-md bg-slate-200/10 px-2.5 py-1.5 text-xs text-slate-100 transition-colors hover:bg-slate-200/15 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                            :disabled="m.output?.loading"
-                            @click="loadMoreToolOutputBefore(selectedSessionId, m.itemId)"
+                    <!-- Inline diffs (VS Code-like) -->
+                    <div v-else-if="m.stepKind === 'diff'" class="w-full">
+                      <div class="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+                        <div class="flex items-center gap-2 border-b border-slate-200 bg-slate-50 px-3 py-2">
+                          <div class="shrink-0 text-[11px] uppercase tracking-wider text-slate-500">Edited file</div>
+                          <select
+                            v-if="Array.isArray(m.files) && m.files.length > 1"
+                            :value="diffStepSelectedPath(m.id, m.files)"
+                            class="min-w-0 flex-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-400/30"
+                            @change="setDiffStepSelectedPath(m.id, $event.target.value)"
                           >
-                            Load more
+                            <option v-for="f in m.files" :key="f.path" :value="f.path">{{ f.path }}</option>
+                          </select>
+                          <div v-else class="min-w-0 flex-1 truncate text-xs font-mono text-slate-800">
+                            {{ diffStepSelectedFile(m.id, m.files)?.path ?? '' }}
+                          </div>
+                          <button
+                            class="inline-flex h-7 w-7 items-center justify-center rounded-md bg-white text-slate-700 transition-colors hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/40"
+                            title="Copy diff"
+                            @click="copyText(diffStepSelectedFile(m.id, m.files)?.raw ?? m.raw ?? '')"
+                          >
+                            <Copy class="h-3.5 w-3.5" />
                           </button>
                         </div>
 
-                        <div v-if="m.output?.loading" class="mt-2 text-xs text-slate-500">Loading…</div>
-
-                        <div v-if="m.output?.stdout" class="mt-2">
-                          <div class="mb-1 text-[10px] uppercase tracking-wider text-slate-500">stdout</div>
-                          <pre class="m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-slate-900 bg-slate-950/50 p-2 text-xs font-mono text-slate-200">{{ m.output.stdout }}</pre>
+                        <div v-if="!Array.isArray(m.files) || !m.files.length" class="p-3">
+                          <pre class="m-0 whitespace-pre-wrap break-words text-xs font-mono text-slate-800">{{ m.raw ?? '' }}</pre>
                         </div>
 
-                        <div v-if="m.output?.stderr" class="mt-2">
-                          <div class="mb-1 text-[10px] uppercase tracking-wider text-slate-500">stderr</div>
-                          <pre class="m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-slate-900 bg-slate-950/50 p-2 text-xs font-mono text-slate-200">{{ m.output.stderr }}</pre>
-                        </div>
+                        <template v-else>
+                          <div class="flex items-center justify-between gap-3 border-b border-slate-200 px-3 py-2">
+                            <div class="min-w-0 truncate text-xs font-mono text-slate-800">
+                              {{ diffStepSelectedFile(m.id, m.files)?.path ?? '' }}
+                            </div>
+                            <div class="shrink-0 text-xs font-mono">
+                              <span class="text-emerald-700">+{{ diffStepSelectedFile(m.id, m.files)?.added ?? 0 }}</span>
+                              <span class="ml-2 text-rose-700">-{{ diffStepSelectedFile(m.id, m.files)?.removed ?? 0 }}</span>
+                            </div>
+                          </div>
 
-                        <div v-if="m.output && !m.output.loading && !m.output.stdout && !m.output.stderr" class="mt-2 text-xs text-slate-500">
-                          (no output)
-                        </div>
+                          <div class="max-h-[520px] overflow-auto">
+                            <table class="w-full border-collapse text-xs font-mono">
+                              <tbody>
+                                <tr
+                                  v-for="(l, idx) in (diffStepSelectedFile(m.id, m.files)?.lines ?? [])"
+                                  :key="idx"
+                                  :class="l.kind === 'add'
+                                    ? 'bg-emerald-50'
+                                    : (l.kind === 'del'
+                                      ? 'bg-rose-50'
+                                      : (l.kind === 'hunk' ? 'bg-slate-100' : 'bg-white'))"
+                                >
+                                  <td class="w-12 select-none whitespace-nowrap pr-2 text-right align-top text-slate-400">{{ l.oldLine ?? '' }}</td>
+                                  <td class="w-12 select-none whitespace-nowrap pr-2 text-right align-top text-slate-400">{{ l.newLine ?? '' }}</td>
+                                  <td class="pr-3 align-top">
+                                    <pre
+                                      class="m-0 whitespace-pre text-slate-800"
+                                      :class="l.kind === 'hunk' ? 'text-slate-600' : ''"
+                                    >{{ l.kind === 'hunk' ? l.text : l.text }}</pre>
+                                  </td>
+                                </tr>
+                              </tbody>
+                            </table>
+                          </div>
+                        </template>
                       </div>
                     </div>
+
+                    <!-- Tool step -->
+                    <details
+                      v-else
+                      class="group w-full"
+                      :open="m.expanded"
+                      @toggle="onToolDetailsToggle(m.itemId, $event)"
+                    >
+                      <summary class="cursor-pointer select-none flex items-center justify-between gap-3">
+                        <div class="min-w-0 flex items-center gap-2 text-xs text-slate-600">
+                          <span class="shrink-0 text-[10px] uppercase tracking-wider text-slate-400">
+                            {{ m.tool === 'commandExecution' ? 'Command' : (m.tool === 'fileChange' ? 'File changes' : 'Tool') }}
+                          </span>
+                          <span class="shrink-0 text-slate-300">·</span>
+                          <span class="shrink-0 text-slate-600">{{ String(m.status ?? '') }}</span>
+                          <span v-if="m.exitCode !== null && m.exitCode !== undefined" class="shrink-0 text-slate-300">·</span>
+                          <span v-if="m.exitCode !== null && m.exitCode !== undefined" class="shrink-0 text-slate-600">exit {{ m.exitCode }}</span>
+
+                          <span
+                            v-if="toolDisplayCommand(m)"
+                            class="min-w-0 truncate font-mono text-slate-800"
+                            :title="toolDisplayCommand(m)"
+                          >
+                            {{ toolDisplayCommand(m) }}
+                          </span>
+                          <span v-else-if="m.tool === 'fileChange'" class="min-w-0 truncate text-slate-700">
+                            {{ Array.isArray(m.changes) ? `${m.changes.length} file(s)` : 'file changes' }}
+                          </span>
+                        </div>
+                      </summary>
+
+                      <div class="mt-2 space-y-3 border-l border-slate-200 pl-4">
+                        <div
+                          v-if="m.tool === 'fileChange' && Array.isArray(m.changes) && m.changes.length"
+                          class="rounded-lg border border-slate-200 bg-slate-50 p-3"
+                        >
+                          <div class="text-[11px] uppercase tracking-wider text-slate-500">Files</div>
+                          <div class="mt-2 space-y-1 text-xs font-mono text-slate-800">
+                            <div v-for="(c, idx) in m.changes.slice(0, 50)" :key="idx" class="truncate" :title="c.path">{{ c.path }}</div>
+                            <div v-if="m.changes.length > 50" class="text-[11px] text-slate-500">…and {{ m.changes.length - 50 }} more</div>
+                          </div>
+                        </div>
+
+                        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                          <div class="flex items-center justify-between gap-3">
+                            <div class="text-[11px] uppercase tracking-wider text-slate-500">Output</div>
+                            <button
+                              v-if="m.output?.hasMoreBefore"
+                              class="rounded-md bg-slate-100 px-2.5 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                              :disabled="m.output?.loading"
+                              @click="loadMoreToolOutputBefore(selectedSessionId, m.itemId)"
+                            >
+                              Load more
+                            </button>
+                          </div>
+
+                          <div v-if="!m.output" class="mt-2 text-xs text-slate-500">Loading…</div>
+                          <div v-else>
+                            <div v-if="m.output.loading" class="mt-2 text-xs text-slate-500">Loading…</div>
+
+                            <div v-if="m.output.stdout" class="mt-2">
+                              <div class="mb-1 text-[10px] uppercase tracking-wider text-slate-500">stdout</div>
+                              <pre class="m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-slate-200 bg-white p-2 text-xs font-mono text-slate-800">{{ m.output.stdout }}</pre>
+                            </div>
+
+                            <div v-if="m.output.stderr" class="mt-2">
+                              <div class="mb-1 text-[10px] uppercase tracking-wider text-slate-500">stderr</div>
+                              <pre class="m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-slate-200 bg-white p-2 text-xs font-mono text-slate-800">{{ m.output.stderr }}</pre>
+                            </div>
+
+                            <div v-if="!m.output.loading && !m.output.stdout && !m.output.stderr" class="mt-2 text-xs text-slate-500">
+                              (no output)
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </details>
                   </div>
 
-                  <div
-                    v-else-if="m.role === 'tool'"
-                    class="max-w-[860px] rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3 text-xs font-mono text-slate-200 shadow-sm"
-                  >
-                    <div class="mb-2 flex items-center justify-between text-[10px] font-sans uppercase tracking-wider text-slate-500">
-                      <span>{{ m.stream ?? 'tool' }}</span>
-                    </div>
+                  <!-- System lines -->
+                  <div v-else-if="m.role === 'system'" class="w-full text-xs text-slate-600">
+                    <div class="mb-1 text-[10px] uppercase tracking-wider text-slate-400">{{ m.stream ?? 'system' }}</div>
                     <pre class="m-0 whitespace-pre-wrap">{{ m.text }}</pre>
                   </div>
 
+                  <!-- User + assistant bubbles -->
                   <div
                     v-else
                     class="max-w-[860px] rounded-2xl border px-4 py-3 text-sm leading-relaxed shadow-sm transition-colors"
                     :class="m.role === 'user'
-                      ? 'bg-indigo-500/15 text-indigo-50 border-indigo-400/20'
-                      : 'bg-slate-950/40 text-slate-100 border-slate-800/80'"
+                      ? 'bg-indigo-50 text-indigo-950 border-indigo-200'
+                      : 'bg-white text-slate-900 border-slate-200'"
                   >
                     <div v-if="m.role === 'assistant'">
-                      <MarkdownView :source="m.text" />
+                      <div v-if="String(m.text ?? '').trim()">
+                        <MarkdownView :source="m.text" />
+                      </div>
                     </div>
                     <div v-else>
                       <div v-if="Array.isArray(m.attachments) && m.attachments.length" class="mb-2 flex flex-wrap gap-2">
@@ -2468,11 +3854,11 @@ onBeforeUnmount(() => {
                             v-if="isImageType(a.mimeType)"
                             :src="a.url"
                             :alt="a.filename"
-                            class="h-20 w-20 rounded-xl object-cover ring-1 ring-slate-800/70 hover:ring-slate-700"
+                            class="h-20 w-20 rounded-xl object-cover ring-1 ring-slate-200 hover:ring-slate-300"
                           />
                           <div
                             v-else
-                            class="flex h-12 max-w-[220px] items-center justify-center rounded-xl bg-slate-200/5 px-3 text-xs text-slate-200 ring-1 ring-slate-800/70 hover:ring-slate-700"
+                            class="flex h-12 max-w-[220px] items-center justify-center rounded-xl bg-white px-3 text-xs text-slate-800 ring-1 ring-slate-200 hover:ring-slate-300"
                           >
                             <div class="truncate">{{ a.filename }}</div>
                           </div>
@@ -2489,7 +3875,7 @@ onBeforeUnmount(() => {
 
             <button
               v-if="selectedSessionId && !stickToBottom"
-              class="absolute bottom-4 right-4 inline-flex items-center gap-2 rounded-full border border-slate-800 bg-slate-950/80 px-3 py-2 text-xs text-slate-100 shadow-lg backdrop-blur transition-colors hover:bg-slate-900/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 active:scale-[0.99]"
+              class="absolute bottom-4 right-4 inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs text-slate-800 shadow-lg transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 active:scale-[0.99]"
               @click="scrollToBottom"
               title="Scroll to bottom"
             >
@@ -2499,7 +3885,7 @@ onBeforeUnmount(() => {
           </div>
 
           <footer
-            class="relative border-t border-slate-900 bg-slate-950/40 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-slate-950/25"
+            class="relative border-t border-slate-200 bg-white px-4 py-3"
             @dragenter.prevent="onComposerDragEnter"
             @dragleave.prevent="onComposerDragLeave"
             @dragover.prevent
@@ -2508,104 +3894,144 @@ onBeforeUnmount(() => {
             <div class="mx-auto w-full max-w-3xl">
               <div
                 v-if="composerDragging"
-                class="pointer-events-none absolute inset-0 flex items-center justify-center border-2 border-dashed border-indigo-500/50 bg-indigo-500/5 text-sm font-medium text-indigo-200"
+                class="pointer-events-none absolute inset-0 flex items-center justify-center border-2 border-dashed border-slate-900/30 bg-slate-900/5 text-sm font-medium text-slate-700"
               >
                 Drop files to attach
               </div>
-              <div v-if="ideError" class="mb-2 text-sm text-red-400">{{ ideError }}</div>
-              <div v-if="sendError" class="mb-2 text-sm text-red-400">{{ sendError }}</div>
+              <div v-if="ideError" class="mb-2 text-sm text-red-600">{{ ideError }}</div>
+              <div v-if="sendError" class="mb-2 text-sm text-red-600">{{ sendError }}</div>
+              <div v-if="composerOptionsError" class="mb-2 text-sm text-red-600">{{ composerOptionsError }}</div>
+              <div v-if="modelCatalogError" class="mb-2 text-sm text-red-600">{{ modelCatalogError }}</div>
 
-              <div class="mb-2 flex items-center justify-between gap-2 text-xs text-slate-500">
-                <div class="truncate">
-                  Workspace:
-                  <span class="text-slate-200">{{ defaults.cwd || '(not set)' }}</span>
-                  <span class="text-slate-500"> · </span>
-                  Machine:
-                  <span class="text-slate-200">{{ defaults.machineId ? defaults.machineId.slice(0, 8) : 'auto' }}</span>
-                </div>
-                <button class="text-slate-300 transition-colors hover:text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 rounded" @click="openSettings('defaults')">Edit</button>
-              </div>
-
-              <div v-if="attachments.length" class="mb-2 flex flex-wrap gap-2">
-                <div
-                  v-for="a in attachments"
-                  :key="a.id"
-                  class="relative rounded-xl border border-slate-800 bg-slate-950/60 p-2"
-                >
-                  <button
-                    class="absolute -right-2 -top-2 inline-flex h-6 w-6 items-center justify-center rounded-full bg-slate-950 text-slate-200 ring-1 ring-slate-800/70 hover:bg-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
-                    @click="removeAttachment(a.id)"
-                    title="Remove"
-                  >
-                    <X class="h-3.5 w-3.5" />
-                  </button>
-
-                  <img
-                    v-if="a.previewUrl"
-                    :src="a.previewUrl"
-                    :alt="a.filename"
-                    class="h-16 w-16 rounded-lg object-cover"
-                  />
-                  <div v-else class="flex h-16 w-40 items-center justify-center rounded-lg bg-slate-200/5 px-2 text-xs text-slate-200">
-                    <div class="truncate" :title="a.filename">{{ a.filename }}</div>
-                  </div>
-                </div>
-              </div>
-
-              <div class="flex items-end gap-2">
-                <input
-                  ref="fileInputEl"
-                  type="file"
-                  class="hidden"
-                  multiple
-                  @change="onFilesPicked"
-                />
-                <button
-                  class="inline-flex items-center justify-center rounded-xl border border-slate-800 bg-slate-950 px-3 py-2 text-slate-200 transition-colors hover:bg-slate-900/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 active:scale-[0.99]"
-                  @click="openFilePicker"
-                  title="Attach files"
-                >
-                  <Paperclip class="h-4 w-4" />
-                </button>
+              <div class="rounded-3xl border border-slate-200 bg-white px-4 py-3 shadow-sm transition-colors focus-within:border-slate-300 focus-within:ring-2 focus-within:ring-slate-400/30">
                 <textarea
                   v-model="messageDraft"
                   rows="2"
-                  class="flex-1 resize-none rounded-xl border border-slate-800 bg-slate-950 px-3 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
-                  placeholder="Message Codex…"
+                  class="w-full resize-none bg-transparent text-sm text-slate-900 outline-none placeholder:text-slate-400"
+                  placeholder="Ask for follow-up changes…"
                   @keydown.enter.exact.prevent="submit"
                   @paste="onComposerPaste"
                 />
-                <button
-                  class="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60 active:scale-[0.99]"
-                  @click="submit"
-                  :disabled="sending || (!messageDraft.trim() && !attachments.length)"
-                >
-                  <Loader2 v-if="sending" class="h-4 w-4 animate-spin" />
-                  <Send v-else class="h-4 w-4" />
-                  Send
-                </button>
+
+                <div v-if="attachments.length" class="mt-2 flex flex-wrap gap-2">
+                  <div
+                    v-for="a in attachments"
+                    :key="a.id"
+                    class="relative rounded-2xl border border-slate-200 bg-white p-2"
+                  >
+                    <button
+                      class="absolute -right-2 -top-2 inline-flex h-6 w-6 items-center justify-center rounded-full bg-white text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/40"
+                      @click="removeAttachment(a.id)"
+                      title="Remove"
+                    >
+                      <X class="h-3.5 w-3.5" />
+                    </button>
+
+                    <img
+                      v-if="a.previewUrl"
+                      :src="a.previewUrl"
+                      :alt="a.filename"
+                      class="h-14 w-14 rounded-xl object-cover"
+                    />
+                    <div v-else class="flex h-14 w-40 items-center justify-center rounded-xl bg-slate-50 px-2 text-xs text-slate-800">
+                      <div class="truncate" :title="a.filename">{{ a.filename }}</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="mt-2 flex items-center justify-between gap-2">
+                  <div class="flex min-w-0 items-center gap-2">
+                    <input
+                      ref="fileInputEl"
+                      type="file"
+                      class="hidden"
+                      multiple
+                      @change="onFilesPicked"
+                    />
+                    <button
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-full bg-transparent text-slate-700 transition-colors hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/40 active:scale-[0.99]"
+                      @click="openFilePicker"
+                      title="Upload files/images"
+                    >
+                      <Plus class="h-4 w-4" />
+                    </button>
+
+                    <select
+                      v-model="composerModel"
+                      class="h-9 max-w-[170px] rounded-full border border-slate-200 bg-white px-3 pr-8 text-xs text-slate-900 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/30 sm:max-w-[220px]"
+                      title="Model"
+                      :disabled="modelCatalogLoading && !composerModelOptions.length"
+                    >
+                      <option value="">
+                        {{ defaultCodexModel ? String(defaultCodexModel.displayName ?? defaultCodexModel.display_name ?? defaultCodexModel.id ?? defaultCodexModel.model) : 'Model' }}
+                      </option>
+                      <option v-for="opt in composerModelOptions" :key="opt.value" :value="opt.value">
+                        {{ opt.label }}
+                      </option>
+                    </select>
+
+                    <select
+                      v-model="composerReasoningEffort"
+                      class="h-9 rounded-full border border-slate-200 bg-white px-3 pr-8 text-xs text-slate-900 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/30"
+                      title="Reasoning effort"
+                    >
+                      <option value="">
+                        {{
+                          selectedCodexDefaultReasoningEffort
+                            ? `Auto (${labelReasoningEffort(selectedCodexDefaultReasoningEffort)})`
+                            : 'Auto'
+                        }}
+                      </option>
+                      <option v-for="opt in composerReasoningEffortOptions" :key="opt.value" :value="opt.value" :title="opt.description || ''">
+                        {{ opt.label }}
+                      </option>
+                    </select>
+
+                    <select
+                      v-model="composerApprovalPolicy"
+                      class="h-9 rounded-full border border-slate-200 bg-white px-3 pr-8 text-xs text-slate-900 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/30"
+                      title="Approvals"
+                    >
+                      <option value="on-request">Ask</option>
+                      <option value="untrusted">Unless trusted</option>
+                      <option value="on-failure">On failure</option>
+                      <option value="never">Never ask</option>
+                    </select>
+
+                    <select
+                      v-model="composerSandbox"
+                      class="h-9 rounded-full border border-slate-200 bg-white px-3 pr-8 text-xs text-slate-900 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/30"
+                      title="Permissions"
+                    >
+                      <option value="read-only">Read only</option>
+                      <option value="workspace-write">Workspace write</option>
+                      <option value="danger-full-access">Full access</option>
+                    </select>
+                  </div>
+
+                  <button
+                    class="inline-flex h-9 w-9 items-center justify-center rounded-full bg-slate-900 text-white transition-colors hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/50 active:scale-[0.99]"
+                    @click="submit"
+                    :disabled="sending || (selectedSession?.turnState !== 'running' && !messageDraft.trim() && !attachments.length)"
+                    :title="selectedSession?.turnState === 'running' ? 'Stop' : 'Send'"
+                  >
+                    <Loader2 v-if="sending" class="h-4 w-4 animate-spin" />
+                    <Square v-else-if="selectedSession?.turnState === 'running'" class="h-4 w-4" />
+                    <Send v-else class="h-4 w-4" />
+                  </button>
+                </div>
               </div>
-              <div class="mt-2 text-xs text-slate-500">Enter to send · Shift+Enter for newline</div>
             </div>
           </footer>
         </section>
 
-        <aside v-if="showDiff || showPlan" class="hidden lg:flex min-w-0 flex-col border-l border-slate-900 bg-slate-950/40">
-          <div v-if="showDiff" class="flex flex-1 min-h-0 flex-col">
-            <div class="border-b border-slate-900 px-4 py-3">
-              <div class="text-xs uppercase tracking-wider text-slate-500">Diff</div>
-            </div>
-            <div class="flex-1 overflow-auto p-4">
-              <pre class="whitespace-pre-wrap break-words rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-xs font-mono text-slate-200">{{ selectedStore?.diff ?? '' }}</pre>
-            </div>
-          </div>
-
-          <div v-if="showPlan" class="flex flex-1 min-h-0 flex-col border-t border-slate-900">
-            <div class="border-b border-slate-900 px-4 py-3">
+        <aside v-if="showPlan" class="hidden lg:flex min-w-0 flex-col border-l border-slate-200 bg-white">
+          <div class="flex flex-1 min-h-0 flex-col">
+            <div class="border-b border-slate-200 px-4 py-3">
               <div class="text-xs uppercase tracking-wider text-slate-500">Plan</div>
             </div>
             <div class="flex-1 overflow-auto p-4">
-              <div v-if="selectedStore?.planExplanation" class="mb-3 rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-xs text-slate-300 whitespace-pre-wrap">
+              <div v-if="selectedStore?.planExplanation" class="mb-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700 whitespace-pre-wrap">
                 {{ selectedStore.planExplanation }}
               </div>
 
@@ -2613,11 +4039,11 @@ onBeforeUnmount(() => {
                 <div
                   v-for="(step, idx) in selectedStore.plan"
                   :key="idx"
-                  class="flex items-start gap-3 rounded-lg border border-slate-900 bg-slate-950/30 p-3"
+                  class="flex items-start gap-3 rounded-lg border border-slate-200 bg-white p-3"
                 >
                   <span class="mt-1 h-2.5 w-2.5 rounded-full" :class="planDotClass(step.status)" />
                   <div class="min-w-0 flex-1">
-                    <div class="text-sm text-slate-200 whitespace-pre-wrap">{{ step.step }}</div>
+                    <div class="text-sm text-slate-900 whitespace-pre-wrap">{{ step.step }}</div>
                   </div>
                   <div class="shrink-0 text-[10px] uppercase tracking-wider text-slate-500">
                     {{ step.status }}
@@ -2625,7 +4051,7 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <div v-else class="rounded-lg border border-slate-900 bg-slate-950/30 p-3 text-xs text-slate-500">
+              <div v-else class="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
                 No plan yet.
               </div>
             </div>
@@ -2635,17 +4061,159 @@ onBeforeUnmount(() => {
 
       </div>
 	
+	      <!-- New thread modal -->
+	      <transition name="rg-fade">
+	        <div v-if="newThreadOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
+	          <div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
+	            <div class="flex items-start justify-between gap-4">
+	              <div class="min-w-0">
+	                <div class="text-sm font-semibold text-slate-900">New thread</div>
+	                <div class="mt-1 text-xs text-slate-600">Choose a machine and workspace before starting.</div>
+	              </div>
+	              <button
+	                class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+	                @click="closeNewThreadDialog"
+	              >
+	                Close
+	              </button>
+	            </div>
+
+	            <div class="mt-4 space-y-4">
+	              <div>
+	                <div class="text-xs uppercase tracking-wider text-slate-500">1) Machine</div>
+	                <select
+	                  v-model="newThreadMachineId"
+	                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+	                  :disabled="!machinesForSelect.length"
+	                >
+	                  <option value="" disabled>(select a machine)</option>
+	                  <option v-for="m in machinesForSelect" :key="m.machineId" :value="m.machineId">
+	                    {{ m.machineName }} · {{ m.platform }} · {{ machineStatusLabel(m) }} · {{ String(m.machineId).slice(0, 8) }}
+	                  </option>
+	                </select>
+	                <div v-if="!machines.length" class="mt-2 text-xs text-slate-600">
+	                  No machines yet.
+	                </div>
+	                <div v-else-if="newThreadSelectedMachine" class="mt-2 flex items-center gap-2 text-xs" :class="newThreadSelectedMachineOnline ? 'text-emerald-700' : 'text-slate-700'">
+	                  <span class="h-2.5 w-2.5 rounded-full" :class="newThreadSelectedMachineOnline ? 'bg-emerald-500' : 'bg-slate-400'" />
+	                  <span>{{ machineStatusLabel(newThreadSelectedMachine) }}</span>
+	                </div>
+	              </div>
+
+	              <div>
+	                <div class="flex items-end justify-between gap-3">
+	                  <div class="text-xs uppercase tracking-wider text-slate-500">2) Workspace</div>
+	                  <button
+	                    class="rounded-md bg-slate-100 px-3 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+	                    @click="openNewThreadBrowse"
+	                    :disabled="!newThreadMachineId || !newThreadSelectedMachineOnline"
+	                  >
+	                    Browse…
+	                  </button>
+	                </div>
+	                <input
+	                  v-model="newThreadCwd"
+	                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+	                  placeholder="/home/me/project"
+	                />
+
+	                <div v-if="newThreadRecentWorkspaces.length" class="mt-3">
+	                  <div class="text-[11px] uppercase tracking-wider text-slate-500">Recent projects</div>
+	                  <div class="mt-2 space-y-1">
+	                    <button
+	                      v-for="p in newThreadRecentWorkspaces"
+	                      :key="p.cwd"
+	                      class="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-left transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 active:scale-[0.99]"
+	                      @click="newThreadCwd = p.cwd"
+	                      :title="p.cwd"
+	                    >
+	                      <div class="truncate text-sm font-medium text-slate-900">{{ p.label }}</div>
+	                      <div class="mt-0.5 truncate text-xs text-slate-600">{{ p.cwd }}</div>
+	                    </button>
+	                  </div>
+	                </div>
+	              </div>
+
+	              <div v-if="newThreadBrowseOpen" class="rounded-xl border border-slate-200 bg-slate-50 p-3">
+	                <div class="flex items-center justify-between gap-3">
+	                  <div class="text-[11px] uppercase tracking-wider text-slate-500">Folder browser</div>
+	                  <button
+	                    class="rounded-md bg-white px-2.5 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+	                    @click="newThreadBrowseOpen = false"
+	                  >
+	                    Close
+	                  </button>
+	                </div>
+
+	                <div class="mt-2 flex items-center gap-2">
+	                  <button
+	                    class="rounded-md bg-white px-2.5 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed"
+	                    @click="newThreadBrowseParent ? loadNewThreadBrowse(newThreadBrowseParent) : null"
+	                    :disabled="!newThreadBrowseParent || newThreadBrowseLoading"
+	                  >
+	                    Up
+	                  </button>
+	                  <div class="min-w-0 flex-1 truncate rounded-md bg-white px-3 py-1.5 text-xs text-slate-700 ring-1 ring-slate-200" :title="newThreadBrowsePath">
+	                    {{ newThreadBrowsePath || (newThreadBrowseLoading ? 'Loading…' : '—') }}
+	                  </div>
+	                  <button
+	                    class="rounded-md bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
+	                    @click="selectNewThreadBrowseFolder"
+	                    :disabled="!newThreadBrowsePath"
+	                  >
+	                    Select
+	                  </button>
+	                </div>
+
+	                <div v-if="newThreadBrowseError" class="mt-2 text-xs text-red-600">{{ newThreadBrowseError }}</div>
+	                <div v-else-if="newThreadBrowseLoading" class="mt-2 text-xs text-slate-600">Loading…</div>
+
+	                <div v-else class="mt-3 max-h-64 overflow-auto space-y-1">
+	                  <button
+	                    v-for="e in newThreadBrowseEntries"
+	                    :key="e.path"
+	                    class="w-full rounded-lg bg-white px-3 py-2 text-left text-sm text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+	                    @click="loadNewThreadBrowse(e.path)"
+	                    :title="e.path"
+	                  >
+	                    {{ e.name }}
+	                  </button>
+	                  <div v-if="!newThreadBrowseEntries.length" class="px-3 py-6 text-center text-xs text-slate-600">(empty)</div>
+	                </div>
+	              </div>
+
+	              <div v-if="newThreadError" class="text-sm text-red-600">{{ newThreadError }}</div>
+
+	              <div class="mt-5 flex items-center justify-end gap-2">
+	                <button
+	                  class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+	                  @click="closeNewThreadDialog"
+	                >
+	                  Cancel
+	                </button>
+	                <button
+	                  class="rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
+	                  @click="confirmNewThreadDialog"
+	                >
+	                  Start
+	                </button>
+	              </div>
+	            </div>
+	          </div>
+	        </div>
+	      </transition>
+
 	      <!-- Workspace & defaults modal -->
 		      <transition name="rg-fade">
 		        <div v-if="defaultsOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-		          <div class="w-full max-w-xl rounded-2xl border border-slate-800 bg-slate-950 p-5 shadow-2xl">
+		          <div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
 		            <div class="flex items-start justify-between gap-4">
 		              <div class="min-w-0">
-		                <div class="text-sm font-semibold text-slate-100">Settings</div>
-		                <div class="mt-1 text-xs text-slate-500">Defaults, machines, and system settings.</div>
+		                <div class="text-sm font-semibold text-slate-900">Settings</div>
+		                <div class="mt-1 text-xs text-slate-600">Defaults, machines, and system settings.</div>
 		              </div>
 		              <button
-		                class="rounded-md bg-slate-200/10 px-3 py-2 text-sm text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+		                class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 		                @click="defaultsOpen = false"
 		              >
 		                Close
@@ -2655,21 +4223,21 @@ onBeforeUnmount(() => {
 		            <div class="mt-4 flex items-center gap-2 text-xs">
 		              <button
 		                class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                :class="settingsTab === 'defaults' ? 'border-slate-700 bg-slate-200/10 text-slate-100' : 'border-slate-900 bg-slate-950/40 text-slate-400 hover:bg-slate-200/5'"
+		                :class="settingsTab === 'defaults' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
 		                @click="settingsTab = 'defaults'"
 		              >
 		                Defaults
 		              </button>
 		              <button
 		                class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                :class="settingsTab === 'machines' ? 'border-slate-700 bg-slate-200/10 text-slate-100' : 'border-slate-900 bg-slate-950/40 text-slate-400 hover:bg-slate-200/5'"
+		                :class="settingsTab === 'machines' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
 		                @click="settingsTab = 'machines'"
 		              >
 		                Machines
 		              </button>
 		              <button
 		                class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                :class="settingsTab === 'system' ? 'border-slate-700 bg-slate-200/10 text-slate-100' : 'border-slate-900 bg-slate-950/40 text-slate-400 hover:bg-slate-200/5'"
+		                :class="settingsTab === 'system' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
 		                @click="settingsTab = 'system'"
 		              >
 		                System
@@ -2681,7 +4249,7 @@ onBeforeUnmount(() => {
 		                <div class="text-xs uppercase tracking-wider text-slate-500">Workspace (cwd)</div>
 		                <input
 		                  v-model="defaults.cwd"
-	                  class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+	                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 	                  placeholder="/home/me/project"
 	                />
 	              </div>
@@ -2691,20 +4259,24 @@ onBeforeUnmount(() => {
 	                  <div class="text-xs uppercase tracking-wider text-slate-500">Machine</div>
 	                  <select
 	                    v-model="defaults.machineId"
-	                    class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-2 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+	                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 	                  >
 	                    <option value="">(auto)</option>
-	                    <option v-for="m in machines" :key="m.machineId" :value="m.machineId">
-	                      {{ m.machineName }}
+	                    <option v-for="m in machinesForSelect" :key="m.machineId" :value="m.machineId">
+	                      {{ m.machineName }} · {{ m.platform }} · {{ machineStatusLabel(m) }} · {{ String(m.machineId).slice(0, 8) }}
 	                    </option>
 	                  </select>
+	                  <div v-if="defaultsSelectedMachine" class="mt-2 flex items-center gap-2 text-xs" :class="machineIsOnline(defaultsSelectedMachine) ? 'text-emerald-700' : 'text-slate-700'">
+	                    <span class="h-2.5 w-2.5 rounded-full" :class="machineIsOnline(defaultsSelectedMachine) ? 'bg-emerald-500' : 'bg-slate-400'" />
+	                    <span>{{ machineStatusLabel(defaultsSelectedMachine) }}</span>
+	                  </div>
 	                </div>
 	
 	                <div>
 	                  <div class="text-xs uppercase tracking-wider text-slate-500">Model</div>
 	                  <input
 	                    v-model="defaults.model"
-	                    class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+	                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 	                    placeholder="(optional)"
 	                  />
 	                </div>
@@ -2715,7 +4287,7 @@ onBeforeUnmount(() => {
 	                  <div class="text-xs uppercase tracking-wider text-slate-500">Approval policy</div>
 	                  <select
 	                    v-model="defaults.approvalPolicy"
-	                    class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-2 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+	                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 	                  >
 	                    <option value="untrusted">untrusted</option>
 	                    <option value="on-request">on-request</option>
@@ -2728,7 +4300,7 @@ onBeforeUnmount(() => {
 	                  <div class="text-xs uppercase tracking-wider text-slate-500">Sandbox</div>
 	                  <select
 	                    v-model="defaults.sandbox"
-	                    class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-2 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+	                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 	                  >
 	                    <option value="read-only">read-only</option>
 	                    <option value="workspace-write">workspace-write</option>
@@ -2737,34 +4309,55 @@ onBeforeUnmount(() => {
 	                </div>
 		              </div>
 		
-		              <div v-if="defaultsError" class="text-sm text-red-400">{{ defaultsError }}</div>
+		              <div v-if="defaultsError" class="text-sm text-red-600">{{ defaultsError }}</div>
 		            </div>
 
 		            <div v-else-if="settingsTab === 'machines'" class="mt-4 space-y-3">
-		              <div v-if="!machines.length" class="rounded-xl border border-slate-900 bg-slate-950/40 p-6 text-center text-sm text-slate-500">
+		              <div v-if="!machines.length" class="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
 		                No machines connected yet.
 		              </div>
 
 		              <div v-else class="space-y-2">
+		                <div v-if="machineDisconnectError" class="text-sm text-red-600">{{ machineDisconnectError }}</div>
 		                <div
-		                  v-for="m in machines"
+		                  v-for="m in machinesForSelect"
 		                  :key="m.machineId"
-		                  class="rounded-xl border border-slate-900 bg-slate-950/40 p-3"
+		                  class="rounded-xl border border-slate-200 bg-white p-3"
 		                >
 		                  <div class="flex items-center justify-between gap-3">
 		                    <div class="min-w-0 flex items-center gap-2">
-		                      <span class="h-2.5 w-2.5 rounded-full" :class="machineIsOnline(m) ? 'bg-emerald-400' : 'bg-slate-600'" />
-		                      <div class="truncate text-sm font-medium text-slate-100">{{ m.machineName }}</div>
-		                      <div class="shrink-0 rounded-md border border-slate-800 bg-slate-950/50 px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-400">
+		                      <span class="h-2.5 w-2.5 rounded-full" :class="machineIsOnline(m) ? 'bg-emerald-500' : 'bg-slate-400'" />
+		                      <div class="truncate text-sm font-medium text-slate-900">{{ m.machineName }}</div>
+		                      <div class="shrink-0 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-600">
 		                        {{ m.platform }}
 		                      </div>
 		                    </div>
-		                    <div class="shrink-0 text-xs text-slate-500">{{ formatAgo(m.lastSeenMs) }}</div>
+		                    <div class="shrink-0 flex items-center gap-2">
+		                      <button
+		                        v-if="machineIsOnline(m)"
+		                        class="inline-flex items-center gap-2 rounded-md bg-slate-100 px-2.5 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+		                        @click="disconnectMachine(m.machineId)"
+		                        :disabled="machineDisconnectWorkingId === m.machineId"
+		                        title="Disconnect the runner (it may reconnect if the runner process is still running)."
+		                      >
+		                        <Loader2 v-if="machineDisconnectWorkingId === m.machineId" class="h-3.5 w-3.5 animate-spin" />
+		                        Disconnect
+		                      </button>
+		                      <button
+		                        v-else
+		                        class="inline-flex items-center gap-2 rounded-md bg-red-50 px-2.5 py-1.5 text-xs text-red-700 transition-colors hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
+		                        @click="openDeleteMachineModal(m.machineId)"
+		                        title="Delete this machine and all its sessions."
+		                      >
+		                        <Trash2 class="h-3.5 w-3.5" />
+		                        Delete
+		                      </button>
+		                    </div>
 		                  </div>
 		                  <div class="mt-2 flex items-center justify-between gap-3">
-		                    <div class="min-w-0 truncate text-xs font-mono text-slate-400" :title="m.machineId">{{ m.machineId }}</div>
-		                    <div class="shrink-0 text-[11px]" :class="machineIsOnline(m) ? 'text-emerald-400' : 'text-slate-500'">
-		                      {{ machineIsOnline(m) ? 'online' : 'offline' }}
+		                    <div class="min-w-0 truncate text-xs font-mono text-slate-500" :title="m.machineId">{{ m.machineId }}</div>
+		                    <div class="shrink-0 text-[11px]" :class="machineIsOnline(m) ? 'text-emerald-600' : 'text-slate-500'">
+		                      {{ machineStatusLabel(m) }}
 		                    </div>
 		                  </div>
 		                </div>
@@ -2779,7 +4372,7 @@ onBeforeUnmount(() => {
 		                  type="number"
 		                  min="1"
 		                  max="3650"
-		                  class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+		                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 		                />
 		                <div class="mt-2 text-xs text-slate-500">Rootgrid prunes its own sessions/events beyond this window.</div>
 		              </div>
@@ -2788,7 +4381,7 @@ onBeforeUnmount(() => {
 		                <div class="text-xs uppercase tracking-wider text-slate-500">SSE notifications</div>
 		                <select
 		                  v-model="sseToastsDraft"
-		                  class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-2 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+		                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 		                >
 		                  <option value="if-not-visible">If not visible</option>
 		                  <option value="always">Always</option>
@@ -2796,14 +4389,14 @@ onBeforeUnmount(() => {
 		                </select>
 		                <div class="mt-2 text-xs text-slate-500">Controls toast/desktop notifications emitted over SSE (approvals, ready, failures).</div>
 
-		                <div class="mt-3 flex items-center justify-between gap-3 rounded-xl border border-slate-900 bg-slate-950/40 p-3">
+		                <div class="mt-3 flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
 		                  <div class="min-w-0">
 		                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Browser notifications</div>
-		                    <div class="mt-1 text-xs text-slate-300">Permission: {{ notificationPermission }}</div>
+		                    <div class="mt-1 text-xs text-slate-700">Permission: {{ notificationPermission }}</div>
 		                    <div class="mt-1 text-xs text-slate-500">Needed to alert you while the tab/app is not visible.</div>
 		                  </div>
 		                  <button
-		                    class="shrink-0 rounded-md bg-slate-200/10 px-3 py-2 text-sm text-slate-100 transition-colors hover:bg-slate-200/15 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+		                    class="shrink-0 rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 		                    @click="requestNotificationPermission"
 		                    :disabled="!notificationSupported || notificationPermission === 'granted'"
 		                  >
@@ -2815,7 +4408,7 @@ onBeforeUnmount(() => {
 		                  <div class="text-xs uppercase tracking-wider text-slate-500">Web Push notifications</div>
 		                  <select
 		                    v-model="webPushDraft"
-		                    class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-2 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+		                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 		                  >
 		                    <option value="if-not-visible">If not visible</option>
 		                    <option value="always">Always</option>
@@ -2823,23 +4416,23 @@ onBeforeUnmount(() => {
 		                  </select>
 		                  <div class="mt-2 text-xs text-slate-500">Uses the PWA service worker + VAPID. Requires a secure context (localhost/https) and subscription. “If not visible” means the relevant session isn’t currently open in a visible Rootgrid tab.</div>
 
-		                  <div class="mt-3 flex items-center justify-between gap-3 rounded-xl border border-slate-900 bg-slate-950/40 p-3">
+		                  <div class="mt-3 flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
 		                    <div class="min-w-0">
 		                      <div class="text-[11px] uppercase tracking-wider text-slate-500">Push subscription</div>
-		                      <div class="mt-1 text-xs text-slate-300">Status: {{ pushStatus }}</div>
+		                      <div class="mt-1 text-xs text-slate-700">Status: {{ pushStatus }}</div>
 		                      <div v-if="pushEndpoint" class="mt-1 truncate text-[11px] text-slate-500" :title="pushEndpoint">endpoint: {{ pushEndpoint }}</div>
-		                      <div v-if="pushError" class="mt-1 text-xs text-red-400">{{ pushError }}</div>
+		                      <div v-if="pushError" class="mt-1 text-xs text-red-600">{{ pushError }}</div>
 		                    </div>
 		                    <div class="shrink-0 flex items-center gap-2">
 		                      <button
-		                        class="rounded-md bg-slate-200/10 px-3 py-2 text-sm text-slate-100 transition-colors hover:bg-slate-200/15 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+		                        class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 		                        @click="enablePush"
 		                        :disabled="pushWorking || pushStatus === 'subscribed' || pushStatus === 'unsupported' || pushStatus === 'insecure'"
 		                      >
 		                        Enable
 		                      </button>
 		                      <button
-		                        class="rounded-md bg-slate-200/10 px-3 py-2 text-sm text-slate-100 transition-colors hover:bg-slate-200/15 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+		                        class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 		                        @click="disablePush"
 		                        :disabled="pushWorking || pushStatus !== 'subscribed'"
 		                      >
@@ -2851,32 +4444,32 @@ onBeforeUnmount(() => {
 		              </div>
 
 		              <div class="grid grid-cols-2 gap-2">
-		                <div class="rounded-xl border border-slate-900 bg-slate-950/40 p-3">
+		                <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
 		                  <div class="text-[11px] uppercase tracking-wider text-slate-500">Host</div>
-		                  <div class="mt-2 text-xs text-slate-200 font-mono">
+		                  <div class="mt-2 text-xs text-slate-900 font-mono">
 		                    {{ appSettings.host?.listen?.host ?? '—' }}:{{ appSettings.host?.listen?.port ?? '—' }}
 		                  </div>
 		                  <div class="mt-2 text-xs text-slate-500">trustProxy: {{ appSettings.host?.trustProxy ? 'true' : 'false' }}</div>
 		                  <div v-if="appSettings.host?.publicUrl" class="mt-2 text-xs text-slate-500 truncate" :title="appSettings.host.publicUrl">
-		                    publicUrl: <span class="text-slate-300">{{ appSettings.host.publicUrl }}</span>
+		                    publicUrl: <span class="text-slate-700">{{ appSettings.host.publicUrl }}</span>
 		                  </div>
 		                </div>
 
-		                <div class="rounded-xl border border-slate-900 bg-slate-950/40 p-3">
+		                <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
 		                  <div class="text-[11px] uppercase tracking-wider text-slate-500">Runner</div>
-		                  <div class="mt-2 text-xs text-slate-200">
+		                  <div class="mt-2 text-xs text-slate-900">
 		                    {{ appSettings.runner?.enabled ? 'enabled' : 'disabled' }}
 		                  </div>
 		                  <div class="mt-2 text-xs text-slate-500 truncate" :title="appSettings.runner?.machineId ?? ''">
-		                    machineId: <span class="text-slate-300 font-mono">{{ appSettings.runner?.machineId ? appSettings.runner.machineId.slice(0, 12) + '…' : '—' }}</span>
+		                    machineId: <span class="text-slate-700 font-mono">{{ appSettings.runner?.machineId ? appSettings.runner.machineId.slice(0, 12) + '…' : '—' }}</span>
 		                  </div>
 		                  <div class="mt-2 text-xs text-slate-500 truncate" :title="appSettings.runner?.machineName ?? ''">
-		                    machineName: <span class="text-slate-300">{{ appSettings.runner?.machineName ?? '—' }}</span>
+		                    machineName: <span class="text-slate-700">{{ appSettings.runner?.machineName ?? '—' }}</span>
 		                  </div>
 		                </div>
 		              </div>
 
-		              <div v-if="appSettingsError" class="text-sm text-red-400">{{ appSettingsError }}</div>
+		              <div v-if="appSettingsError" class="text-sm text-red-600">{{ appSettingsError }}</div>
 
 		              <div class="flex items-center justify-end">
 		                <button
@@ -2896,14 +4489,14 @@ onBeforeUnmount(() => {
 	      <!-- Archived chats modal -->
 	      <transition name="rg-fade">
 	        <div v-if="archiveOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-	          <div class="w-full max-w-3xl rounded-2xl border border-slate-800 bg-slate-950 p-5 shadow-2xl">
+	          <div class="w-full max-w-3xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
 	            <div class="flex items-start justify-between gap-4">
 	              <div class="min-w-0">
-	                <div class="text-sm font-semibold text-slate-100">Archived chats</div>
-	                <div class="mt-1 text-xs text-slate-500">Hidden from the main chat list.</div>
+	                <div class="text-sm font-semibold text-slate-900">Archived threads</div>
+	                <div class="mt-1 text-xs text-slate-600">Hidden from the main thread list.</div>
 	              </div>
 	              <button
-	                class="rounded-md bg-slate-200/10 px-3 py-2 text-sm text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+	                class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 	                @click="archiveOpen = false"
 	              >
 	                Close
@@ -2912,43 +4505,43 @@ onBeforeUnmount(() => {
 
 	            <div class="mt-4">
 	              <div v-if="archiveLoading" class="space-y-2">
-	                <div v-for="i in 6" :key="i" class="h-12 rounded-xl bg-slate-900/40 animate-pulse" />
+	                <div v-for="i in 6" :key="i" class="h-12 rounded-xl bg-slate-100 animate-pulse" />
 	              </div>
 
-	              <div v-else-if="archiveError" class="text-sm text-red-400">{{ archiveError }}</div>
+	              <div v-else-if="archiveError" class="text-sm text-red-600">{{ archiveError }}</div>
 
-	              <div v-else-if="!archivedSessions.length" class="rounded-xl border border-slate-900 bg-slate-950/40 p-6 text-center text-sm text-slate-500">
-	                No archived chats.
+	              <div v-else-if="!archivedSessions.length" class="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
+	                No archived threads.
 	              </div>
 
 	              <div v-else class="max-h-[65vh] overflow-auto space-y-2 pr-1">
 	                <button
 	                  v-for="s in archivedSessions"
 	                  :key="s.sessionId"
-	                  class="group w-full rounded-xl border border-slate-900 bg-slate-950/40 p-3 text-left transition-colors hover:bg-slate-950/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
+	                  class="group w-full rounded-xl border border-slate-200 bg-white p-3 text-left transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 	                  @click="selectedSessionId = s.sessionId; archiveOpen = false"
 	                  :title="sessionTooltip(s)"
 	                >
 	                  <div class="flex items-start justify-between gap-3">
 	                    <div class="min-w-0">
-	                      <div class="truncate text-sm font-medium text-slate-100">{{ sessionListTitle(s) }}</div>
+	                      <div class="truncate text-sm font-medium text-slate-900">{{ sessionListTitle(s) }}</div>
 	                      <div class="mt-1 flex items-center gap-2 text-[11px] text-slate-500">
 	                        <span class="truncate" :title="s.cwd">{{ sessionProject(s) }}</span>
-	                        <span class="text-slate-700">·</span>
+	                        <span class="text-slate-300">·</span>
 	                        <span>{{ sessionHostName(s) }}</span>
 	                      </div>
-	                      <div class="mt-1 truncate text-xs text-slate-400/90">{{ s.preview ?? '' }}</div>
+	                      <div class="mt-1 truncate text-xs text-slate-600">{{ s.preview ?? '' }}</div>
 	                    </div>
 
 	                    <div class="shrink-0 flex items-center gap-2">
 	                      <button
-	                        class="rounded-md bg-slate-200/10 px-2.5 py-1.5 text-xs text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+	                        class="rounded-md bg-slate-100 px-2.5 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 	                        @click.stop="unarchiveFromArchiveModal(s.sessionId)"
 	                      >
 	                        Unarchive
 	                      </button>
 	                      <button
-	                        class="inline-flex items-center gap-2 rounded-md bg-red-500/10 px-2.5 py-1.5 text-xs text-red-200 transition-colors hover:bg-red-500/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/40"
+	                        class="inline-flex items-center gap-2 rounded-md bg-red-50 px-2.5 py-1.5 text-xs text-red-700 transition-colors hover:bg-red-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
 	                        @click.stop="openDeleteModal(s.sessionId)"
 	                      >
 	                        <Trash2 class="h-3.5 w-3.5" />
@@ -2963,25 +4556,69 @@ onBeforeUnmount(() => {
 	        </div>
 	      </transition>
 
-	      <!-- Delete chat modal -->
+	      <!-- Delete machine modal -->
 	      <transition name="rg-fade">
-	        <div v-if="deleteOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-	          <div class="w-full max-w-xl rounded-2xl border border-slate-800 bg-slate-950 p-5 shadow-2xl">
-	            <div class="text-sm font-semibold text-slate-100">Delete chat?</div>
-	            <div class="mt-1 text-xs text-slate-500">This permanently deletes the session and its history.</div>
+	        <div v-if="deleteMachineOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
+	          <div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
+	            <div class="text-sm font-semibold text-slate-900">Delete machine?</div>
+	            <div class="mt-1 text-xs text-slate-600">This permanently deletes the machine and all of its sessions and history from Rootgrid.</div>
 
-	            <div v-if="deleteError" class="mt-3 text-sm text-red-400">{{ deleteError }}</div>
+	            <div class="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
+	              <div class="text-sm font-medium text-slate-900">
+	                {{ deleteMachineRow?.machineName ?? 'unknown' }}
+	              </div>
+	              <div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-600">
+	                <span class="rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-600">{{ deleteMachineRow?.platform ?? 'unknown' }}</span>
+	                <span class="text-slate-300">·</span>
+	                <span class="font-mono">{{ deleteMachineId }}</span>
+	              </div>
+	              <div class="mt-2 text-xs" :class="deleteMachineRow && machineIsOnline(deleteMachineRow) ? 'text-red-700' : 'text-slate-600'">
+	                {{ deleteMachineRow && machineIsOnline(deleteMachineRow) ? 'This machine is online. Disconnect the runner before deleting.' : 'Runner disconnected (ok to delete).' }}
+	              </div>
+	            </div>
+
+	            <div v-if="deleteMachineError" class="mt-3 text-sm text-red-600">{{ deleteMachineError }}</div>
 
 	            <div class="mt-5 flex items-center justify-end gap-2">
 	              <button
-	                class="rounded-md bg-slate-200/10 px-3 py-2 text-sm text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+	                class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+	                @click="deleteMachineOpen = false"
+	                :disabled="deleteMachineWorking"
+	              >
+	                Cancel
+	              </button>
+	              <button
+	                class="inline-flex items-center gap-2 rounded-md bg-red-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-red-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
+	                @click="confirmDeleteMachine"
+	                :disabled="deleteMachineWorking || (deleteMachineRow && machineIsOnline(deleteMachineRow))"
+	              >
+	                <Loader2 v-if="deleteMachineWorking" class="h-4 w-4 animate-spin" />
+	                Delete
+	              </button>
+	            </div>
+	          </div>
+	        </div>
+	      </transition>
+
+	      <!-- Delete chat modal -->
+	      <transition name="rg-fade">
+	        <div v-if="deleteOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
+	          <div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
+	            <div class="text-sm font-semibold text-slate-900">Delete thread?</div>
+	            <div class="mt-1 text-xs text-slate-600">This permanently deletes the session and its history.</div>
+
+	            <div v-if="deleteError" class="mt-3 text-sm text-red-600">{{ deleteError }}</div>
+
+	            <div class="mt-5 flex items-center justify-end gap-2">
+	              <button
+	                class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 	                @click="deleteOpen = false"
 	                :disabled="deleteWorking"
 	              >
 	                Cancel
 	              </button>
 	              <button
-	                class="inline-flex items-center gap-2 rounded-md bg-red-500/15 px-3 py-2 text-sm font-medium text-red-200 transition-colors hover:bg-red-500/20 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/40"
+	                class="inline-flex items-center gap-2 rounded-md bg-red-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-red-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
 	                @click="confirmDeleteSession"
 	                :disabled="deleteWorking"
 	              >
@@ -2996,16 +4633,16 @@ onBeforeUnmount(() => {
 	      <!-- Rename modal -->
 	      <transition name="rg-fade">
 	        <div v-if="renameOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-	          <div class="w-full max-w-xl rounded-2xl border border-slate-800 bg-slate-950 p-5 shadow-2xl">
-	            <div class="text-sm font-semibold text-slate-100">Rename chat</div>
-	            <div class="mt-1 text-xs text-slate-500">Update the chat title and/or project label.</div>
+	          <div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
+	            <div class="text-sm font-semibold text-slate-900">Rename thread</div>
+	            <div class="mt-1 text-xs text-slate-600">Update the thread title and/or project label.</div>
 	
 	            <div class="mt-4 space-y-3">
 	              <div>
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Chat title</div>
 	                <input
 	                  v-model="renameTitleValue"
-	                  class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+	                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 	                  placeholder="(leave empty to use the default title)"
 	                  :autofocus="renameFocus === 'title'"
 	                  @keydown.enter.prevent="saveRenameSession"
@@ -3016,25 +4653,25 @@ onBeforeUnmount(() => {
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Project label</div>
 	                <input
 	                  v-model="renameProjectValue"
-	                  class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+	                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 	                  placeholder="(leave empty to use folder name)"
 	                  :autofocus="renameFocus === 'project'"
 	                  @keydown.enter.prevent="saveRenameSession"
 	                />
 	              </div>
 
-	              <div v-if="renameError" class="text-sm text-red-400">{{ renameError }}</div>
+	              <div v-if="renameError" class="text-sm text-red-600">{{ renameError }}</div>
 	            </div>
 	
 	            <div class="mt-5 flex items-center justify-end gap-2">
 	              <button
-	                class="rounded-md bg-slate-200/10 px-3 py-2 text-sm text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+	                class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 	                @click="renameOpen = false"
 	              >
 	                Cancel
 	              </button>
 	              <button
-	                class="rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60"
+	                class="rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
 	                @click="saveRenameSession"
 	              >
 	                Save
@@ -3047,16 +4684,16 @@ onBeforeUnmount(() => {
 	      <!-- Session policy modal -->
 	      <transition name="rg-fade">
 	        <div v-if="sessionPolicyOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-	          <div class="w-full max-w-xl rounded-2xl border border-slate-800 bg-slate-950 p-5 shadow-2xl">
-	            <div class="text-sm font-semibold text-slate-100">Session policies</div>
-	            <div class="mt-1 text-xs text-slate-500">Updates Codex approval + sandbox settings (applies on the next turn).</div>
+	          <div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
+	            <div class="text-sm font-semibold text-slate-900">Session policies</div>
+	            <div class="mt-1 text-xs text-slate-600">Updates Codex approval + sandbox settings (applies on the next turn).</div>
 
 	            <div class="mt-4 grid grid-cols-2 gap-2">
 	              <div>
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Approval policy</div>
 	                <select
 	                  v-model="sessionApprovalDraft"
-	                  class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-2 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+	                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 	                >
 	                  <option value="untrusted">untrusted</option>
 	                  <option value="on-request">on-request</option>
@@ -3069,7 +4706,7 @@ onBeforeUnmount(() => {
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Sandbox</div>
 	                <select
 	                  v-model="sessionSandboxDraft"
-	                  class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-2 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+	                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 	                >
 	                  <option value="read-only">read-only</option>
 	                  <option value="workspace-write">workspace-write</option>
@@ -3078,18 +4715,18 @@ onBeforeUnmount(() => {
 	              </div>
 	            </div>
 
-	            <div v-if="sessionPolicyError" class="mt-3 text-sm text-red-400">{{ sessionPolicyError }}</div>
+	            <div v-if="sessionPolicyError" class="mt-3 text-sm text-red-600">{{ sessionPolicyError }}</div>
 
 	            <div class="mt-5 flex items-center justify-end gap-2">
 	              <button
-	                class="rounded-md bg-slate-200/10 px-3 py-2 text-sm text-slate-100 transition-colors hover:bg-slate-200/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+	                class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 	                @click="sessionPolicyOpen = false"
 	                :disabled="sessionPolicySaving"
 	              >
 	                Cancel
 	              </button>
 	              <button
-	                class="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60"
+	                class="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
 	                @click="saveSessionPolicy"
 	                :disabled="sessionPolicySaving"
 	              >
@@ -3104,11 +4741,11 @@ onBeforeUnmount(() => {
 	      <!-- Approvals modal -->
 	      <transition name="rg-fade">
 	        <div v-if="pendingApproval" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-	          <div class="w-full max-w-xl rounded-2xl border border-slate-800 bg-slate-950 p-5 shadow-2xl">
-	            <div class="text-sm font-semibold text-slate-100">
+	          <div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
+	            <div class="text-sm font-semibold text-slate-900">
 	              {{ pendingApproval.kind === 'userInput' ? 'Input requested' : 'Approval requested' }}
 	            </div>
-	            <div class="mt-1 text-xs text-slate-500">
+	            <div class="mt-1 text-xs text-slate-600">
 	              Session: {{ pendingApproval.sessionId }} · Kind: {{ pendingApproval.kind }}<span v-if="pendingApproval.itemId"> · Item: {{ pendingApproval.itemId }}</span>
 	            </div>
 	
@@ -3118,13 +4755,13 @@ onBeforeUnmount(() => {
 	                <div v-for="(q, idx) in pendingApproval.questions" :key="q?.id ?? idx">
 	                  <div v-if="q?.id && userInputForm[String(q.id)]">
 	                    <div class="text-xs uppercase tracking-wider text-slate-500">{{ q.header || q.id }}</div>
-	                    <div class="mt-1 text-sm text-slate-200 whitespace-pre-wrap">{{ q.question }}</div>
+	                    <div class="mt-1 text-sm text-slate-900 whitespace-pre-wrap">{{ q.question }}</div>
 	
 	                    <div v-if="Array.isArray(q.options) && q.options.length" class="mt-3 space-y-2">
 	                      <label
 	                        v-for="opt in q.options"
 	                        :key="opt.label"
-	                        class="flex gap-3 rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-sm text-slate-100 hover:bg-slate-950/60 cursor-pointer"
+	                        class="flex gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-800 hover:bg-slate-100 cursor-pointer"
 	                      >
 	                        <input
 	                          type="radio"
@@ -3134,14 +4771,14 @@ onBeforeUnmount(() => {
 	                          v-model="userInputForm[String(q.id)].choice"
 	                        />
 	                        <div class="min-w-0">
-	                          <div class="text-sm text-slate-100">{{ opt.label }}</div>
+	                          <div class="text-sm text-slate-900">{{ opt.label }}</div>
 	                          <div class="text-xs text-slate-400">{{ opt.description }}</div>
 	                        </div>
 	                      </label>
 	
 	                      <label
 	                        v-if="q.isOther"
-	                        class="flex gap-3 rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-sm text-slate-100 hover:bg-slate-950/60 cursor-pointer"
+	                        class="flex gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-800 hover:bg-slate-100 cursor-pointer"
 	                      >
 	                        <input
 	                          type="radio"
@@ -3151,12 +4788,12 @@ onBeforeUnmount(() => {
 	                          v-model="userInputForm[String(q.id)].choice"
 	                        />
 	                        <div class="min-w-0 w-full">
-	                          <div class="text-sm text-slate-100">Other</div>
+	                          <div class="text-sm text-slate-900">Other</div>
 	                          <input
 	                            v-if="userInputForm[String(q.id)].choice === '__other__'"
 	                            v-model="userInputForm[String(q.id)].other"
 	                            :type="q.isSecret ? 'password' : 'text'"
-	                            class="mt-2 w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+	                            class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 	                            placeholder="Type an answer…"
 	                          />
 	                        </div>
@@ -3167,7 +4804,7 @@ onBeforeUnmount(() => {
 	                      <input
 	                        v-model="userInputForm[String(q.id)].text"
 	                        :type="q.isSecret ? 'password' : 'text'"
-	                        class="w-full rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm outline-none transition-colors focus:border-slate-600 focus:ring-2 focus:ring-indigo-500/20"
+	                        class="w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
 	                        placeholder="Type an answer…"
 	                      />
 	                    </div>
@@ -3175,18 +4812,18 @@ onBeforeUnmount(() => {
 	                </div>
 	              </div>
 	
-	              <div v-if="userInputError" class="mt-3 text-sm text-red-400">{{ userInputError }}</div>
+	              <div v-if="userInputError" class="mt-3 text-sm text-red-600">{{ userInputError }}</div>
 	
 	              <div class="mt-5 flex items-center justify-end gap-2">
 	                <button
-	                  class="rounded-md bg-slate-200/10 px-3 py-2 text-sm text-slate-100 transition-colors hover:bg-slate-200/15 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+	                  class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 	                  @click="cancelUserInput"
 	                  :disabled="userInputSubmitting"
 	                >
 	                  Cancel
 	                </button>
 	                <button
-	                  class="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60"
+	                  class="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
 	                  @click="submitUserInput"
 	                  :disabled="userInputSubmitting"
 	                >
@@ -3200,52 +4837,52 @@ onBeforeUnmount(() => {
 	            <div v-else>
 	              <div v-if="pendingApproval.reason" class="mt-4">
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Reason</div>
-	                <div class="mt-2 rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-sm text-slate-200 whitespace-pre-wrap">{{ pendingApproval.reason }}</div>
+	                <div class="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-800 whitespace-pre-wrap">{{ pendingApproval.reason }}</div>
 	              </div>
 	
 	              <div v-if="pendingApproval.command" class="mt-4">
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Command</div>
-	                <pre class="mt-2 rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-xs font-mono text-slate-200 whitespace-pre-wrap">{{ pendingApproval.command }}</pre>
+	                <pre class="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ pendingApproval.command }}</pre>
 	              </div>
 
 	              <div v-if="pendingApproval.cwd" class="mt-4">
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Working directory</div>
-	                <pre class="mt-2 rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-xs font-mono text-slate-200 whitespace-pre-wrap">{{ pendingApproval.cwd }}</pre>
+	                <pre class="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ pendingApproval.cwd }}</pre>
 	              </div>
 
 	              <div v-if="pendingApproval.grantRoot" class="mt-4">
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Grant root</div>
-	                <pre class="mt-2 rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-xs font-mono text-slate-200 whitespace-pre-wrap">{{ pendingApproval.grantRoot }}</pre>
+	                <pre class="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ pendingApproval.grantRoot }}</pre>
 	              </div>
 
 	              <div v-if="pendingApproval.additionalPermissions" class="mt-4">
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Additional permissions</div>
-	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-xs font-mono text-slate-200 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.additionalPermissions, null, 2) }}</pre>
+	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.additionalPermissions, null, 2) }}</pre>
 	              </div>
 
 	              <div v-if="pendingApproval.availableDecisions" class="mt-4">
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Available decisions</div>
-	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-xs font-mono text-slate-200 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.availableDecisions, null, 2) }}</pre>
+	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.availableDecisions, null, 2) }}</pre>
 	              </div>
 
 	              <div v-if="pendingApproval.commandActions" class="mt-4">
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Command actions</div>
-	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-xs font-mono text-slate-200 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.commandActions, null, 2) }}</pre>
+	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.commandActions, null, 2) }}</pre>
 	              </div>
 
 	              <div v-if="pendingApproval.proposedExecpolicyAmendment" class="mt-4">
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Proposed execpolicy amendment</div>
-	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-xs font-mono text-slate-200 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.proposedExecpolicyAmendment, null, 2) }}</pre>
+	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.proposedExecpolicyAmendment, null, 2) }}</pre>
 	              </div>
 
 	              <div v-if="pendingApproval.proposedNetworkPolicyAmendments" class="mt-4">
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Proposed network policy amendments</div>
-	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-xs font-mono text-slate-200 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.proposedNetworkPolicyAmendments, null, 2) }}</pre>
+	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.proposedNetworkPolicyAmendments, null, 2) }}</pre>
 	              </div>
 
 	              <div v-if="pendingApproval.networkApprovalContext" class="mt-4">
 	                <div class="text-xs uppercase tracking-wider text-slate-500">Network approval context</div>
-	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-900 bg-slate-950/40 p-3 text-xs font-mono text-slate-200 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.networkApprovalContext, null, 2) }}</pre>
+	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.networkApprovalContext, null, 2) }}</pre>
 	              </div>
 
 	              <div v-if="approvalExtraActions.length" class="mt-4">
@@ -3256,10 +4893,10 @@ onBeforeUnmount(() => {
 	                    :key="a.id"
 	                    class="rounded-md px-3 py-2 text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2"
 	                    :class="a.variant === 'emerald-solid'
-	                      ? 'bg-emerald-500 text-emerald-950 hover:bg-emerald-400 focus-visible:ring-emerald-500/50'
+	                      ? 'bg-emerald-600 text-white hover:bg-emerald-500 focus-visible:ring-emerald-500/30'
 	                      : (a.variant === 'red-outline'
-	                        ? 'bg-red-500/10 text-red-200 hover:bg-red-500/15 focus-visible:ring-red-500/40'
-	                        : 'bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/15 focus-visible:ring-emerald-500/40')"
+	                        ? 'bg-red-50 text-red-700 hover:bg-red-100 focus-visible:ring-red-500/30'
+	                        : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 focus-visible:ring-emerald-500/30')"
 	                    @click="respondApproval(a.decision)"
 	                    :disabled="approvalResponding"
 	                  >
@@ -3268,12 +4905,12 @@ onBeforeUnmount(() => {
 	                </div>
 	              </div>
 	
-	              <div v-if="approvalRespondError" class="mt-3 text-sm text-red-400">{{ approvalRespondError }}</div>
+	              <div v-if="approvalRespondError" class="mt-3 text-sm text-red-600">{{ approvalRespondError }}</div>
 	
 	              <div class="mt-5 flex items-center justify-end gap-2">
 	                <button
 	                  v-if="approvalAllows('cancel')"
-	                  class="rounded-md bg-slate-200/10 px-3 py-2 text-sm text-slate-100 transition-colors hover:bg-slate-200/15 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+	                  class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 	                  @click="respondApproval('cancel')"
 	                  :disabled="approvalResponding"
 	                >
@@ -3281,7 +4918,7 @@ onBeforeUnmount(() => {
 	                </button>
 	                <button
 	                  v-if="approvalAllows('decline')"
-	                  class="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-200 transition-colors hover:bg-red-500/15 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/40"
+	                  class="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700 transition-colors hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
 	                  @click="respondApproval('decline')"
 	                  :disabled="approvalResponding"
 	                >
@@ -3289,7 +4926,7 @@ onBeforeUnmount(() => {
 	                </button>
 	                <button
 	                  v-if="approvalAllows('accept')"
-	                  class="rounded-md bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200 transition-colors hover:bg-emerald-500/15 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40"
+	                  class="rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/30"
 	                  @click="respondApproval('accept')"
 	                  :disabled="approvalResponding"
 	                >
@@ -3297,7 +4934,7 @@ onBeforeUnmount(() => {
 	                </button>
 	                <button
 	                  v-if="approvalAllows('acceptForSession')"
-	                  class="rounded-md bg-emerald-500 px-3 py-2 text-sm font-medium text-emerald-950 transition-colors hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50"
+	                  class="rounded-md bg-emerald-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/30"
 	                  @click="respondApproval('acceptForSession')"
 	                  :disabled="approvalResponding"
 	                >
@@ -3315,17 +4952,17 @@ onBeforeUnmount(() => {
 	          <div
 	            v-for="t in toasts"
 	            :key="t.id"
-	            class="pointer-events-auto rounded-xl border p-3 shadow-lg backdrop-blur"
+	            class="pointer-events-auto rounded-xl border p-3 shadow-lg"
 	            :class="toastBorderClass(t.level)"
 	            @click="t.sessionId ? (selectedSessionId = t.sessionId) : null"
 	          >
 	            <div class="flex items-start justify-between gap-3">
 	              <div class="min-w-0">
-	                <div class="text-sm font-medium text-slate-100 truncate">{{ t.title }}</div>
-	                <div v-if="t.message" class="mt-1 text-xs text-slate-300 whitespace-pre-wrap">{{ t.message }}</div>
+	                <div class="text-sm font-medium text-slate-900 truncate">{{ t.title }}</div>
+	                <div v-if="t.message" class="mt-1 text-xs text-slate-700 whitespace-pre-wrap">{{ t.message }}</div>
 	              </div>
 	              <button
-	                class="shrink-0 inline-flex h-7 w-7 items-center justify-center rounded-md bg-slate-200/10 text-slate-200 transition-colors hover:bg-slate-200/15"
+	                class="shrink-0 inline-flex h-7 w-7 items-center justify-center rounded-md bg-white text-slate-700 transition-colors hover:bg-slate-50"
 	                @click.stop="dismissToast(t.id)"
 	                title="Dismiss"
 	              >

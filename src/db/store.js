@@ -195,6 +195,15 @@ export class Store {
         continue
       }
 
+      if (v === 6) {
+        // v6 -> v7: persist per-session reasoning effort.
+        try { this.db.exec(`ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT`) } catch { }
+
+        v = 7
+        this.db.exec(`PRAGMA user_version = ${v}`)
+        continue
+      }
+
       throw new Error(`No migration available: ${v} -> ${v + 1}`)
     }
   }
@@ -234,18 +243,49 @@ export class Store {
   }
 
   /**
+   * @param {string} machineId
+   */
+  getMachine(machineId) {
+    const row = this.db.prepare(`
+      SELECT machine_id, machine_name, platform, last_seen_ms, capabilities_json
+      FROM machines
+      WHERE machine_id=?
+    `).get(machineId)
+    if (!row) return null
+    return {
+      machineId: row.machine_id,
+      machineName: row.machine_name,
+      platform: row.platform,
+      lastSeenMs: row.last_seen_ms,
+      capabilities: row.capabilities_json ? JSON.parse(row.capabilities_json) : null
+    }
+  }
+
+  /**
+   * Delete a machine (cascades to sessions/events/approvals/uploads).
+   * @param {string} machineId
+   */
+  deleteMachine(machineId) {
+    const res = this.db.prepare(`DELETE FROM machines WHERE machine_id=?`).run(machineId)
+    return res.changes > 0
+  }
+
+  /**
    * @param {{
    *   sessionId: string,
    *   machineId: string,
    *   cwd: string,
    *   status: string,
    *   codexThreadId?: string|null,
-   *   options?: { model?: string, approvalPolicy?: string, sandbox?: string }|null
+   *   options?: { model?: string, reasoningEffort?: string, approvalPolicy?: string, sandbox?: string }|null
    * }} input
    */
   createSession({ sessionId, machineId, cwd, status, codexThreadId = null, options = null }) {
     const now = Date.now()
     const model = (typeof options?.model === 'string' && options.model.trim()) ? options.model.trim() : null
+    const reasoningEffort = (typeof options?.reasoningEffort === 'string' && options.reasoningEffort.trim())
+      ? options.reasoningEffort.trim()
+      : null
     const approvalPolicy = (typeof options?.approvalPolicy === 'string' && options.approvalPolicy.trim())
       ? options.approvalPolicy.trim()
       : null
@@ -267,12 +307,13 @@ export class Store {
         updated_ms,
         codex_thread_id,
         model,
+        reasoning_effort,
         approval_policy,
         sandbox_mode,
         archived_ms
       )
-      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(sessionId, machineId, cwd, null, null, null, status, 'idle', 0, 0, 0, now, now, codexThreadId, model, approvalPolicy, sandboxMode, null)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(sessionId, machineId, cwd, null, null, null, status, 'idle', 0, 0, 0, now, now, codexThreadId, model, reasoningEffort, approvalPolicy, sandboxMode, null)
   }
 
   /**
@@ -287,6 +328,7 @@ export class Store {
    *   pendingApprovals?: number,
    *   lastReadSeq?: number,
    *   model?: string|null,
+   *   reasoningEffort?: string|null,
    *   approvalPolicy?: string|null,
    *   sandbox?: string|null
    * }} input
@@ -302,6 +344,7 @@ export class Store {
     pendingApprovals,
     lastReadSeq,
     model,
+    reasoningEffort,
     approvalPolicy,
     sandbox
   }) {
@@ -319,6 +362,7 @@ export class Store {
     if (pendingApprovals !== undefined) { sets.push('pending_approvals=?'); params.push(pendingApprovals) }
     if (lastReadSeq !== undefined) { sets.push('last_read_seq=?'); params.push(lastReadSeq) }
     if (model !== undefined) { sets.push('model=?'); params.push(model) }
+    if (reasoningEffort !== undefined) { sets.push('reasoning_effort=?'); params.push(reasoningEffort) }
     if (approvalPolicy !== undefined) { sets.push('approval_policy=?'); params.push(approvalPolicy) }
     if (sandbox !== undefined) { sets.push('sandbox_mode=?'); params.push(sandbox) }
 
@@ -352,6 +396,7 @@ export class Store {
         updated_ms,
         codex_thread_id,
         model,
+        reasoning_effort,
         approval_policy,
         sandbox_mode,
         archived_ms
@@ -375,6 +420,7 @@ export class Store {
       updatedMs: row.updated_ms,
       codexThreadId: row.codex_thread_id ?? null,
       model: row.model ?? null,
+      reasoningEffort: row.reasoning_effort ?? null,
       approvalPolicy: row.approval_policy ?? null,
       sandbox: row.sandbox_mode ?? null,
       archivedMs: row.archived_ms ?? null
@@ -405,6 +451,7 @@ export class Store {
         updated_ms,
         codex_thread_id,
         model,
+        reasoning_effort,
         approval_policy,
         sandbox_mode,
         archived_ms
@@ -429,10 +476,39 @@ export class Store {
       updatedMs: row.updated_ms,
       codexThreadId: row.codex_thread_id ?? null,
       model: row.model ?? null,
+      reasoningEffort: row.reasoning_effort ?? null,
       approvalPolicy: row.approval_policy ?? null,
       sandbox: row.sandbox_mode ?? null,
       archivedMs: row.archived_ms ?? null
     }))
+  }
+
+  /**
+   * @param {string} machineId
+   */
+  listSessionIdsByMachine(machineId) {
+    const rows = this.db.prepare(`
+      SELECT session_id
+      FROM sessions
+      WHERE machine_id=?
+    `).all(machineId)
+    return rows.map((r) => r.session_id)
+  }
+
+  /**
+   * Host paths for uploads belonging to sessions on a given machine.
+   * (Useful for best-effort file cleanup before cascading deletes.)
+   *
+   * @param {string} machineId
+   */
+  listUploadHostPathsByMachine(machineId) {
+    const rows = this.db.prepare(`
+      SELECT u.host_path AS host_path
+      FROM uploads u
+      JOIN sessions s ON s.session_id = u.session_id
+      WHERE s.machine_id=?
+    `).all(machineId)
+    return rows.map((r) => r.host_path)
   }
 
   /**
@@ -670,8 +746,9 @@ export class Store {
     }
 
     if (mode === 'summary') {
-      // "Big events" view: keep assistant text (normalized) but drop tool output streams (stdout/stderr/reasoning/plan).
-      clauses.push(`(type != 'session.output' OR stream = 'normalized')`)
+      // "Big events" view: keep assistant text (normalized) + reasoning, but drop tool stdout/stderr streams.
+      // We still keep un-attributed stderr (item_id IS NULL) since it's often important for users to see.
+      clauses.push(`(type != 'session.output' OR stream IN ('normalized','reasoning') OR ((stream = 'stderr' OR stream = 'stdout') AND item_id IS NULL))`)
     }
 
     const rows = this.db.prepare(`
@@ -695,7 +772,9 @@ export class Store {
     if (oldestSeq) {
       const params2 = [sessionId, oldestSeq]
       const clauses2 = ['session_id=?', 'seq < ?']
-      if (mode === 'summary') clauses2.push(`(type != 'session.output' OR stream = 'normalized')`)
+      if (mode === 'summary') {
+        clauses2.push(`(type != 'session.output' OR stream IN ('normalized','reasoning') OR ((stream = 'stderr' OR stream = 'stdout') AND item_id IS NULL))`)
+      }
       const row = this.db.prepare(`
         SELECT 1 AS ok
         FROM events

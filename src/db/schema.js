@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 6
+export const SCHEMA_VERSION = 7
 
 export const CREATE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS machines (
@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   updated_ms INTEGER NOT NULL,
   codex_thread_id TEXT,
   model TEXT,
+  reasoning_effort TEXT,
   approval_policy TEXT,
   sandbox_mode TEXT,
   archived_ms INTEGER,

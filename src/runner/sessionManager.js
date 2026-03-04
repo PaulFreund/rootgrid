@@ -1,8 +1,10 @@
 import crypto from 'node:crypto'
 import { mkdir, readdir, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { homedir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 
 import { CodexAppServerSession } from './sessions/CodexAppServerSession.js'
+import { JsonRpcStdioClient } from './sessions/JsonRpcStdioClient.js'
 import { RunnerIdeManager } from './ideManager.js'
 import { getUploadsDir } from '../lib/paths.js'
 
@@ -18,7 +20,7 @@ export class RunnerSessionManager {
    * @param {{
    *   machineId: string,
    *   send: (envelope: any) => boolean,
-   *   makeEnvelope: (input: { type: string, scope?: any, payload?: any }) => any
+   *   makeEnvelope: (input: { type: string, scope?: any, payload?: any, track?: boolean }) => any
    * }} opts
    */
   constructor({ machineId, send, makeEnvelope }) {
@@ -41,6 +43,8 @@ export class RunnerSessionManager {
     const type = env?.type
     const payload = env?.payload ?? null
 
+    if (type === 'fs.list') return this.#onFsList(payload)
+    if (type === 'codex.model.list') return this.#onCodexModelList(payload)
     if (type === 'session.start') return this.#onSessionStart(payload)
     if (type === 'session.send') return this.#onSessionSend(payload)
     if (type === 'session.options.update') return this.#onSessionOptionsUpdate(payload)
@@ -54,8 +58,8 @@ export class RunnerSessionManager {
     if (type === 'ide.stop') return this.#onIdeStop(payload)
   }
 
-  #emit(type, scope, payload) {
-    this.send(this.makeEnvelope({ type, scope, payload }))
+  #emit(type, scope, payload, { track = true } = {}) {
+    this.send(this.makeEnvelope({ type, scope, payload, track }))
   }
 
   #sessionScope(sessionId) {
@@ -231,6 +235,129 @@ export class RunnerSessionManager {
         await rm(join(dir, name), { force: true })
       } catch {
       }
+    }
+  }
+
+  async #onFsList(payload) {
+    const requestId = payload?.requestId
+    if (!requestId || typeof requestId !== 'string') return
+
+    const home = homedir()
+    let dir = String(payload?.path ?? '').trim()
+    if (!dir || dir === '~') {
+      dir = home
+    } else if (dir.startsWith('~/') || dir.startsWith('~\\')) {
+      dir = join(home, dir.slice(2))
+    } else if (!dir.startsWith('/')) {
+      // Treat relative paths as relative to the user's home.
+      dir = resolve(home, dir)
+    }
+
+    dir = resolve(dir)
+
+    let entries = []
+    try {
+      const raw = await readdir(dir, { withFileTypes: true })
+      entries = raw
+        .filter((ent) => Boolean(ent?.isDirectory?.()))
+        .map((ent) => ({
+          name: ent.name,
+          path: join(dir, ent.name),
+          kind: 'dir'
+        }))
+        .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+        .slice(0, 500)
+    } catch (err) {
+      this.#emit('fs.list.result', { machineId: this.machineId }, {
+        requestId,
+        ok: false,
+        error: String(err?.message ?? err)
+      }, { track: false })
+      return
+    }
+
+    let parent = null
+    try {
+      const p = dirname(dir)
+      if (p && p !== dir) parent = p
+    } catch {
+    }
+
+    this.#emit('fs.list.result', { machineId: this.machineId }, {
+      requestId,
+      ok: true,
+      path: dir,
+      parent,
+      entries
+    }, { track: false })
+  }
+
+  async #onCodexModelList(payload) {
+    const requestId = payload?.requestId
+    if (!requestId || typeof requestId !== 'string') return
+
+    const cwd = (typeof payload?.cwd === 'string' && payload.cwd.trim()) ? payload.cwd.trim() : homedir()
+    const limit = Number(payload?.limit)
+    const includeHidden = Boolean(payload?.includeHidden)
+
+    const rpc = new JsonRpcStdioClient({
+      command: 'codex',
+      args: ['app-server'],
+      cwd,
+      env: process.env,
+      onNotification: () => {},
+      onRequest: async () => null,
+      onStderr: () => {}
+    })
+
+    try {
+      await rpc.start()
+      await rpc.sendRequest('initialize', {
+        clientInfo: {
+          name: 'rootgrid',
+          title: 'Rootgrid',
+          version: '0.0.0'
+        }
+      })
+      rpc.sendNotification('initialized', {})
+
+      const params = {
+        limit: Number.isFinite(limit) && limit > 0 ? limit : 200,
+        includeHidden
+      }
+
+      let result = null
+      let lastErr = null
+      for (const method of ['model/list', 'models/list']) {
+        try {
+          result = await rpc.sendRequest(method, params)
+          break
+        } catch (err) {
+          lastErr = err
+        }
+      }
+      if (!result) throw lastErr ?? new Error('model list failed')
+
+      const models = Array.isArray(result?.models)
+        ? result.models
+        : (Array.isArray(result?.data) ? result.data : (Array.isArray(result?.items) ? result.items : []))
+      const nextCursorRaw = result?.nextCursor ?? result?.next_cursor ?? result?.cursor ?? null
+      const nextCursor = (nextCursorRaw === null || nextCursorRaw === undefined) ? null : String(nextCursorRaw)
+
+      this.#emit('codex.model.list.result', { machineId: this.machineId }, {
+        requestId,
+        ok: true,
+        models,
+        nextCursor
+      }, { track: false })
+    } catch (err) {
+      this.#emit('codex.model.list.result', { machineId: this.machineId }, {
+        requestId,
+        ok: false,
+        error: String(err?.message ?? err)
+      }, { track: false })
+    } finally {
+      try { rpc.stop({ signal: 'SIGTERM' }) } catch {}
     }
   }
 
