@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { WebSocketServer } from 'ws'
 
 import { makeEnvelope } from './envelope.js'
+import { recoverAfterRunnerRestart } from './recovery.js'
 
 export function createRunnerWsServer({ config, store, sse, onApprovalRequest = null, onRunnerMessage = null }) {
   const wss = new WebSocketServer({ noServer: true })
@@ -48,6 +49,18 @@ export function createRunnerWsServer({ config, store, sse, onApprovalRequest = n
 
         state.authed = true
         state.machineId = machineId
+
+        // If the runner process restarted, any in-flight turns/approvals from that
+        // machine are now stale. Unstick sessions so the user can continue.
+        try {
+          const prev = store.getMachine(machineId)
+          const prevBootId = String(prev?.capabilities?.bootId ?? '').trim()
+          const nextBootId = String(capabilities?.bootId ?? '').trim()
+          if (prevBootId && nextBootId && prevBootId !== nextBootId) {
+            recoverAfterRunnerRestart({ store, sse, machineId, reason: 'runner restarted' })
+          }
+        } catch {
+        }
 
         store.upsertMachine({ machineId, machineName, platform, capabilities })
 

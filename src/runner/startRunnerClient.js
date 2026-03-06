@@ -34,6 +34,8 @@ export async function startRunnerClient({ url, token, machineId, machineName }) 
   const wsUrl = `${toWsBaseUrl(url)}/v1/runner/ws`
 
   const spool = new OutboxSpool({ machineId })
+  const runnerBootId = crypto.randomUUID()
+  const runnerStartedAtMs = Date.now()
 
   let attempt = 0
   /** @type {WebSocket|null} */
@@ -121,7 +123,7 @@ export async function startRunnerClient({ url, token, machineId, machineName }) 
             id: machineId,
             name: machineName || hostname(),
             platform: detectPlatform(),
-            capabilities: {}
+            capabilities: { bootId: runnerBootId, startedAtMs: runnerStartedAtMs }
           }
         },
         track: false

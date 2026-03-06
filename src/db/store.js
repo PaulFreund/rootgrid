@@ -746,9 +746,11 @@ export class Store {
     }
 
     if (mode === 'summary') {
-      // "Big events" view: keep assistant text (normalized) + reasoning, but drop tool stdout/stderr streams.
-      // We still keep un-attributed stderr (item_id IS NULL) since it's often important for users to see.
-      clauses.push(`(type != 'session.output' OR stream IN ('normalized','reasoning') OR ((stream = 'stderr' OR stream = 'stdout') AND item_id IS NULL))`)
+      // "Big events" view: keep assistant text (normalized), but drop verbose
+      // streams like reasoning + tool stdout/stderr (unless un-attributed).
+      // We still keep un-attributed stderr/stdout (item_id IS NULL) since it's
+      // often important for users to see.
+      clauses.push(`(type != 'session.output' OR stream IN ('normalized') OR ((stream = 'stderr' OR stream = 'stdout') AND item_id IS NULL))`)
     }
 
     const rows = this.db.prepare(`
@@ -773,7 +775,7 @@ export class Store {
       const params2 = [sessionId, oldestSeq]
       const clauses2 = ['session_id=?', 'seq < ?']
       if (mode === 'summary') {
-        clauses2.push(`(type != 'session.output' OR stream IN ('normalized','reasoning') OR ((stream = 'stderr' OR stream = 'stdout') AND item_id IS NULL))`)
+        clauses2.push(`(type != 'session.output' OR stream IN ('normalized') OR ((stream = 'stderr' OR stream = 'stdout') AND item_id IS NULL))`)
       }
       const row = this.db.prepare(`
         SELECT 1 AS ok
@@ -833,6 +835,196 @@ export class Store {
     }
 
     return { events, hasMoreBefore, oldestSeq }
+  }
+
+  /**
+   * Resolve a turn's seq range so clients can fetch turn-scoped details on demand
+   * (e.g. reasoning text).
+   *
+   * @param {string} sessionId
+   * @param {string} turnId
+   * @returns {{ startSeq: number, endSeq: number|null }|null}
+   */
+  getTurnSeqRange(sessionId, turnId) {
+    const tid = String(turnId ?? '').trim()
+    if (!tid) return null
+
+    const started = this.db.prepare(`
+      SELECT seq
+      FROM events
+      WHERE session_id=? AND type='turn.started' AND json_extract(payload_json, '$.turnId')=?
+      ORDER BY seq ASC
+      LIMIT 1
+    `).get(sessionId, tid)
+    if (!started) return null
+    const startSeq = Number(started.seq) || 0
+    if (!startSeq) return null
+
+    const completed = this.db.prepare(`
+      SELECT seq
+      FROM events
+      WHERE session_id=? AND type='turn.completed' AND json_extract(payload_json, '$.turnId')=?
+      ORDER BY seq DESC
+      LIMIT 1
+    `).get(sessionId, tid)
+    const endSeq = completed ? (Number(completed.seq) || null) : null
+
+    return { startSeq, endSeq }
+  }
+
+  /**
+   * Fetch reasoning markdown text for a single turn.
+   *
+   * @param {string} sessionId
+   * @param {string} turnId
+   * @param {{ maxChars?: number }} [opts]
+   */
+  getTurnReasoningText(sessionId, turnId, { maxChars = 400_000 } = {}) {
+    const range = this.getTurnSeqRange(sessionId, turnId)
+    if (!range) return null
+
+    const session = this.getSession(sessionId)
+    const endSeq = range.endSeq ?? (session ? Number(session.lastSeq) || null : null)
+    if (!endSeq) return { turnId, startSeq: range.startSeq, endSeq: null, text: '', truncated: false }
+
+    const rows = this.db.prepare(`
+      SELECT payload_json
+      FROM events
+      WHERE session_id=? AND type='session.output' AND stream='reasoning' AND seq >= ? AND seq <= ?
+      ORDER BY seq ASC
+    `).all(sessionId, range.startSeq, endSeq)
+
+    const cap = Math.max(1_000, Math.min(5_000_000, Number(maxChars) || 400_000))
+    let text = ''
+    let truncated = false
+
+    let lastChunk = null
+    for (const row of rows) {
+      let chunk = ''
+      try {
+        chunk = String(JSON.parse(row.payload_json)?.text ?? '')
+      } catch {
+        chunk = ''
+      }
+      if (!chunk) continue
+
+      // Codex can emit duplicate deltas (often consecutive). Drop the simplest
+      // case to reduce client-side parsing/rendering noise.
+      if (chunk === lastChunk) continue
+      lastChunk = chunk
+
+      if (text.length + chunk.length > cap) {
+        const remaining = cap - text.length
+        if (remaining > 0) text += chunk.slice(0, remaining)
+        truncated = true
+        break
+      }
+      text += chunk
+    }
+
+    return {
+      turnId: String(turnId),
+      startSeq: range.startSeq,
+      endSeq,
+      text,
+      truncated
+    }
+  }
+
+  /**
+   * Fetch reasoning markdown sections for a single turn, with a best-effort
+   * ordering key (`startSeq`) so UIs can interleave them with tool calls.
+   *
+   * @param {string} sessionId
+   * @param {string} turnId
+   * @param {{ maxChars?: number }} [opts]
+   */
+  getTurnReasoningSections(sessionId, turnId, { maxChars = 400_000 } = {}) {
+    const range = this.getTurnSeqRange(sessionId, turnId)
+    if (!range) return null
+
+    const session = this.getSession(sessionId)
+    const endSeq = range.endSeq ?? (session ? Number(session.lastSeq) || null : null)
+    if (!endSeq) {
+      return { turnId: String(turnId), startSeq: range.startSeq, endSeq: null, truncated: false, sections: [] }
+    }
+
+    const rows = this.db.prepare(`
+      SELECT seq, ts_ms, payload_json
+      FROM events
+      WHERE session_id=? AND type='session.output' AND stream='reasoning' AND seq >= ? AND seq <= ?
+      ORDER BY seq ASC
+    `).all(sessionId, range.startSeq, endSeq)
+
+    const cap = Math.max(1_000, Math.min(5_000_000, Number(maxChars) || 400_000))
+    let text = ''
+    let truncated = false
+
+    /** @type {{ start: number, end: number, seq: number|null, tsMs: number|null }[]} */
+    const segments = []
+
+    let lastChunk = null
+    for (const row of rows) {
+      let chunk = ''
+      try {
+        chunk = String(JSON.parse(row.payload_json)?.text ?? '')
+      } catch {
+        chunk = ''
+      }
+      if (!chunk) continue
+
+      // Drop the simplest consecutive-duplicate case to reduce parsing noise.
+      if (chunk === lastChunk) continue
+      lastChunk = chunk
+
+      const start = text.length
+      if (text.length + chunk.length > cap) {
+        const remaining = cap - text.length
+        if (remaining > 0) chunk = chunk.slice(0, remaining)
+        else chunk = ''
+        truncated = true
+      }
+
+      if (!chunk) break
+      text += chunk
+      const end = text.length
+
+      segments.push({
+        start,
+        end,
+        seq: Number.isFinite(Number(row.seq)) ? Number(row.seq) : null,
+        tsMs: Number.isFinite(Number(row.ts_ms)) ? Number(row.ts_ms) : null
+      })
+
+      if (truncated) break
+    }
+
+    const parsed = parseReasoningSectionsWithStart(text)
+
+    let segIdx = 0
+    const sections = parsed.map((s, idx) => {
+      const startIndex = Number(s.startIndex) || 0
+      while (segIdx < segments.length && startIndex >= segments[segIdx].end) segIdx += 1
+      const seg = segments[segIdx] ?? null
+      const inside = seg && startIndex >= seg.start && startIndex < seg.end
+      const startSeq = inside && Number.isFinite(Number(seg.seq)) ? Number(seg.seq) : range.startSeq
+      const tsMs = inside && Number.isFinite(Number(seg.tsMs)) ? Number(seg.tsMs) : null
+      return {
+        id: `r-${idx + 1}`,
+        title: s.title,
+        body: s.body,
+        startSeq,
+        ...(tsMs ? { tsMs } : {})
+      }
+    })
+
+    return {
+      turnId: String(turnId),
+      startSeq: range.startSeq,
+      endSeq,
+      truncated,
+      sections
+    }
   }
 
   /**
@@ -1138,4 +1330,80 @@ export class Store {
       updatedMs: r.updated_ms
     }))
   }
+}
+
+function parseReasoningHeadingLine(line) {
+  const raw = String(line ?? '')
+  let ltrim = raw.replace(/^\s+/, '')
+  // Some models format section headers as list items like "- **Header**".
+  if (ltrim.startsWith('- ') || ltrim.startsWith('* ') || ltrim.startsWith('• ') || ltrim.startsWith('– ')) {
+    ltrim = ltrim.slice(2).replace(/^\s+/, '')
+  }
+  if (!ltrim.startsWith('**')) return null
+  const close = ltrim.indexOf('**', 2)
+  if (close < 0) return null
+  const title = ltrim.slice(2, close).trim()
+  if (!title) return null
+  const rest = ltrim.slice(close + 2)
+  return { title, rest }
+}
+
+function appendCappedStr(prev, delta, cap = 200_000) {
+  const p = String(prev ?? '')
+  const d = String(delta ?? '')
+  if (!d) return p
+  const next = p + d
+  if (next.length <= cap) return next
+  return next.slice(next.length - cap)
+}
+
+function parseReasoningSectionsWithStart(markdown, { maxSections = 200, maxBodyChars = 500_000 } = {}) {
+  const text = String(markdown ?? '').replace(/\r/g, '')
+  if (!text.trim()) return []
+
+  const lines = text.split('\n')
+  const sections = []
+  let cur = null
+  let offset = 0
+
+  const start = (title, startIndex) => {
+    if (sections.length >= maxSections) return null
+    cur = {
+      title: String(title ?? '').trim(),
+      body: '',
+      startIndex: Number(startIndex) || 0
+    }
+    sections.push(cur)
+    return cur
+  }
+
+  for (const line of lines) {
+    const heading = parseReasoningHeadingLine(line)
+    if (heading) {
+      const baseTitle = String(heading.title ?? '').trim()
+      const rest = String(heading.rest ?? '')
+      const title = (rest.trim() ? `${baseTitle}${rest}` : baseTitle).trim()
+      start(title, offset)
+      offset += line.length + 1
+      continue
+    }
+
+    if (!cur) {
+      if (!String(line ?? '').trim()) {
+        offset += line.length + 1
+        continue
+      }
+      start('Reasoning', offset)
+    }
+
+    if (!cur) break
+    cur.body = appendCappedStr(cur.body, `${line}\n`, maxBodyChars)
+    offset += line.length + 1
+  }
+
+  // Trim final trailing newlines (cosmetic).
+  for (const s of sections) {
+    if (typeof s.body === 'string') s.body = s.body.replace(/\n+$/, '\n')
+  }
+  return sections
 }

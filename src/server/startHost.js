@@ -12,6 +12,7 @@ import { AuthService } from './auth.js'
 import { makeEnvelope } from './envelope.js'
 import { readJsonBody, json } from './httpUtil.js'
 import { PushService } from './pushService.js'
+import { recoverAfterRunnerRestart } from './recovery.js'
 import { SSEManager } from './sseManager.js'
 import { serveWeb } from './static.js'
 import { createRunnerWsServer } from './wsRunner.js'
@@ -46,6 +47,16 @@ export async function startHost({ config }) {
   const tunnelHub = new TunnelHub()
 
   const logRequests = process.env.ROOTGRID_LOG_REQUESTS === '1'
+
+  // If we run a local runner in the same process, a host restart implies any
+  // in-flight turns were interrupted. Clear stuck `turn_state=running` so the
+  // UI doesn't get wedged showing an unkillable "Stop" state.
+  if (config.runner?.enabled && config.runner?.machineId) {
+    try {
+      recoverAfterRunnerRestart({ store, machineId: config.runner.machineId, reason: 'host restarted' })
+    } catch {
+    }
+  }
 
   // Recover pending approvals + IDE sessions (best-effort) after host restart.
   try {
@@ -616,10 +627,26 @@ export async function startHost({ config }) {
         const body = await readJsonBody(req)
         const connectionId = body?.connectionId
         const visibility = body?.visibility
+        const sessionId = body?.sessionId
+        const machineId = body?.machineId
         if (!connectionId || typeof connectionId !== 'string') return json(res, 400, { error: 'connectionId is required' })
         if (visibility !== 'visible' && visibility !== 'hidden') return json(res, 400, { error: 'visibility must be visible|hidden' })
+
+        if (sessionId !== undefined && sessionId !== null && typeof sessionId !== 'string') {
+          return json(res, 400, { error: 'sessionId must be a string or null' })
+        }
+        if (machineId !== undefined && machineId !== null && typeof machineId !== 'string') {
+          return json(res, 400, { error: 'machineId must be a string or null' })
+        }
+
         const ok = sse.setVisibility(connectionId, visibility)
         if (!ok) return json(res, 404, { error: 'not found' })
+
+        // Update event routing filters without forcing the browser to reconnect
+        // the SSE stream (which is slow and causes UI flicker).
+        if (sessionId !== undefined) sse.setSessionId(connectionId, sessionId)
+        if (machineId !== undefined) sse.setMachineId(connectionId, machineId)
+
         return json(res, 200, { ok: true })
       }
 
@@ -767,6 +794,45 @@ export async function startHost({ config }) {
           ? true
           : (archivedRaw === 'all' ? null : false)
         return json(res, 200, { sessions: store.listSessions({ archived }) })
+      }
+
+      // Create a new "empty" session (thread) without starting Codex yet.
+      // This lets the UI show the thread in the sidebar immediately, before the
+      // first user message is sent.
+      if (url.pathname === '/api/sessions/draft' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return
+        let body = null
+        try {
+          body = await readJsonBody(req)
+        } catch (err) {
+          return json(res, 400, { error: String(err?.message ?? err) })
+        }
+
+        const cwdRaw = body?.cwd
+        const preferredMachineId = body?.machineId ?? null
+        const options = body?.options ?? null
+
+        if (!cwdRaw || typeof cwdRaw !== 'string' || !cwdRaw.trim()) return json(res, 400, { error: 'cwd is required' })
+
+        const machineId = pickMachineId((typeof preferredMachineId === 'string' && preferredMachineId.trim())
+          ? preferredMachineId.trim()
+          : null)
+        if (!machineId) return json(res, 503, { error: 'no runner connected' })
+
+        const cwd = cwdRaw.trim()
+        const sessionId = crypto.randomUUID()
+        store.createSession({ sessionId, machineId, cwd, status: 'idle', options })
+
+        const session = store.getSession(sessionId)
+        if (session) {
+          sse.send(makeEnvelope({
+            type: 'registry.session.upsert',
+            scope: { machineId, sessionId },
+            payload: session
+          }))
+        }
+
+        return json(res, 200, { sessionId, session })
       }
 
       if (url.pathname === '/api/sessions' && req.method === 'POST') {
@@ -922,6 +988,21 @@ export async function startHost({ config }) {
           hasMoreBefore: page.hasMoreBefore,
           nextBeforeSeq: page.oldestSeq
         })
+      }
+
+      if (parts[0] === 'api' && parts[1] === 'sessions' && parts[2] && parts[3] === 'turns' && parts[4] && parts[5] === 'reasoning' && req.method === 'GET') {
+        if (!auth.requireAuth(req, res)) return
+        const sessionId = parts[2]
+        const turnId = parts[4]
+        const session = store.getSession(sessionId)
+        if (!session) return json(res, 404, { error: 'not found' })
+
+        const maxCharsRaw = url.searchParams.get('maxChars')
+        const maxChars = maxCharsRaw ? Number.parseInt(String(maxCharsRaw), 10) : 400_000
+
+        const out = store.getTurnReasoningSections(sessionId, turnId, { maxChars })
+        if (!out) return json(res, 404, { error: 'not found' })
+        return json(res, 200, out)
       }
 
       if (parts[0] === 'api' && parts[1] === 'sessions' && parts[2] && parts[3] === 'items' && parts[4] && parts[5] === 'output' && req.method === 'GET') {

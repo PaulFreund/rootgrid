@@ -83,6 +83,32 @@ export class SSEManager {
     return true
   }
 
+  /**
+   * Update which session's verbose events (e.g. `session.output`) should be
+   * delivered to a connection. Registry + small lifecycle events are always
+   * broadcast; this only affects session-scoped streaming output.
+   *
+   * @param {string} id
+   * @param {string|null} sessionId
+   */
+  setSessionId(id, sessionId) {
+    const c = this.clients.get(id)
+    if (!c) return false
+    c.sessionId = (typeof sessionId === 'string' && sessionId.trim()) ? sessionId.trim() : null
+    return true
+  }
+
+  /**
+   * @param {string} id
+   * @param {string|null} machineId
+   */
+  setMachineId(id, machineId) {
+    const c = this.clients.get(id)
+    if (!c) return false
+    c.machineId = (typeof machineId === 'string' && machineId.trim()) ? machineId.trim() : null
+    return true
+  }
+
   anyVisible() {
     for (const c of this.clients.values()) {
       if (c.visibility === 'visible') return true

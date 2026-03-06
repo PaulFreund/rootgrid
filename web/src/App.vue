@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Archive, ArrowDown, Code, Copy, Loader2, PanelRightClose, PanelRightOpen, Plus, Send, Settings, Square, Trash2, X } from 'lucide-vue-next'
+import { Archive, ArrowDown, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, Loader2, Plus, Send, Settings, Square, Trash2, X } from 'lucide-vue-next'
 
 import MarkdownView from './components/MarkdownView.vue'
 
@@ -102,6 +102,7 @@ const newThreadOpen = ref(false)
 const newThreadMachineId = ref('')
 const newThreadCwd = ref('')
 const newThreadError = ref('')
+const newThreadCreating = ref(false)
 
 const newThreadBrowseOpen = ref(false)
 const newThreadBrowsePath = ref('')
@@ -179,8 +180,6 @@ const ideError = ref('')
 const sending = ref(false)
 const ideStarting = ref(false)
 
-const showPlan = ref(false)
-
 const chatScrollEl = ref(null)
 const stickToBottom = ref(true)
 
@@ -234,11 +233,16 @@ function getSessionStore(sessionId) {
       diff: '',
       plan: null,
       planExplanation: null,
-      lastReasoningChunk: { text: null, tsMs: 0 },
+      planPinnedOpen: true,
+      currentTurnId: null,
+      turnHasReasoningLive: new Set(), // turnId -> true (seen reasoning deltas via SSE)
+      backgroundExpandedByTurnId: new Map(), // turnId -> boolean
+      reasoningByTurnId: new Map(), // turnId -> { loading, loaded, error, truncated, sections }
       seen: new Set(),
       hasMoreBefore: true,
       nextBeforeSeq: null,
       loadingBefore: false,
+      pendingAfter: [],
       toolOutputByItemId: new Map(), // itemId -> { stdout, stderr, loaded, loading, hasMoreBefore, nextBeforeSeq }
       toolExpanded: new Map(), // itemId -> boolean
       diffSelectedFileByEventId: new Map() // diffEventId -> path
@@ -312,7 +316,13 @@ function sessionHostName(s) {
 
 function sessionListTitle(s) {
   const t = String(s?.title ?? '').trim()
-  return t || sessionProject(s) || (s?.sessionId ? String(s.sessionId).slice(0, 8) : 'Session')
+  if (t) return t
+
+  const lastSeq = Number(s?.lastSeq ?? 0) || 0
+  const preview = String(s?.preview ?? '').trim()
+  if (!preview && lastSeq <= 0) return 'New thread'
+
+  return sessionProject(s) || (s?.sessionId ? String(s.sessionId).slice(0, 8) : 'Session')
 }
 
 function sessionInitial(s) {
@@ -366,13 +376,6 @@ function statusChipClass(status) {
   return 'border-slate-800 bg-slate-950/60 text-slate-400'
 }
 
-function planDotClass(status) {
-  const s = String(status ?? '')
-  if (s === 'completed') return 'bg-emerald-400'
-  if (s === 'inProgress') return 'bg-amber-400'
-  return 'bg-slate-600'
-}
-
 async function apiFetch(path, opts = {}) {
   return await fetch(path, {
     ...opts,
@@ -397,7 +400,11 @@ async function postVisibilityNow() {
   if (!connectionId) return
   await apiFetch('/api/visibility', {
     method: 'POST',
-    body: JSON.stringify({ connectionId, visibility: currentVisibility() })
+    body: JSON.stringify({
+      connectionId,
+      visibility: currentVisibility(),
+      sessionId: selectedSessionId.value ?? null
+    })
   }).catch(() => {})
 }
 
@@ -1006,16 +1013,6 @@ function appendCapped(prev, delta, cap = 200_000) {
   return next.slice(next.length - cap)
 }
 
-function shouldDropReasoningChunk(store, text) {
-  const t = String(text ?? '')
-  if (!t) return true
-  const now = Date.now()
-  const last = store?.lastReasoningChunk ?? null
-  if (last && last.text === t && (now - Number(last.tsMs ?? 0)) < 500) return true
-  if (store) store.lastReasoningChunk = { text: t, tsMs: now }
-  return false
-}
-
 function toolOutputHasMeaningfulText(output) {
   if (!output) return false
   const stdout = String(output?.stdout ?? '')
@@ -1147,6 +1144,67 @@ function onToolDetailsToggle(itemId, ev) {
   if (current === open) return
   store.toolExpanded.set(key, open)
   if (open) ensureToolOutputLoaded(sid, key).catch(() => {})
+}
+
+function getTurnReasoningState(store, turnId) {
+  const key = String(turnId ?? '').trim()
+  if (!key) return null
+  let state = store.reasoningByTurnId.get(key)
+  if (!state) {
+    state = reactive({
+      loading: false,
+      loaded: false,
+      error: '',
+      truncated: false,
+      sections: []
+    })
+    store.reasoningByTurnId.set(key, state)
+  }
+  return state
+}
+
+async function ensureTurnReasoningLoaded(sessionId, turnId) {
+  const sid = String(sessionId ?? '').trim()
+  const tid = String(turnId ?? '').trim()
+  if (!sid || !tid) return
+  const store = getSessionStore(sid)
+  const st = getTurnReasoningState(store, tid)
+  if (!st) return
+  if (st.loading || st.loaded) return
+
+  st.loading = true
+  st.error = ''
+  try {
+    const res = await apiFetch(`/api/sessions/${sid}/turns/${encodeURIComponent(tid)}/reasoning?maxChars=400000`)
+    const data = await res.json().catch(() => null)
+    if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+
+    const sections = Array.isArray(data?.sections) ? data.sections : null
+    if (sections) {
+      st.sections = sections
+    } else {
+      const text = String(data?.text ?? '')
+      st.sections = parseReasoningSections(text)
+    }
+    st.truncated = Boolean(data?.truncated)
+    st.loaded = true
+  } catch (err) {
+    st.error = String(err?.message ?? err)
+  } finally {
+    st.loading = false
+  }
+}
+
+function onBackgroundDetailsToggle(turnId, ev) {
+  const sid = selectedSessionId.value
+  if (!sid || !turnId) return
+  const open = Boolean(ev?.target?.open)
+  const store = getSessionStore(sid)
+  const key = String(turnId)
+  const current = Boolean(store.backgroundExpandedByTurnId.get(key))
+  if (current === open) return
+  store.backgroundExpandedByTurnId.set(key, open)
+  if (open) ensureTurnReasoningLoaded(sid, key).catch(() => {})
 }
 
 function toolDisplayCommand(m) {
@@ -1294,7 +1352,12 @@ function handleEnvelope(env) {
   if (selectedSessionId.value === sessionId) {
     if (env.type === 'turn.started') {
       const store = getSessionStore(sessionId)
-      store.lastReasoningChunk = { text: null, tsMs: 0 }
+      store.currentTurnId = env.payload?.turnId ?? null
+    }
+
+    if (env.type === 'turn.completed') {
+      const store = getSessionStore(sessionId)
+      store.currentTurnId = null
     }
 
     // Compact history view: keep big events in the main list; route tool output
@@ -1309,11 +1372,28 @@ function handleEnvelope(env) {
       }
       if (stream === 'reasoning') {
         const store = getSessionStore(sessionId)
-        const chunk = String(text ?? '')
-        if (shouldDropReasoningChunk(store, chunk)) return
-        // Fall through: reasoning is rendered as interleaved "step lines" in the timeline.
+        const tid = String(store.currentTurnId ?? '').trim()
+        if (tid) store.turnHasReasoningLive.add(tid)
+        return
       }
       if (stream === 'plan') return
+    }
+
+    // If the user is scrolling up to load history, don't let new incoming events
+    // (appended at the bottom) interfere with the scroll anchoring math for
+    // prepending older pages. Buffer them briefly and flush after `loadMoreBefore`.
+    try {
+      const store = getSessionStore(sessionId)
+      if (store.loadingBefore && !stickToBottom.value) {
+        store.pendingAfter.push({
+          eventId: env.id,
+          tsMs: env.ts,
+          type: env.type,
+          payload: env.payload
+        })
+        return
+      }
+    } catch {
     }
 
     addSessionEvent(sessionId, {
@@ -1341,19 +1421,22 @@ async function loadSession(sessionId) {
     store.diff = ''
     store.plan = null
     store.planExplanation = null
-    store.lastReasoningChunk = { text: null, tsMs: 0 }
+    store.currentTurnId = null
+    store.turnHasReasoningLive.clear()
+    store.backgroundExpandedByTurnId.clear()
+    store.reasoningByTurnId.clear()
     store.hasMoreBefore = true
     store.nextBeforeSeq = null
     store.loadingBefore = false
+    try { store.pendingAfter?.splice?.(0, store.pendingAfter.length) } catch {}
     store.toolOutputByItemId.clear()
     store.toolExpanded.clear()
     try { store.diffSelectedFileByEventId?.clear?.() } catch {}
 
     // Load the newest page (summary/"big events" mode).
-    // Summary mode now includes reasoning; bump the initial page size so we
-    // reliably include the triggering user message + tool steps (reasoning can
-    // be chunked into many events).
-    const pageRes = await apiFetch(`/api/sessions/${sessionId}/events?mode=summary&limit=2000`)
+    // Summary mode intentionally excludes verbose streams (reasoning + tool
+    // stdout/stderr) to keep scrolling responsive. Details are loaded on demand.
+    const pageRes = await apiFetch(`/api/sessions/${sessionId}/events?mode=summary&limit=800`)
     if (!pageRes.ok) return
     const page = await pageRes.json().catch(() => null)
     if (nonce !== loadSessionNonce) return
@@ -1362,18 +1445,32 @@ async function loadSession(sessionId) {
     store.hasMoreBefore = Boolean(page?.hasMoreBefore)
     store.nextBeforeSeq = page?.nextBeforeSeq ?? null
 
-    // Cache a few pages back so streamed reasoning headlines aren't cut mid-line.
-    await loadMoreBefore(sessionId, { pages: 3 })
-
     // Ensure the loaded window includes at least the most recent user message.
-    // (Reasoning can be chunked into many events and push the `session.input`
-    // out of the first page.)
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 6; i++) {
       if (nonce !== loadSessionNonce) break
       if (store.events.some((ev) => ev?.type === 'session.input')) break
       if (!store.hasMoreBefore || !store.nextBeforeSeq) break
-      await loadMoreBefore(sessionId, { pages: 3 })
+      await loadMoreBefore(sessionId, { pages: 1, limit: 800 })
     }
+
+    // Background prefetch: cache a few pages back so users don't see history
+    // "pop in" line-by-line when they scroll up.
+    try {
+      setTimeout(() => {
+        if (nonce !== loadSessionNonce) return
+        loadMoreBefore(sessionId, { pages: 3, limit: 500 }).catch(() => {})
+      }, 0)
+    } catch {
+    }
+
+    // If we loaded mid-turn, remember the latest started turn so we can
+    // attribute any subsequent SSE deltas (like reasoning) to the right turn.
+    let active = null
+    for (const ev of store.events) {
+      if (ev?.type === 'turn.started') active = ev.payload?.turnId ?? active
+      if (ev?.type === 'turn.completed') active = null
+    }
+    store.currentTurnId = active
   } finally {
     if (nonce === loadSessionNonce) sessionLoading.value = false
   }
@@ -1386,6 +1483,7 @@ async function loadMoreBefore(sessionId, { pages = 1, limit = 200 } = {}) {
   if (!store.nextBeforeSeq) return
 
   const pageCount = Math.max(1, Math.min(10, Number(pages) || 1))
+  const maxPages = pageCount
   const pageLimit = Math.max(1, Math.min(2000, Number(limit) || 200))
 
   store.loadingBefore = true
@@ -1394,8 +1492,9 @@ async function loadMoreBefore(sessionId, { pages = 1, limit = 200 } = {}) {
     const prevHeight = el ? el.scrollHeight : null
     const prevTop = el ? el.scrollTop : null
 
+    const prependChunks = []
     let fetchedAny = false
-    for (let p = 0; p < pageCount; p++) {
+    for (let p = 0; p < maxPages; p++) {
       if (!store.hasMoreBefore) break
       const beforeSeq = store.nextBeforeSeq
       if (!beforeSeq) break
@@ -1413,13 +1512,29 @@ async function loadMoreBefore(sessionId, { pages = 1, limit = 200 } = {}) {
         store.seen.add(ev.eventId)
         toAdd.push(ev)
       }
-      if (toAdd.length) store.events.unshift(...toAdd)
+      if (toAdd.length) {
+        prependChunks.unshift(toAdd)
+        fetchedAny = true
+      }
 
       store.hasMoreBefore = Boolean(page?.hasMoreBefore)
       store.nextBeforeSeq = page?.nextBeforeSeq ?? store.nextBeforeSeq
-      fetchedAny = fetchedAny || Boolean(events.length)
       if (!events.length) break
+
+      // Try to avoid loading history windows that start mid-turn (many tiny
+      // `session.output` deltas) — keep fetching until we reach the preceding
+      // `session.input` boundary so the top of the viewport doesn't start with
+      // a truncated assistant output fragment.
+      if (p + 1 >= pageCount) {
+        const firstType = prependChunks.length
+          ? (prependChunks[0]?.[0]?.type ?? null)
+          : (store.events?.[0]?.type ?? null)
+        if (firstType === 'session.input') break
+      }
     }
+
+    const prepend = prependChunks.flat()
+    if (prepend.length) store.events.unshift(...prepend)
 
     await nextTick()
     if (el && prevHeight !== null && prevTop !== null && fetchedAny) {
@@ -1428,20 +1543,30 @@ async function loadMoreBefore(sessionId, { pages = 1, limit = 200 } = {}) {
     }
   } finally {
     store.loadingBefore = false
+
+    // Flush any SSE events that arrived while we were prepending history.
+    try {
+      const pending = Array.isArray(store.pendingAfter) ? store.pendingAfter : []
+      if (pending.length) {
+        const toFlush = pending.splice(0, pending.length)
+        for (const ev of toFlush) addSessionEvent(sessionId, ev, { atStart: false, applyDerived: true })
+      }
+    } catch {
+    }
   }
 }
 
 watch(selectedSessionId, async (sid) => {
   if (!sid) {
     replaceUrlSessionParam(null)
-    if (authed.value) connectSse()
+    if (authed.value) schedulePostVisibility()
     loadSessionNonce += 1
     sessionLoading.value = false
     return
   }
 
   replaceUrlSessionParam(sid)
-  if (authed.value) connectSse()
+  if (authed.value) schedulePostVisibility()
   await loadSession(sid)
   const s = sessions.value.find((x) => x.sessionId === sid)
   if (s?.cwd) defaults.cwd = s.cwd
@@ -1458,6 +1583,48 @@ watch(settingsTab, (t) => {
 const selectedSession = computed(() => sessions.value.find((s) => s.sessionId === selectedSessionId.value) ?? null)
 const selectedStore = computed(() => selectedSessionId.value ? sessionStores.get(selectedSessionId.value) : null)
 const selectedTokenUsage = computed(() => selectedSessionId.value ? (tokenUsageBySessionId.get(selectedSessionId.value) ?? null) : null)
+
+function planStatusKey(status) {
+  return String(status ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, '')
+}
+
+function planStepIsCompleted(step) {
+  return planStatusKey(step?.status) === 'completed'
+}
+
+const pinnedPlanSteps = computed(() => {
+  const plan = selectedStore.value?.plan
+  return Array.isArray(plan) ? plan : []
+})
+
+const pinnedPlanCompletedCount = computed(() => {
+  let n = 0
+  for (const step of pinnedPlanSteps.value) {
+    if (planStepIsCompleted(step)) n++
+  }
+  return n
+})
+
+const pinnedPlanHasUnchecked = computed(() => {
+  if (!pinnedPlanSteps.value.length) return false
+  return pinnedPlanSteps.value.some((s) => !planStepIsCompleted(s))
+})
+
+const pinnedPlanSummary = computed(() => {
+  const total = pinnedPlanSteps.value.length
+  const done = pinnedPlanCompletedCount.value
+  if (!total) return ''
+  return `${done} out of ${total} tasks completed`
+})
+
+function togglePinnedPlanOpen() {
+  const store = selectedStore.value
+  if (!store) return
+  store.planPinnedOpen = !store.planPinnedOpen
+}
 
 const recentModels = computed(() => {
   const seen = new Set()
@@ -1920,14 +2087,281 @@ function looksLikeFileToken(token) {
   return false
 }
 
-function formatExploreTitle({ files = 0, searches = 0, lists = 0 } = {}) {
+function formatExploreTitle({ files = 0, searches = 0, lists = 0, active = false } = {}) {
   const parts = []
   const pl = (n, one, many) => (Number(n) === 1 ? one : many)
   if (files) parts.push(`${files} ${pl(files, 'file', 'files')}`)
   if (searches) parts.push(`${searches} ${pl(searches, 'search', 'searches')}`)
   if (lists) parts.push(`${lists} ${pl(lists, 'list', 'lists')}`)
-  if (!parts.length) return 'Explored'
-  return `Explored ${parts.join(', ')}`
+  const prefix = active ? 'Exploring' : 'Explored'
+  if (!parts.length) return prefix
+  return `${prefix} ${parts.join(', ')}`
+}
+
+function formatBackgroundTitle({ hasReasoning = false, explore = null } = {}) {
+  const parts = []
+  if (hasReasoning) parts.push('Reasoning')
+  if (explore && (explore.files || explore.searches || explore.lists || explore.active)) parts.push(formatExploreTitle(explore))
+  if (!parts.length) return 'Details'
+  return `Details — ${parts.join(' · ')}`
+}
+
+function normalizeCommandActions(commandActions) {
+  const raw = Array.isArray(commandActions) ? commandActions : []
+  const out = []
+  for (const a of raw) {
+    if (!a || typeof a !== 'object') continue
+    const type = String(a.type ?? '').trim()
+    const command = String(a.command ?? '').trim()
+    if (type === 'read') {
+      const name = String(a.name ?? '').trim() || String(a.path ?? '').trim() || command
+      const path = (a.path === undefined || a.path === null) ? null : String(a.path)
+      out.push({ kind: 'read', command, name, path })
+      continue
+    }
+    if (type === 'listFiles') {
+      const path = (a.path === undefined || a.path === null) ? null : String(a.path)
+      out.push({ kind: 'list', command, path })
+      continue
+    }
+    if (type === 'search') {
+      const query = (a.query === undefined || a.query === null) ? null : String(a.query)
+      const path = (a.path === undefined || a.path === null) ? null : String(a.path)
+      out.push({ kind: 'search', command, query, path })
+      continue
+    }
+    if (type === 'unknown') {
+      out.push({ kind: 'unknown', command })
+      continue
+    }
+    if (command) out.push({ kind: 'unknown', command })
+  }
+  return out
+}
+
+function isExploringCallFromActions(actions) {
+  const arr = Array.isArray(actions) ? actions : []
+  if (!arr.length) return false
+  return arr.every((a) => a && typeof a === 'object' && (a.kind === 'read' || a.kind === 'list' || a.kind === 'search'))
+}
+
+function exploreCountKey(action) {
+  if (!action || typeof action !== 'object') return null
+  if (action.kind === 'read') return `read:${String(action.name ?? '').trim() || String(action.path ?? '').trim() || String(action.command ?? '').trim()}`
+  if (action.kind === 'list') return `list:${String(action.path ?? '').trim() || String(action.command ?? '').trim()}`
+  if (action.kind === 'search') {
+    const q = String(action.query ?? '').trim() || String(action.command ?? '').trim()
+    const p = String(action.path ?? '').trim()
+    return `search:${q}::${p}`
+  }
+  return null
+}
+
+function buildExploreEntriesFromCalls(calls, { maxLines = 400 } = {}) {
+  const list = Array.isArray(calls) ? calls : []
+  const out = []
+
+  const pushLine = (label) => {
+    if (out.length >= Math.max(10, Number(maxLines) || 400)) return
+    out.push({ id: `explore-${out.length + 1}`, label: String(label ?? '').trim() })
+  }
+
+  const pushReadMerged = (names) => {
+    const uniq = []
+    const seen = new Set()
+    for (const n of names) {
+      const k = String(n ?? '').trim()
+      if (!k || seen.has(k)) continue
+      seen.add(k)
+      uniq.push(k)
+    }
+    if (uniq.length) pushLine(`Read ${uniq.join(', ')}`)
+  }
+
+  let i = 0
+  while (i < list.length) {
+    const call = list[i] ?? null
+    const actions = Array.isArray(call?.actions) ? call.actions : []
+    const readsOnly = actions.length && actions.every((a) => a?.kind === 'read')
+
+    if (readsOnly) {
+      const names = actions.map((a) => a?.name ?? a?.path ?? a?.command).filter(Boolean)
+      i += 1
+      while (i < list.length) {
+        const next = list[i] ?? null
+        const nextActions = Array.isArray(next?.actions) ? next.actions : []
+        const nextReadsOnly = nextActions.length && nextActions.every((a) => a?.kind === 'read')
+        if (!nextReadsOnly) break
+        for (const a of nextActions) names.push(a?.name ?? a?.path ?? a?.command)
+        i += 1
+      }
+      pushReadMerged(names)
+      continue
+    }
+
+    for (const a of actions) {
+      if (!a || typeof a !== 'object') continue
+      if (a.kind === 'read') {
+        const name = String(a.name ?? '').trim() || String(a.path ?? '').trim() || String(a.command ?? '').trim()
+        if (name) pushLine(`Read ${name}`)
+        continue
+      }
+      if (a.kind === 'list') {
+        const p = String(a.path ?? '').trim() || String(a.command ?? '').trim()
+        if (p) pushLine(`List ${p}`)
+        continue
+      }
+      if (a.kind === 'search') {
+        const q = String(a.query ?? '').trim()
+        const p = String(a.path ?? '').trim()
+        const cmd = String(a.command ?? '').trim()
+        if (q && p) pushLine(`Search ${q} in ${p}`)
+        else if (q) pushLine(`Search ${q}`)
+        else if (cmd) pushLine(`Search ${cmd}`)
+        continue
+      }
+      if (a.kind === 'unknown') {
+        const cmd = String(a.command ?? '').trim()
+        if (cmd) pushLine(`Run ${cmd}`)
+      }
+    }
+
+    i += 1
+  }
+
+  return out.filter((e) => e && e.label)
+}
+
+function buildTurnBackgroundTimeline({ exploreCalls, reasoningState }) {
+  const calls = Array.isArray(exploreCalls) ? exploreCalls : []
+  const reasoningLoaded = Boolean(reasoningState?.loaded)
+  const reasoningSections = (reasoningLoaded && Array.isArray(reasoningState?.sections)) ? reasoningState.sections : []
+
+  /** @type {{ kind: string, id: string, seq: number|null, tsMs: number|null, actions?: any[], section?: any, itemId?: string }[]} */
+  const items = []
+
+  for (const s of reasoningSections) {
+    if (!s) continue
+    const title = String(s.title ?? '').trim()
+    const body = String(s.body ?? '')
+    if (!title && !body.trim()) continue
+    const seq = Number(s.startSeq ?? s.seq ?? NaN)
+    const tsMs = Number(s.tsMs ?? NaN)
+    items.push({
+      kind: 'reasoning',
+      id: `reasoning-${String(s.id ?? title ?? items.length + 1)}`,
+      seq: Number.isFinite(seq) ? seq : null,
+      tsMs: Number.isFinite(tsMs) ? tsMs : null,
+      section: s
+    })
+  }
+
+  for (const c of calls) {
+    if (!c) continue
+    const actions = Array.isArray(c.actions) ? c.actions : []
+    if (!actions.length) continue
+    const seq = Number(c.seq ?? NaN)
+    const tsMs = Number(c.tsMs ?? NaN)
+    items.push({
+      kind: 'exploreCall',
+      id: `explorecall-${String(c.itemId ?? items.length + 1)}`,
+      seq: Number.isFinite(seq) ? seq : null,
+      tsMs: Number.isFinite(tsMs) ? tsMs : null,
+      itemId: String(c.itemId ?? ''),
+      actions
+    })
+  }
+
+  if (!items.length) return []
+
+  const useSeq = items.every((it) => (typeof it.seq === 'number' && Number.isFinite(it.seq)))
+  const withKeys = items.map((it, idx) => ({
+    ...it,
+    _idx: idx,
+    _key: useSeq
+      ? it.seq
+      : ((typeof it.tsMs === 'number' && Number.isFinite(it.tsMs))
+        ? it.tsMs
+        : ((typeof it.seq === 'number' && Number.isFinite(it.seq)) ? it.seq : idx))
+  }))
+
+  withKeys.sort((a, b) => (a._key - b._key) || (a._idx - b._idx))
+
+  const readsOnly = (it) => it?.kind === 'exploreCall' && Array.isArray(it.actions) && it.actions.length && it.actions.every((a) => a?.kind === 'read')
+
+  // Merge consecutive read-only explore calls (Codex TUI semantics), but only
+  // when they are adjacent in the ordered timeline (i.e. not separated by
+  // reasoning).
+  const merged = []
+  for (const it of withKeys) {
+    const prev = merged.length ? merged[merged.length - 1] : null
+    if (readsOnly(prev) && readsOnly(it)) {
+      prev.actions.push(...it.actions)
+      continue
+    }
+    merged.push({ ...it })
+  }
+
+  /** @type {{ kind: string, id: string, label?: string, section?: any }[]} */
+  const out = []
+
+  const pushExploreLine = (baseId, label) => {
+    const l = String(label ?? '').trim()
+    if (!l) return
+    out.push({ kind: 'explore', id: `${baseId}-${out.length + 1}`, label: l })
+  }
+
+  const formatExploreCall = (call) => {
+    const actions = Array.isArray(call?.actions) ? call.actions : []
+    if (!actions.length) return
+
+    const isReadsOnly = actions.every((a) => a?.kind === 'read')
+    if (isReadsOnly) {
+      const seen = new Set()
+      const names = []
+      for (const a of actions) {
+        const n = String(a?.name ?? a?.path ?? a?.command ?? '').trim()
+        if (!n || seen.has(n)) continue
+        seen.add(n)
+        names.push(n)
+      }
+      if (names.length) pushExploreLine(call.id, `Read ${names.join(', ')}`)
+      return
+    }
+
+    for (const a of actions) {
+      if (!a || typeof a !== 'object') continue
+      if (a.kind === 'read') {
+        const name = String(a.name ?? a.path ?? a.command ?? '').trim()
+        if (name) pushExploreLine(call.id, `Read ${name}`)
+      } else if (a.kind === 'list') {
+        const p = String(a.path ?? '').trim() || String(a.command ?? '').trim()
+        if (p) pushExploreLine(call.id, `List ${p}`)
+      } else if (a.kind === 'search') {
+        const q = String(a.query ?? '').trim()
+        const p = String(a.path ?? '').trim()
+        const cmd = String(a.command ?? '').trim()
+        if (q && p) pushExploreLine(call.id, `Search ${q} in ${p}`)
+        else if (q) pushExploreLine(call.id, `Search ${q}`)
+        else if (cmd) pushExploreLine(call.id, `Search ${cmd}`)
+      } else if (a.kind === 'unknown') {
+        const cmd = String(a.command ?? '').trim()
+        if (cmd) pushExploreLine(call.id, `Run ${cmd}`)
+      }
+    }
+  }
+
+  for (const it of merged) {
+    if (it.kind === 'reasoning') {
+      out.push({ kind: 'reasoning', id: it.id, section: it.section })
+      continue
+    }
+    if (it.kind === 'exploreCall') {
+      formatExploreCall(it)
+    }
+  }
+
+  return out
 }
 
 function parseExploreActionsFromCommand(command) {
@@ -2052,6 +2486,66 @@ function parseExploreActionsFromCommand(command) {
   }
 
   return { actions, hasNonExplore }
+}
+
+function parseReasoningHeading(line) {
+  const raw = String(line ?? '')
+  let ltrim = raw.replace(/^\s+/, '')
+  // Some models format section headers as list items like "- **Header**".
+  if (ltrim.startsWith('- ') || ltrim.startsWith('* ') || ltrim.startsWith('• ') || ltrim.startsWith('– ')) {
+    ltrim = ltrim.slice(2).replace(/^\s+/, '')
+  }
+  if (!ltrim.startsWith('**')) return null
+  const close = ltrim.indexOf('**', 2)
+  if (close < 0) return null
+  const title = ltrim.slice(2, close).trim()
+  if (!title) return null
+  const rest = ltrim.slice(close + 2)
+  return { title, rest }
+}
+
+function parseReasoningSections(markdown, { maxSections = 200, maxBodyChars = 500_000 } = {}) {
+  const text = String(markdown ?? '').replace(/\r/g, '')
+  if (!text.trim()) return []
+
+  const lines = text.split('\n')
+  const sections = []
+  let cur = null
+
+  const start = (title) => {
+    if (sections.length >= maxSections) return null
+    cur = {
+      id: `r-${sections.length + 1}`,
+      title: String(title ?? '').trim(),
+      body: ''
+    }
+    sections.push(cur)
+    return cur
+  }
+
+  for (const line of lines) {
+    const heading = parseReasoningHeading(line)
+    if (heading) {
+      const baseTitle = String(heading.title ?? '').trim()
+      const rest = String(heading.rest ?? '')
+      const title = (rest.trim() ? `${baseTitle}${rest}` : baseTitle).trim()
+      start(title)
+      continue
+    }
+
+    if (!cur) {
+      if (!String(line ?? '').trim()) continue
+      start('Reasoning')
+    }
+    if (!cur) break
+    cur.body = appendCapped(cur.body, `${line}\n`, maxBodyChars)
+  }
+
+  // Trim the final trailing newline (cosmetic).
+  for (const s of sections) {
+    if (typeof s.body === 'string') s.body = s.body.replace(/\n+$/, '\n')
+  }
+  return sections
 }
 
 function normalizeDiffPath(p) {
@@ -2264,184 +2758,137 @@ function buildChatMessages(store) {
   const events = store?.events ?? []
   const msgs = []
   let currentAssistant = null
+  let currentAssistantIdx = null
   /** @type {Map<string, any>} */
   const toolMsgByItemId = new Map()
 
-  // VS Code-like folding: collapse consecutive file reads/search/list commands
-  // (shell-based "exploration") into a single expandable "Explored …" line.
-  let exploreCurrent = null
-  let exploreSeq = 0
-  const exploreSeenItemIds = new Set()
-  const resetExplore = () => { exploreCurrent = null }
-  const ensureExploreGroup = (idHint) => {
-    if (exploreCurrent) return exploreCurrent
-    const msg = {
-      id: `explore-${idHint ?? (++exploreSeq)}`,
-      role: 'step',
-      stepKind: 'explore',
-      title: 'Explored',
-      files: 0,
-      searches: 0,
-      lists: 0,
-      entries: []
-    }
-    exploreCurrent = msg
-    msgs.push(msg)
-    return msg
-  }
-
   let lastDiffText = null
 
-  // Reasoning is streamed as markdown with section headings like "**Title**"
-  // on their own line. Render each heading as a single expandable "step line".
-  let reasoningCurrent = null
-  let reasoningBuf = ''
-  let lastReasoningEventId = null
-  /** @type {Map<string, number>} */
-  const reasoningStepIdxByEventId = new Map()
+  // Per-turn background folding (Reasoning + file reads/search/list exploration).
+  const reasoningTurnIds = new Set()
+  for (const e of events) {
+    if (e.type !== 'thread.tokenUsage.updated') continue
+    const tid = String(e.payload?.turnId ?? '').trim()
+    if (!tid) continue
+    const n = Number(e.payload?.tokenUsage?.last?.reasoningOutputTokens ?? 0)
+    if (Number.isFinite(n) && n > 0) reasoningTurnIds.add(tid)
+  }
+  try {
+    for (const tid of store?.turnHasReasoningLive ?? []) reasoningTurnIds.add(String(tid))
+  } catch {
+  }
+
+  let activeTurnId = null
+  let backgroundOpen = false
+  const exploreFileKeys = new Set()
+  const exploreSearchKeys = new Set()
+  const exploreListKeys = new Set()
+  /** @type {{ actions: any[], itemId: string }[]|null} */
+  let exploreCalls = null
+  const exploreActiveItemIds = new Set()
+  const exploreSeenItemIds = new Set()
+
+  const resetTurnBackground = () => {
+    activeTurnId = null
+    backgroundOpen = false
+    exploreFileKeys.clear()
+    exploreSearchKeys.clear()
+    exploreListKeys.clear()
+    exploreCalls = null
+    exploreActiveItemIds.clear()
+    exploreSeenItemIds.clear()
+  }
+
+  const beginTurn = (turnId) => {
+    resetTurnBackground()
+    activeTurnId = String(turnId ?? '').trim() || null
+    if (!activeTurnId) return
+    backgroundOpen = Boolean(store?.backgroundExpandedByTurnId?.get?.(activeTurnId))
+    if (backgroundOpen) exploreCalls = []
+  }
+
+  const maybeEmitBackground = () => {
+    if (!activeTurnId) return
+    const hasExplore = Boolean(exploreFileKeys.size || exploreSearchKeys.size || exploreListKeys.size || exploreActiveItemIds.size)
+    const tokenHasReasoning = reasoningTurnIds.has(activeTurnId)
+    if (!hasExplore && !tokenHasReasoning) {
+      resetTurnBackground()
+      return
+    }
+
+    const expanded = Boolean(store?.backgroundExpandedByTurnId?.get?.(activeTurnId))
+    const explore = {
+      files: exploreFileKeys.size,
+      searches: exploreSearchKeys.size,
+      lists: exploreListKeys.size,
+      active: Boolean(exploreActiveItemIds.size)
+    }
+    const reasoningState = expanded ? getTurnReasoningState(store, activeTurnId) : null
+    const hasReasoning = tokenHasReasoning || Boolean(reasoningState?.loaded && Array.isArray(reasoningState?.sections) && reasoningState.sections.length)
+    const timeline = expanded ? buildTurnBackgroundTimeline({ exploreCalls: exploreCalls ?? [], reasoningState }) : null
+    const msg = {
+      id: `bg-${activeTurnId}`,
+      role: 'step',
+      stepKind: 'background',
+      turnId: activeTurnId,
+      expanded,
+      title: formatBackgroundTitle({ hasReasoning, explore }),
+      hasReasoning,
+      reasoning: reasoningState,
+      explore,
+      timeline
+    }
+    // Ordering: show background details *before* the assistant answer bubble
+    // (Codex-like: work details above the final response), but after any real
+    // tool/diff steps that were already emitted earlier in the turn.
+    const insertAt = (Number.isInteger(currentAssistantIdx) && currentAssistantIdx !== null)
+      ? Math.max(0, Math.min(msgs.length, currentAssistantIdx))
+      : msgs.length
+    if (insertAt === msgs.length) msgs.push(msg)
+    else {
+      msgs.splice(insertAt, 0, msg)
+      if (Number.isInteger(currentAssistantIdx) && currentAssistantIdx !== null) currentAssistantIdx += 1
+    }
+    resetTurnBackground()
+  }
 
   const ensureAssistant = (idHint) => {
     if (currentAssistant) return currentAssistant
-    resetExplore()
     currentAssistant = { id: idHint, role: 'assistant', text: '' }
+    currentAssistantIdx = msgs.length
     msgs.push(currentAssistant)
     return currentAssistant
   }
 
-  const nextReasoningStepId = (eventId) => {
-    const key = String(eventId ?? 'reasoning')
-    const next = (reasoningStepIdxByEventId.get(key) ?? 0) + 1
-    reasoningStepIdxByEventId.set(key, next)
-    return `reason-${key}-${next}`
-  }
-
-  const startReasoningStep = (eventId, title) => {
-    resetExplore()
-    const msg = {
-      id: nextReasoningStepId(eventId),
-      role: 'step',
-      stepKind: 'reasoning',
-      _placeholder: false,
-      title: String(title ?? '').trim(),
-      body: ''
-    }
-    msgs.push(msg)
-    reasoningCurrent = msg
-    return msg
-  }
-
-  const appendReasoningBody = (eventId, text) => {
-    const chunk = String(text ?? '')
-    if (!chunk) return
-    if (!reasoningCurrent) {
-      if (!chunk.trim()) return
-      startReasoningStep(eventId, 'Reasoning')
-    }
-    reasoningCurrent.body = appendCapped(reasoningCurrent.body, chunk, 500_000)
-  }
-
-  const parseReasoningHeading = (line) => {
-    const raw = String(line ?? '')
-    const ltrim = raw.replace(/^\s+/, '')
-    if (!ltrim.startsWith('**')) return null
-    const close = ltrim.indexOf('**', 2)
-    if (close < 0) return null
-    const title = ltrim.slice(2, close).trim()
-    if (!title) return null
-    const rest = ltrim.slice(close + 2)
-    return { title, rest }
-  }
-
-  const handleReasoningLine = (eventId, line, trailingNewline) => {
-    const raw = String(line ?? '')
-    const heading = parseReasoningHeading(raw)
-    if (heading) {
-      const baseTitle = String(heading.title ?? '').trim()
-      const rest = String(heading.rest ?? '')
-      const title = (rest.trim() ? `${baseTitle}${rest}` : baseTitle).trim()
-      if (reasoningCurrent?._placeholder && !String(reasoningCurrent?.body ?? '').trim()) {
-        reasoningCurrent.title = title
-        reasoningCurrent._placeholder = false
-      } else {
-        startReasoningStep(eventId, title)
-      }
-      return
-    }
-    if (!reasoningCurrent && !raw.trim()) return
-    appendReasoningBody(eventId, raw + (trailingNewline ? '\n' : ''))
-  }
-
-  const feedReasoning = (eventId, chunk) => {
-    lastReasoningEventId = eventId
-    reasoningBuf += String(chunk ?? '')
-    let idx
-    while ((idx = reasoningBuf.indexOf('\n')) >= 0) {
-      let line = reasoningBuf.slice(0, idx)
-      if (line.endsWith('\r')) line = line.slice(0, -1)
-      reasoningBuf = reasoningBuf.slice(idx + 1)
-      handleReasoningLine(eventId, line, true)
-    }
-
-    // If we have started receiving reasoning but haven't reached a newline yet,
-    // still show a single expandable "Reasoning" line immediately.
-    if (!reasoningCurrent && reasoningBuf.trim()) {
-      const msg = startReasoningStep(eventId, 'Reasoning')
-      msg._placeholder = true
-    }
-  }
-
-  const flushReasoningBuf = (eventId) => {
-    if (!reasoningBuf) return
-    const id = eventId ?? lastReasoningEventId ?? 'reasoning'
-    handleReasoningLine(id, reasoningBuf, false)
-    reasoningBuf = ''
-  }
-
   for (const e of events) {
     if (e.type === 'session.input') {
-      flushReasoningBuf()
+      maybeEmitBackground()
       const text = e.payload?.text ?? ''
       const atts = Array.isArray(e.payload?.attachments) ? e.payload.attachments : []
       msgs.push({ id: e.eventId, role: 'user', text, attachments: atts })
       currentAssistant = null
-      resetExplore()
-      exploreSeenItemIds.clear()
+      currentAssistantIdx = null
       toolMsgByItemId.clear()
-      reasoningCurrent = null
-      reasoningBuf = ''
-      lastReasoningEventId = null
-      reasoningStepIdxByEventId.clear()
       continue
     }
 
     if (e.type === 'turn.started') {
-      flushReasoningBuf()
+      maybeEmitBackground()
       currentAssistant = null
-      resetExplore()
-      exploreSeenItemIds.clear()
+      currentAssistantIdx = null
       toolMsgByItemId.clear()
-      reasoningCurrent = null
-      reasoningBuf = ''
-      lastReasoningEventId = null
-      reasoningStepIdxByEventId.clear()
+      beginTurn(e.payload?.turnId ?? e.eventId)
       continue
     }
 
     if (e.type === 'turn.completed') {
-      flushReasoningBuf()
+      maybeEmitBackground()
       currentAssistant = null
-      resetExplore()
-      exploreSeenItemIds.clear()
-      reasoningCurrent = null
-      reasoningBuf = ''
-      lastReasoningEventId = null
-      reasoningStepIdxByEventId.clear()
+      currentAssistantIdx = null
       continue
     }
 
     if (e.type === 'diff.updated') {
-      flushReasoningBuf()
-      resetExplore()
       const diff = (typeof e.payload?.diff === 'string') ? e.payload.diff : ''
       const trimmed = String(diff ?? '').trim()
       if (!trimmed) continue
@@ -2465,18 +2912,14 @@ function buildChatMessages(store) {
       if (stream === 'normalized') {
         const a = ensureAssistant(currentAssistant?.id ?? e.eventId)
         a.text += text
-      } else if (stream === 'reasoning') {
-        feedReasoning(e.eventId, String(text ?? ''))
       } else if ((stream === 'stderr' || stream === 'stdout') && !e.payload?.itemId) {
         // Un-attributed stdout/stderr (important enough to show).
-        resetExplore()
         msgs.push({ id: e.eventId, role: 'system', stream, text: String(text ?? '') })
       }
       continue
     }
 
     if (e.type === 'session.status' && e.payload?.status === 'failed') {
-      resetExplore()
       msgs.push({ id: e.eventId, role: 'system', text: `Session failed: ${e.payload?.error ?? 'unknown error'}` })
     }
 
@@ -2485,40 +2928,32 @@ function buildChatMessages(store) {
       const itemId = String(e.payload?.itemId ?? '')
       if (!itemId) continue
 
-      // Fold "exploration" commands (ls/find/rg/sed/cat/...) into a single
-      // VS Code-like "Explored …" group instead of showing raw command steps.
-      if (String(tool ?? '').toLowerCase() === 'commandexecution') {
-        const cmd = toolDisplayCommand({ commandActions: e.payload?.commandActions ?? null, command: e.payload?.command ?? null })
-        const parsed = parseExploreActionsFromCommand(cmd)
-        const exitCode = (e.payload?.exitCode === null || e.payload?.exitCode === undefined) ? null : Number(e.payload.exitCode)
-        const allowExit = (exitCode === null || exitCode === 0 || (exitCode === 1 && parsed.actions.some((a) => a.kind === 'search')))
-
-        if (parsed.actions.length && !parsed.hasNonExplore && allowExit) {
-          if (!exploreSeenItemIds.has(itemId)) {
-            const g = ensureExploreGroup(e.eventId)
-            for (const a of parsed.actions) {
-              const kind = a.kind
-              const label = String(a.label ?? '').trim()
-              if (!kind || !label) continue
-              g.entries.push({
-                id: `explore-${itemId}-${g.entries.length + 1}`,
-                kind,
-                label,
-                itemId
-              })
-              if (kind === 'read') g.files += 1
-              else if (kind === 'search') g.searches += 1
-              else g.lists += 1
-            }
-            g.title = formatExploreTitle(g)
+      // Fold "exploration" commands (ls/find/rg/sed/cat/...) and keep them out
+      // of the main timeline (scan view). They live under a per-turn "Details"
+      // group and can load output on demand.
+      if (String(tool ?? '').toLowerCase() === 'commandexecution' && activeTurnId) {
+        const actions = normalizeCommandActions(e.payload?.commandActions)
+        const isExplore = isExploringCallFromActions(actions)
+        if (isExplore) {
+          if (e.type === 'tool.started') {
+            exploreActiveItemIds.add(itemId)
+          } else {
+            exploreActiveItemIds.delete(itemId)
+            if (exploreSeenItemIds.has(itemId)) continue
             exploreSeenItemIds.add(itemId)
+
+            for (const a of actions) {
+              const key = exploreCountKey(a)
+              if (!key) continue
+              if (a.kind === 'read') exploreFileKeys.add(key)
+              else if (a.kind === 'search') exploreSearchKeys.add(key)
+              else if (a.kind === 'list') exploreListKeys.add(key)
+            }
+            if (exploreCalls) exploreCalls.push({ itemId, actions, seq: e.seq ?? null, tsMs: e.tsMs ?? null })
           }
           continue
         }
       }
-
-      // Any non-folded tool step breaks the current explore group.
-      resetExplore()
 
       let msg = toolMsgByItemId.get(itemId) ?? null
       if (!msg) {
@@ -2554,6 +2989,7 @@ function buildChatMessages(store) {
     }
   }
 
+  maybeEmitBackground()
   return msgs
 }
 
@@ -2625,7 +3061,8 @@ function selectNewThreadBrowseFolder() {
   newThreadBrowseOpen.value = false
 }
 
-function confirmNewThreadDialog() {
+async function confirmNewThreadDialog() {
+  if (newThreadCreating.value) return
   newThreadError.value = ''
   const machineId = String(newThreadMachineId.value ?? '').trim()
   const cwd = String(newThreadCwd.value ?? '').trim()
@@ -2646,8 +3083,38 @@ function confirmNewThreadDialog() {
   defaults.machineId = machineId
   defaults.cwd = cwd
 
-  closeNewThreadDialog()
-  newChat()
+  const options = {
+    ...(defaults.model.trim() ? { model: defaults.model.trim() } : {}),
+    ...(String(defaults.reasoningEffort ?? '').trim() ? { reasoningEffort: String(defaults.reasoningEffort).trim() } : {}),
+    approvalPolicy: defaults.approvalPolicy,
+    sandbox: defaults.sandbox
+  }
+
+  newThreadCreating.value = true
+  try {
+    const res = await apiFetch('/api/sessions/draft', {
+      method: 'POST',
+      body: JSON.stringify({ cwd, machineId, options })
+    })
+    const data = await res.json().catch(() => null)
+    if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+
+    const session = data?.session ?? null
+    if (session) upsertSessionRow(session)
+    const sessionId = data?.sessionId ?? session?.sessionId ?? null
+    if (!sessionId) throw new Error('missing sessionId')
+
+    // Reset composer state and open the new session.
+    messageDraft.value = ''
+    attachments.value.splice(0, attachments.value.length)
+
+    closeNewThreadDialog()
+    selectedSessionId.value = sessionId
+  } catch (err) {
+    newThreadError.value = String(err?.message ?? err)
+  } finally {
+    newThreadCreating.value = false
+  }
 }
 
 watch(newThreadMachineId, () => {
@@ -2656,18 +3123,12 @@ watch(newThreadMachineId, () => {
   loadNewThreadBrowse('').catch(() => {})
 })
 
-function newChat() {
-  selectedSessionId.value = null
-  messageDraft.value = ''
-  attachments.value.splice(0, attachments.value.length)
-  showPlan.value = false
-}
-
 function onChatScroll() {
   const el = chatScrollEl.value
   if (!el) return
-  if (selectedSessionId.value && el.scrollTop <= 80) {
-    loadMoreBefore(selectedSessionId.value, { pages: 3 }).catch(() => {})
+  // Preload earlier history before the user hits the top so it feels instant.
+  if (selectedSessionId.value && el.scrollTop <= 500) {
+    loadMoreBefore(selectedSessionId.value, { pages: 3, limit: 500 }).catch(() => {})
   }
   const nearBottom = (el.scrollTop + el.clientHeight) >= (el.scrollHeight - 80)
   const was = stickToBottom.value
@@ -3509,7 +3970,7 @@ onBeforeUnmount(() => {
               <button
                 v-for="s in visibleSessions"
                 :key="s.sessionId"
-                class="group w-full rounded-lg px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 active:scale-[0.99]"
+                class="group w-full rounded-lg px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-slate-400/40"
                 :class="selectedSessionId === s.sessionId ? 'bg-slate-100' : 'hover:bg-slate-50'"
                 :title="sessionTooltip(s)"
                 @click="selectedSessionId = s.sessionId"
@@ -3549,7 +4010,7 @@ onBeforeUnmount(() => {
         </aside>
 
       <!-- Main -->
-      <main class="flex-1 grid grid-cols-1 bg-slate-50" :class="showPlan ? 'lg:grid-cols-[1fr_520px]' : ''">
+      <main class="flex-1 grid grid-cols-1 bg-slate-50">
         <section class="min-w-0 flex flex-col bg-white">
           <header class="border-b border-slate-200 bg-white px-4 py-3">
             <div class="flex items-center justify-between gap-4">
@@ -3597,13 +4058,6 @@ onBeforeUnmount(() => {
 
               <div class="flex items-center gap-2">
                 <button
-                  class="inline-flex items-center gap-2 rounded-md bg-slate-100 px-3 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                  @click="showPlan = !showPlan"
-                >
-                  <component :is="showPlan ? PanelRightClose : PanelRightOpen" class="h-3.5 w-3.5" />
-                  Plan
-                </button>
-                <button
                   class="inline-flex items-center gap-2 rounded-md bg-slate-100 px-3 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 active:scale-[0.99]"
                   @click="openVSCode"
                   title="Open VS Code web (code-server)"
@@ -3617,7 +4071,7 @@ onBeforeUnmount(() => {
             </div>
           </header>
 
-          <div class="relative flex-1">
+          <div class="relative flex-1 min-h-0">
             <div ref="chatScrollEl" class="absolute inset-0 overflow-auto px-4 py-6" @scroll="onChatScroll">
               <div class="mx-auto w-full max-w-3xl">
               <div v-if="selectedSessionId && sessionLoading" class="py-10">
@@ -3643,7 +4097,7 @@ onBeforeUnmount(() => {
 
               <div v-else>
               <div v-if="selectedStore?.loadingBefore" class="pb-4 text-center text-xs text-slate-500">Loading earlier…</div>
-              <transition-group name="rg-msg" tag="div" class="space-y-3">
+              <transition-group :css="!selectedStore?.loadingBefore" name="rg-msg" tag="div" class="space-y-3">
                 <div
                   v-for="m in chatMessages"
                   :key="m.id"
@@ -3652,24 +4106,39 @@ onBeforeUnmount(() => {
                 >
                   <!-- Interleaved "step lines" (reasoning sections + tools) -->
                   <div v-if="m.role === 'step'" class="w-full">
-                    <!-- Reasoning step -->
-                    <details v-if="m.stepKind === 'reasoning'" class="group w-full">
+                    <!-- Per-turn "Details" fold (reasoning + exploration) -->
+                    <details
+                      v-if="m.stepKind === 'background'"
+                      class="group w-full"
+                      :open="m.expanded"
+                      @toggle="onBackgroundDetailsToggle(m.turnId, $event)"
+                    >
                       <summary class="cursor-pointer select-none truncate text-xs font-medium text-slate-700 hover:text-slate-900">
-                        {{ m.title || 'Reasoning' }}
+                        {{ m.title || 'Details' }}
                       </summary>
-                      <div v-if="String(m.body ?? '').trim()" class="mt-2 border-l border-slate-200 pl-4">
-                        <MarkdownView :source="m.body" />
-                      </div>
-                    </details>
 
-                    <!-- Explore fold (derived from read/search/list commands) -->
-                    <details v-else-if="m.stepKind === 'explore'" class="group w-full">
-                      <summary class="cursor-pointer select-none truncate text-xs font-medium text-slate-700 hover:text-slate-900">
-                        {{ m.title || 'Explored' }}
-                      </summary>
-                      <div v-if="Array.isArray(m.entries) && m.entries.length" class="mt-2 border-l border-slate-200 pl-4">
-                        <div class="space-y-1 text-xs text-slate-700">
-                          <div v-for="e in m.entries" :key="e.id" class="truncate" :title="e.label">{{ e.label }}</div>
+                      <div class="mt-2 space-y-3 border-l border-slate-200 pl-4">
+                        <div v-if="m.reasoning?.loading" class="text-xs text-slate-500">Loading reasoning…</div>
+                        <div v-else-if="m.reasoning?.error" class="text-xs text-rose-700">{{ m.reasoning.error }}</div>
+
+                        <div v-if="Array.isArray(m.timeline) && m.timeline.length" class="space-y-2">
+                          <template v-for="it in m.timeline" :key="it.id">
+                            <details v-if="it.kind === 'reasoning'" class="group">
+                              <summary class="cursor-pointer select-none truncate text-xs font-medium text-slate-700 hover:text-slate-900">
+                                {{ it.section?.title || 'Reasoning' }}
+                              </summary>
+                              <div v-if="String(it.section?.body ?? '').trim()" class="mt-2 border-l border-slate-200 pl-4">
+                                <MarkdownView :source="it.section.body" />
+                              </div>
+                            </details>
+                            <div v-else-if="it.kind === 'explore'" class="truncate text-xs text-slate-700" :title="it.label">{{ it.label }}</div>
+                          </template>
+
+                          <div v-if="m.reasoning?.truncated" class="text-xs text-slate-500">(reasoning truncated)</div>
+                        </div>
+
+                        <div v-else class="text-xs text-slate-500">
+                          {{ m.explore?.active ? 'Exploring…' : '(no details)' }}
                         </div>
                       </div>
                     </details>
@@ -3881,7 +4350,53 @@ onBeforeUnmount(() => {
             >
               <ArrowDown class="h-4 w-4" />
               <span class="hidden sm:inline">New messages</span>
-            </button>
+	            </button>
+	          </div>
+
+          <!-- Pinned plan checklist (Codex-style) -->
+          <div v-if="pinnedPlanHasUnchecked" class="shrink-0 bg-white px-4 pb-3">
+            <div class="mx-auto w-full max-w-3xl">
+              <div class="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+                <button
+                  class="flex w-full items-center justify-between gap-3 bg-slate-50 px-4 py-2 text-left text-xs text-slate-700 transition-colors hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/40"
+                  type="button"
+                  @click="togglePinnedPlanOpen"
+                >
+                  <div class="flex items-center gap-2">
+                    <span class="inline-flex h-5 w-5 items-center justify-center rounded-md bg-white text-slate-700 shadow-sm ring-1 ring-black/5">
+                      <CheckCircle2 class="h-3.5 w-3.5" />
+                    </span>
+                    <span class="font-medium">{{ pinnedPlanSummary }}</span>
+                  </div>
+                  <ChevronDown v-if="selectedStore?.planPinnedOpen" class="h-4 w-4 text-slate-500" />
+                  <ChevronUp v-else class="h-4 w-4 text-slate-500" />
+                </button>
+
+                <div v-if="selectedStore?.planPinnedOpen" class="border-t border-slate-200 bg-white px-4 py-3">
+                  <div class="space-y-2">
+                    <div
+                      v-for="(step, idx) in pinnedPlanSteps"
+                      :key="idx"
+                      class="flex items-start gap-2 text-sm"
+                    >
+                      <span class="mt-0.5 shrink-0">
+                        <CheckCircle2 v-if="planStepIsCompleted(step)" class="h-4 w-4 text-emerald-600" />
+                        <Circle v-else class="h-4 w-4 text-slate-400" />
+                      </span>
+                      <div class="min-w-0 flex-1">
+                        <span class="mr-2 text-xs tabular-nums text-slate-500">{{ idx + 1 }}.</span>
+                        <span
+                          class="whitespace-pre-wrap"
+                          :class="planStepIsCompleted(step) ? 'line-through text-slate-500' : 'text-slate-900'"
+                        >
+                          {{ step.step }}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
 
           <footer
@@ -4024,40 +4539,7 @@ onBeforeUnmount(() => {
             </div>
           </footer>
         </section>
-
-        <aside v-if="showPlan" class="hidden lg:flex min-w-0 flex-col border-l border-slate-200 bg-white">
-          <div class="flex flex-1 min-h-0 flex-col">
-            <div class="border-b border-slate-200 px-4 py-3">
-              <div class="text-xs uppercase tracking-wider text-slate-500">Plan</div>
-            </div>
-            <div class="flex-1 overflow-auto p-4">
-              <div v-if="selectedStore?.planExplanation" class="mb-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700 whitespace-pre-wrap">
-                {{ selectedStore.planExplanation }}
-              </div>
-
-              <div v-if="Array.isArray(selectedStore?.plan) && selectedStore.plan.length" class="space-y-2">
-                <div
-                  v-for="(step, idx) in selectedStore.plan"
-                  :key="idx"
-                  class="flex items-start gap-3 rounded-lg border border-slate-200 bg-white p-3"
-                >
-                  <span class="mt-1 h-2.5 w-2.5 rounded-full" :class="planDotClass(step.status)" />
-                  <div class="min-w-0 flex-1">
-                    <div class="text-sm text-slate-900 whitespace-pre-wrap">{{ step.step }}</div>
-                  </div>
-                  <div class="shrink-0 text-[10px] uppercase tracking-wider text-slate-500">
-                    {{ step.status }}
-                  </div>
-                </div>
-              </div>
-
-              <div v-else class="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-                No plan yet.
-              </div>
-            </div>
-          </div>
-        </aside>
-	      </main>
+      </main>
 
       </div>
 	
@@ -4188,13 +4670,16 @@ onBeforeUnmount(() => {
 	                <button
 	                  class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 	                  @click="closeNewThreadDialog"
+	                  :disabled="newThreadCreating"
 	                >
 	                  Cancel
 	                </button>
 	                <button
-	                  class="rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
+	                  class="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
 	                  @click="confirmNewThreadDialog"
+	                  :disabled="newThreadCreating"
 	                >
+	                  <Loader2 v-if="newThreadCreating" class="h-4 w-4 animate-spin" />
 	                  Start
 	                </button>
 	              </div>
