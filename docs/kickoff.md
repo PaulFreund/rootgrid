@@ -1,6 +1,6 @@
 # Implementation baseline (v0)
 
-This repo is still in **design / pre-implementation**, but the decisions below are now fixed enough to start scaffolding.
+This document records the **v0 implementation baseline**. The core host/runner/session loop exists, and the decisions below are the baseline it should continue to follow as the implementation hardens.
 
 ---
 

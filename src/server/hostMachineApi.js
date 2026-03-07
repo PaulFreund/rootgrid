@@ -1,0 +1,237 @@
+import crypto from 'node:crypto'
+import { rm } from 'node:fs/promises'
+
+export function createHostMachineApi({
+  auth,
+  store,
+  sse,
+  runnerWs,
+  approvals,
+  ideSessions,
+  makeEnvelope,
+  json,
+  readJsonBody,
+  pickMachineId,
+  fsListOnRunner,
+  codexModelListOnRunner,
+  pendingIdeStarts
+}) {
+  function clearPendingIdeStart(ideId) {
+    pendingIdeStarts.cancel(ideId)
+  }
+
+  return {
+    async handle(req, res, url, parts) {
+      if (url.pathname === '/api/machines' && req.method === 'GET') {
+        if (!auth.requireAuth(req, res)) return true
+        const connectedMachineIds = new Set(runnerWs.listConnectedMachineIds())
+        json(res, 200, {
+          machines: store.listMachines().map((machine) => ({
+            ...machine,
+            connected: connectedMachineIds.has(machine.machineId)
+          }))
+        })
+        return true
+      }
+
+      if (parts[0] === 'api' && parts[1] === 'machines' && parts.length === 3 && parts[2] && req.method === 'DELETE') {
+        if (!auth.requireAuth(req, res)) return true
+        const machineId = parts[2]
+        const machine = store.getMachine(machineId)
+        if (!machine) {
+          json(res, 404, { error: 'not found' })
+          return true
+        }
+
+        if (runnerWs.listConnectedMachineIds().includes(machineId)) {
+          json(res, 409, { error: 'machine is currently connected; disconnect the runner before deleting' })
+          return true
+        }
+
+        let sessionIds = []
+        let uploadPaths = []
+        try { sessionIds = store.listSessionIdsByMachine(machineId) } catch {}
+        try { uploadPaths = store.listUploadHostPathsByMachine(machineId) } catch {}
+
+        for (const [approvalId, route] of approvals.entries()) {
+          if (route?.machineId === machineId) approvals.delete(approvalId)
+        }
+
+        const ideIds = []
+        for (const [ideId, ide] of ideSessions.entries()) {
+          if (ide?.machineId !== machineId) continue
+          ideIds.push(ideId)
+        }
+
+        const ok = store.deleteMachine(machineId)
+        if (!ok) {
+          json(res, 404, { error: 'not found' })
+          return true
+        }
+
+        for (const ideId of ideIds) {
+          ideSessions.delete(ideId)
+          try { store.deleteIdeSession(ideId) } catch {}
+        }
+
+        for (const sessionId of sessionIds) {
+          sse.send(makeEnvelope({
+            type: 'registry.session.delete',
+            scope: { machineId, sessionId },
+            payload: { sessionId }
+          }))
+        }
+        sse.send(makeEnvelope({
+          type: 'registry.machine.delete',
+          scope: { machineId },
+          payload: { machineId }
+        }))
+
+        for (const hostPath of uploadPaths) {
+          if (!hostPath || typeof hostPath !== 'string') continue
+          try { await rm(hostPath, { force: true }) } catch { }
+        }
+
+        json(res, 200, { ok: true, machineId, deletedSessions: sessionIds.length })
+        return true
+      }
+
+      if (parts[0] === 'api' && parts[1] === 'machines' && parts[2] && parts[3] === 'disconnect' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        const machineId = parts[2]
+        if (!runnerWs.listConnectedMachineIds().includes(machineId)) {
+          json(res, 404, { error: 'runner not connected' })
+          return true
+        }
+        const ok = runnerWs.disconnectMachine(machineId)
+        if (!ok) {
+          json(res, 404, { error: 'runner not connected' })
+          return true
+        }
+        json(res, 200, { ok: true })
+        return true
+      }
+
+      if (url.pathname === '/api/fs/list' && req.method === 'GET') {
+        if (!auth.requireAuth(req, res)) return true
+        const machineId = url.searchParams.get('machineId')
+        if (!machineId || typeof machineId !== 'string') {
+          json(res, 400, { error: 'machineId is required' })
+          return true
+        }
+        if (!runnerWs.listConnectedMachineIds().includes(machineId)) {
+          json(res, 503, { error: 'runner not connected' })
+          return true
+        }
+        const path = url.searchParams.get('path') ?? ''
+        try {
+          const out = await fsListOnRunner({ machineId, path })
+          json(res, 200, out)
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          json(res, code, { error: String(err?.message ?? err) })
+        }
+        return true
+      }
+
+      if (url.pathname === '/api/models' && req.method === 'GET') {
+        if (!auth.requireAuth(req, res)) return true
+        const preferredMachineId = url.searchParams.get('machineId')
+        const machineId = pickMachineId(
+          (typeof preferredMachineId === 'string' && preferredMachineId.trim()) ? preferredMachineId.trim() : null
+        )
+        if (!machineId) {
+          json(res, 503, { error: 'no runner connected' })
+          return true
+        }
+
+        const cwd = url.searchParams.get('cwd') ?? ''
+        const limitRaw = url.searchParams.get('limit')
+        const includeHiddenRaw = url.searchParams.get('includeHidden')
+        const limit = (limitRaw === null || limitRaw === undefined) ? 200 : Number(limitRaw)
+        const includeHidden = (includeHiddenRaw === '1' || includeHiddenRaw === 'true')
+
+        try {
+          const out = await codexModelListOnRunner({ machineId, cwd, limit, includeHidden })
+          json(res, 200, { machineId, ...out })
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          json(res, code, { error: String(err?.message ?? err) })
+        }
+        return true
+      }
+
+      if (url.pathname === '/api/ide-sessions' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        const body = await readJsonBody(req)
+        const cwd = body?.cwd
+        const preferredMachineId = body?.machineId ?? null
+        if (!cwd || typeof cwd !== 'string') {
+          json(res, 400, { error: 'cwd is required' })
+          return true
+        }
+
+        const machineId = pickMachineId(preferredMachineId)
+        if (!machineId) {
+          json(res, 503, { error: 'no runner connected' })
+          return true
+        }
+
+        const ideId = crypto.randomUUID()
+        const startedP = pendingIdeStarts.create(ideId, {
+          machineId,
+          timeoutMs: 15_000,
+          onTimeout: () => new Error('timeout starting ide session')
+        })
+
+        const ok = runnerWs.sendToMachine(machineId, makeEnvelope({
+          type: 'ide.start',
+          scope: { machineId },
+          payload: { ideId, cwd }
+        }))
+        if (!ok) {
+          clearPendingIdeStart(ideId)
+          json(res, 503, { error: 'runner not connected' })
+          return true
+        }
+
+        try {
+          await startedP
+        } catch (err) {
+          json(res, 503, { error: String(err?.message ?? err) })
+          return true
+        }
+
+        json(res, 200, { ideId, urlPath: `/vscode/${ideId}/` })
+        return true
+      }
+
+      if (parts[0] === 'api' && parts[1] === 'ide-sessions' && parts[2] && parts[3] === 'stop' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        const ideId = parts[2]
+        const ide = ideSessions.get(ideId)
+        if (!ide) {
+          json(res, 404, { error: 'not found' })
+          return true
+        }
+
+        const ok = runnerWs.sendToMachine(ide.machineId, makeEnvelope({
+          type: 'ide.stop',
+          scope: { machineId: ide.machineId },
+          payload: { ideId }
+        }))
+        if (!ok) {
+          json(res, 503, { error: 'runner not connected' })
+          return true
+        }
+
+        ideSessions.delete(ideId)
+        try { store.deleteIdeSession(ideId) } catch {}
+        json(res, 200, { ok: true })
+        return true
+      }
+
+      return false
+    }
+  }
+}

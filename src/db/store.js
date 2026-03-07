@@ -4,6 +4,58 @@ import { dirname } from 'node:path'
 import crypto from 'node:crypto'
 
 import { CREATE_SCHEMA_SQL, SCHEMA_VERSION } from './schema.js'
+import {
+  machineRowToRecord,
+  sessionRowToRecord
+} from './storeRows.js'
+import {
+  listSessionsPage as listSessionsPageQuery
+} from './storeSessionLists.js'
+import {
+  getTurnReasoningSections as getTurnReasoningSectionsQuery,
+  getTurnReasoningText as getTurnReasoningTextQuery,
+  getTurnSeqRange as getTurnSeqRangeQuery,
+  listItemOutputEvents as listItemOutputEventsQuery,
+  listSessionEvents as listSessionEventsQuery,
+  listSessionEventsAfter as listSessionEventsAfterQuery,
+  listSessionEventsPage as listSessionEventsPageQuery
+} from './storeEvents.js'
+import {
+  buildCreateSessionRow,
+  buildDerivedSessionEventUpdate,
+  buildUpdateSessionStatement,
+  normalizeStoredEventPayload
+} from './storeSessionWrites.js'
+import {
+  archiveSession as archiveSessionRow,
+  deleteSession as deleteSessionRow,
+  markSessionRead as markSessionReadRow,
+  setSessionProjectLabel as setSessionProjectLabelRow,
+  setSessionTitle as setSessionTitleRow,
+  unarchiveSession as unarchiveSessionRow
+} from './storeSessionMeta.js'
+import {
+  listSessionIdsByMachine as listSessionIdsByMachineQuery,
+  listUploadHostPathsByMachine as listUploadHostPathsByMachineQuery,
+  pruneOldData as pruneOldDataQuery
+} from './storeMaintenance.js'
+import {
+  deleteApproval as deleteApprovalRow,
+  deleteIdeSession as deleteIdeSessionRow,
+  deletePushSubscription as deletePushSubscriptionRow,
+  deleteUpload as deleteUploadRow,
+  getApproval as getApprovalRow,
+  getIdeSession as getIdeSessionRow,
+  getUpload as getUploadRow,
+  listApprovals as listApprovalsRows,
+  listIdeSessions as listIdeSessionsRows,
+  listPushSubscriptions as listPushSubscriptionsRows,
+  listSessionUploads as listSessionUploadsRows,
+  upsertApproval as upsertApprovalRow,
+  upsertIdeSession as upsertIdeSessionRow,
+  upsertPushSubscription as upsertPushSubscriptionRow,
+  upsertUpload as upsertUploadRow
+} from './storeSideTables.js'
 
 export class Store {
   /**
@@ -204,6 +256,18 @@ export class Store {
         continue
       }
 
+      if (v === 7) {
+        // v7 -> v8: add indexes for hot list queries.
+        this.db.exec(`
+          CREATE INDEX IF NOT EXISTS sessions_by_archived_updated ON sessions(archived_ms, updated_ms DESC);
+          CREATE INDEX IF NOT EXISTS approvals_by_created ON approvals(created_ms);
+        `)
+
+        v = 8
+        this.db.exec(`PRAGMA user_version = ${v}`)
+        continue
+      }
+
       throw new Error(`No migration available: ${v} -> ${v + 1}`)
     }
   }
@@ -233,13 +297,7 @@ export class Store {
       FROM machines
       ORDER BY machine_name ASC
     `).all()
-    return rows.map((r) => ({
-      machineId: r.machine_id,
-      machineName: r.machine_name,
-      platform: r.platform,
-      lastSeenMs: r.last_seen_ms,
-      capabilities: r.capabilities_json ? JSON.parse(r.capabilities_json) : null
-    }))
+    return rows.map(machineRowToRecord)
   }
 
   /**
@@ -251,14 +309,7 @@ export class Store {
       FROM machines
       WHERE machine_id=?
     `).get(machineId)
-    if (!row) return null
-    return {
-      machineId: row.machine_id,
-      machineName: row.machine_name,
-      platform: row.platform,
-      lastSeenMs: row.last_seen_ms,
-      capabilities: row.capabilities_json ? JSON.parse(row.capabilities_json) : null
-    }
+    return machineRowToRecord(row)
   }
 
   /**
@@ -282,14 +333,6 @@ export class Store {
    */
   createSession({ sessionId, machineId, cwd, status, codexThreadId = null, options = null }) {
     const now = Date.now()
-    const model = (typeof options?.model === 'string' && options.model.trim()) ? options.model.trim() : null
-    const reasoningEffort = (typeof options?.reasoningEffort === 'string' && options.reasoningEffort.trim())
-      ? options.reasoningEffort.trim()
-      : null
-    const approvalPolicy = (typeof options?.approvalPolicy === 'string' && options.approvalPolicy.trim())
-      ? options.approvalPolicy.trim()
-      : null
-    const sandboxMode = (typeof options?.sandbox === 'string' && options.sandbox.trim()) ? options.sandbox.trim() : null
     this.db.prepare(`
       INSERT INTO sessions(
         session_id,
@@ -313,7 +356,15 @@ export class Store {
         archived_ms
       )
       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(sessionId, machineId, cwd, null, null, null, status, 'idle', 0, 0, 0, now, now, codexThreadId, model, reasoningEffort, approvalPolicy, sandboxMode, null)
+    `).run(...buildCreateSessionRow({
+      sessionId,
+      machineId,
+      cwd,
+      status,
+      codexThreadId,
+      options,
+      now
+    }))
   }
 
   /**
@@ -349,25 +400,21 @@ export class Store {
     sandbox
   }) {
     const now = Date.now()
-
-    const sets = []
-    const params = []
-
-    if (status !== undefined) { sets.push('status=?'); params.push(status) }
-    if (codexThreadId !== undefined) { sets.push('codex_thread_id=?'); params.push(codexThreadId) }
-    if (projectLabel !== undefined) { sets.push('project_label=?'); params.push(projectLabel) }
-    if (title !== undefined) { sets.push('title=?'); params.push(title) }
-    if (preview !== undefined) { sets.push('preview=?'); params.push(preview) }
-    if (turnState !== undefined) { sets.push('turn_state=?'); params.push(turnState) }
-    if (pendingApprovals !== undefined) { sets.push('pending_approvals=?'); params.push(pendingApprovals) }
-    if (lastReadSeq !== undefined) { sets.push('last_read_seq=?'); params.push(lastReadSeq) }
-    if (model !== undefined) { sets.push('model=?'); params.push(model) }
-    if (reasoningEffort !== undefined) { sets.push('reasoning_effort=?'); params.push(reasoningEffort) }
-    if (approvalPolicy !== undefined) { sets.push('approval_policy=?'); params.push(approvalPolicy) }
-    if (sandbox !== undefined) { sets.push('sandbox_mode=?'); params.push(sandbox) }
-
-    sets.push('updated_ms=?')
-    params.push(now)
+    const { sets, params } = buildUpdateSessionStatement({
+      status,
+      codexThreadId,
+      projectLabel,
+      title,
+      preview,
+      turnState,
+      pendingApprovals,
+      lastReadSeq,
+      model,
+      reasoningEffort,
+      approvalPolicy,
+      sandbox,
+      now
+    })
     params.push(sessionId)
 
     const stmt = this.db.prepare(`UPDATE sessions SET ${sets.join(', ')} WHERE session_id=?`)
@@ -403,96 +450,40 @@ export class Store {
       FROM sessions
       WHERE session_id=?
     `).get(sessionId)
-    if (!row) return null
-    return {
-      sessionId: row.session_id,
-      machineId: row.machine_id,
-      cwd: row.cwd,
-      projectLabel: row.project_label ?? null,
-      title: row.title ?? null,
-      preview: row.preview ?? null,
-      status: row.status,
-      turnState: row.turn_state,
-      pendingApprovals: row.pending_approvals,
-      lastSeq: row.last_seq,
-      lastReadSeq: row.last_read_seq,
-      createdMs: row.created_ms,
-      updatedMs: row.updated_ms,
-      codexThreadId: row.codex_thread_id ?? null,
-      model: row.model ?? null,
-      reasoningEffort: row.reasoning_effort ?? null,
-      approvalPolicy: row.approval_policy ?? null,
-      sandbox: row.sandbox_mode ?? null,
-      archivedMs: row.archived_ms ?? null
-    }
+    return sessionRowToRecord(row)
   }
 
   /**
    * @param {{ archived?: boolean|null }} [opts]
    */
   listSessions({ archived = false } = {}) {
-    const clauses = []
-    if (archived === true) clauses.push('archived_ms IS NOT NULL')
-    else if (archived === false) clauses.push('archived_ms IS NULL')
-    const rows = this.db.prepare(`
-      SELECT
-        session_id,
-        machine_id,
-        cwd,
-        project_label,
-        title,
-        preview,
-        status,
-        turn_state,
-        pending_approvals,
-        last_seq,
-        last_read_seq,
-        created_ms,
-        updated_ms,
-        codex_thread_id,
-        model,
-        reasoning_effort,
-        approval_policy,
-        sandbox_mode,
-        archived_ms
-      FROM sessions
-      ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
-      ORDER BY updated_ms DESC
-      LIMIT 200
-    `).all()
-    return rows.map((row) => ({
-      sessionId: row.session_id,
-      machineId: row.machine_id,
-      cwd: row.cwd,
-      projectLabel: row.project_label ?? null,
-      title: row.title ?? null,
-      preview: row.preview ?? null,
-      status: row.status,
-      turnState: row.turn_state,
-      pendingApprovals: row.pending_approvals,
-      lastSeq: row.last_seq,
-      lastReadSeq: row.last_read_seq,
-      createdMs: row.created_ms,
-      updatedMs: row.updated_ms,
-      codexThreadId: row.codex_thread_id ?? null,
-      model: row.model ?? null,
-      reasoningEffort: row.reasoning_effort ?? null,
-      approvalPolicy: row.approval_policy ?? null,
-      sandbox: row.sandbox_mode ?? null,
-      archivedMs: row.archived_ms ?? null
-    }))
+    return this.listSessionsPage({ archived, limit: 200 }).sessions
+  }
+
+  /**
+   * Cursor-paginated session listing for large registries.
+   *
+   * @param {{
+   *   archived?: boolean|null,
+   *   beforeUpdatedMs?: number|null,
+   *   beforeSessionId?: string|null,
+   *   limit?: number
+   * }} [opts]
+   */
+  listSessionsPage({ archived = false, beforeUpdatedMs = null, beforeSessionId = null, limit = 200 } = {}) {
+    return listSessionsPageQuery(this.db, {
+      archived,
+      beforeUpdatedMs,
+      beforeSessionId,
+      limit
+    })
   }
 
   /**
    * @param {string} machineId
    */
   listSessionIdsByMachine(machineId) {
-    const rows = this.db.prepare(`
-      SELECT session_id
-      FROM sessions
-      WHERE machine_id=?
-    `).all(machineId)
-    return rows.map((r) => r.session_id)
+    return listSessionIdsByMachineQuery(this.db, machineId)
   }
 
   /**
@@ -502,13 +493,7 @@ export class Store {
    * @param {string} machineId
    */
   listUploadHostPathsByMachine(machineId) {
-    const rows = this.db.prepare(`
-      SELECT u.host_path AS host_path
-      FROM uploads u
-      JOIN sessions s ON s.session_id = u.session_id
-      WHERE s.machine_id=?
-    `).all(machineId)
-    return rows.map((r) => r.host_path)
+    return listUploadHostPathsByMachineQuery(this.db, machineId)
   }
 
   /**
@@ -526,93 +511,22 @@ export class Store {
     const srow = this.db.prepare(`SELECT last_seq FROM sessions WHERE session_id=?`).get(sessionId)
     const lastSeq = srow ? (Number(srow.last_seq) || 0) : 0
     const seq = lastSeq + 1
-
-    // Ensure `session.output.payload.seq` is monotonic/durable (host-controlled),
-    // even if the runner restarts and its local seq counter resets.
-    let payloadToStore = payload ?? null
-    if (type === 'session.output' && payloadToStore && typeof payloadToStore === 'object') {
-      const p = { ...payloadToStore }
-      if (p.seq !== undefined && p.seq !== null && p.seq !== seq) {
-        // Preserve runner-provided ordering info for debugging.
-        p.runnerSeq = p.seq
-      }
-      p.seq = seq
-      payloadToStore = p
-    }
-
-    const payloadJson = JSON.stringify(payloadToStore)
-    const stream = (type === 'session.output' && typeof payloadToStore?.stream === 'string') ? payloadToStore.stream : null
-    const itemId = (typeof payloadToStore?.itemId === 'string' && payloadToStore.itemId) ? payloadToStore.itemId : null
+    const stored = normalizeStoredEventPayload({ type, payload, seq })
 
     const insertRes = this.db.prepare(`
       INSERT OR IGNORE INTO events(event_id, session_id, seq, ts_ms, type, stream, item_id, payload_json)
       VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(eventId, sessionId, seq, tsMs, type, stream, itemId, payloadJson)
+    `).run(eventId, sessionId, seq, tsMs, type, stored.stream, stored.itemId, stored.payloadJson)
 
     // Duplicate event (same event_id). Don't double-apply derived state or bump updated_ms.
     if (insertRes.changes === 0) return null
 
-    // Update derived session metadata used by the UI session list.
-    const sets = ['updated_ms=?', 'last_seq=?']
-    const params = [tsMs, seq]
-
-    const textSnippet = (input) => {
-      const t = String(input ?? '').replace(/\s+/g, ' ').trim()
-      if (!t) return null
-      return t.length > 160 ? `${t.slice(0, 157)}…` : t
-    }
-
-    if (type === 'session.input') {
-      const text = textSnippet(payload?.text)
-      if (text) {
-        sets.push('preview=?')
-        params.push(text)
-      }
-      if (payload?.isInitial && text) {
-        sets.push(`title = CASE WHEN title IS NULL OR title='' THEN ? ELSE title END`)
-        params.push(text)
-      }
-    }
-
-    if (type === 'turn.started') {
-      sets.push('turn_state=?')
-      params.push('running')
-    }
-
-    if (type === 'turn.completed') {
-      sets.push('turn_state=?')
-      params.push('idle')
-      const preview = textSnippet(payload?.preview)
-      if (preview) {
-        sets.push('preview=?')
-        params.push(preview)
-      }
-    }
-
-    if (type === 'approval.request') {
-      sets.push('pending_approvals = pending_approvals + 1')
-    }
-
-    if (type === 'approval.resolved') {
-      sets.push('pending_approvals = MAX(pending_approvals - 1, 0)')
-    }
-
-    if (type === 'session.status') {
-      const status = payload?.status
-      if (status && typeof status === 'string') {
-        sets.push('status=?')
-        params.push(status)
-        if (status === 'stopping' || status === 'exited' || status === 'failed') {
-          sets.push('turn_state=?')
-          params.push('idle')
-        }
-      }
-      const threadId = payload?.codexThreadId
-      if (threadId && typeof threadId === 'string') {
-        sets.push('codex_thread_id=?')
-        params.push(threadId)
-      }
-    }
+    const { sets, params } = buildDerivedSessionEventUpdate({
+      type,
+      payload: stored.payload,
+      tsMs,
+      seq
+    })
 
     try {
       this.db.prepare(`UPDATE sessions SET ${sets.join(', ')} WHERE session_id=?`).run(...params, sessionId)
@@ -624,16 +538,140 @@ export class Store {
   }
 
   /**
+   * Persist multiple events in a single transaction.
+   * Intended for hot runner output bursts.
+   *
+   * @param {Array<{
+   *   eventId?: string,
+   *   sessionId: string,
+   *   tsMs: number,
+   *   type: string,
+   *   payload: any
+   * }>} events
+   */
+  appendEventsBatch(events) {
+    const list = Array.isArray(events) ? events : []
+    if (!list.length) return []
+
+    const selectSessionStmt = this.db.prepare(`SELECT last_seq FROM sessions WHERE session_id=?`)
+    const insertStmt = this.db.prepare(`
+      INSERT OR IGNORE INTO events(event_id, session_id, seq, ts_ms, type, stream, item_id, payload_json)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    const updateOutputSessionStmt = this.db.prepare(`
+      UPDATE sessions
+      SET updated_ms=?, last_seq=?
+      WHERE session_id=?
+    `)
+    const updateStmtCache = new Map()
+    const results = new Array(list.length)
+
+    const getUpdateStmt = (sets) => {
+      const sql = `UPDATE sessions SET ${sets.join(', ')} WHERE session_id=?`
+      let stmt = updateStmtCache.get(sql)
+      if (!stmt) {
+        stmt = this.db.prepare(sql)
+        updateStmtCache.set(sql, stmt)
+      }
+      return stmt
+    }
+
+    const lastSeqBySession = new Map()
+    const pendingOutputBySession = new Map()
+
+    const flushPendingOutput = (sessionId) => {
+      const pending = pendingOutputBySession.get(sessionId)
+      if (!pending) return
+      updateOutputSessionStmt.run(pending.tsMs, pending.seq, sessionId)
+      pendingOutputBySession.delete(sessionId)
+    }
+
+    this.db.exec('BEGIN')
+    try {
+      for (let i = 0; i < list.length; i++) {
+        const input = list[i] ?? {}
+        const sid = String(input.sessionId ?? '').trim()
+        if (!sid) {
+          results[i] = { inserted: false, seq: null, payload: input.payload ?? null }
+          continue
+        }
+
+        let lastSeq = lastSeqBySession.get(sid)
+        if (lastSeq === undefined) {
+          const srow = selectSessionStmt.get(sid)
+          if (!srow) {
+            results[i] = { inserted: false, seq: null, payload: input.payload ?? null }
+            continue
+          }
+          lastSeq = Number(srow.last_seq) || 0
+          lastSeqBySession.set(sid, lastSeq)
+        }
+
+        const seq = Number(lastSeq) + 1
+        const stored = normalizeStoredEventPayload({
+          type: input.type,
+          payload: input.payload,
+          seq
+        })
+
+        const insertRes = insertStmt.run(
+          input.eventId ?? crypto.randomUUID(),
+          sid,
+          seq,
+          input.tsMs,
+          input.type,
+          stored.stream,
+          stored.itemId,
+          stored.payloadJson
+        )
+
+        if (insertRes.changes === 0) {
+          results[i] = { inserted: false, seq: null, payload: stored.payload }
+          continue
+        }
+
+        lastSeqBySession.set(sid, seq)
+        if (input.type === 'session.output') {
+          pendingOutputBySession.set(sid, {
+            seq,
+            tsMs: input.tsMs
+          })
+        } else {
+          flushPendingOutput(sid)
+          const { sets, params } = buildDerivedSessionEventUpdate({
+            type: input.type,
+            payload: stored.payload,
+            tsMs: input.tsMs,
+            seq
+          })
+          getUpdateStmt(sets).run(...params, sid)
+        }
+
+        results[i] = {
+          inserted: true,
+          seq,
+          payload: stored.payload
+        }
+      }
+
+      for (const sessionId of pendingOutputBySession.keys()) {
+        flushPendingOutput(sessionId)
+      }
+
+      this.db.exec('COMMIT')
+      return results
+    } catch (err) {
+      try { this.db.exec('ROLLBACK') } catch { }
+      throw err
+    }
+  }
+
+  /**
    * Mark session as "read" by advancing last_read_seq to last_seq.
    * @param {string} sessionId
    */
   markSessionRead(sessionId) {
-    const res = this.db.prepare(`
-      UPDATE sessions
-      SET last_read_seq=last_seq
-      WHERE session_id=?
-    `).run(sessionId)
-    return res.changes > 0
+    return markSessionReadRow(this.db, sessionId)
   }
 
   /**
@@ -642,12 +680,7 @@ export class Store {
    * @param {string|null} projectLabel
    */
   setSessionProjectLabel(sessionId, projectLabel) {
-    const res = this.db.prepare(`
-      UPDATE sessions
-      SET project_label=?
-      WHERE session_id=?
-    `).run(projectLabel, sessionId)
-    return res.changes > 0
+    return setSessionProjectLabelRow(this.db, sessionId, projectLabel)
   }
 
   /**
@@ -656,12 +689,7 @@ export class Store {
    * @param {string|null} title
    */
   setSessionTitle(sessionId, title) {
-    const res = this.db.prepare(`
-      UPDATE sessions
-      SET title=?
-      WHERE session_id=?
-    `).run(title, sessionId)
-    return res.changes > 0
+    return setSessionTitleRow(this.db, sessionId, title)
   }
 
   /**
@@ -670,13 +698,7 @@ export class Store {
    * @param {string} sessionId
    */
   archiveSession(sessionId) {
-    const now = Date.now()
-    const res = this.db.prepare(`
-      UPDATE sessions
-      SET archived_ms=?
-      WHERE session_id=?
-    `).run(now, sessionId)
-    return res.changes > 0
+    return archiveSessionRow(this.db, sessionId)
   }
 
   /**
@@ -685,12 +707,7 @@ export class Store {
    * @param {string} sessionId
    */
   unarchiveSession(sessionId) {
-    const res = this.db.prepare(`
-      UPDATE sessions
-      SET archived_ms=NULL
-      WHERE session_id=?
-    `).run(sessionId)
-    return res.changes > 0
+    return unarchiveSessionRow(this.db, sessionId)
   }
 
   /**
@@ -698,8 +715,7 @@ export class Store {
    * @param {string} sessionId
    */
   deleteSession(sessionId) {
-    const res = this.db.prepare(`DELETE FROM sessions WHERE session_id=?`).run(sessionId)
-    return res.changes > 0
+    return deleteSessionRow(this.db, sessionId)
   }
 
   /**
@@ -707,22 +723,7 @@ export class Store {
    * @param {{ limit?: number }} [opts]
    */
   listSessionEvents(sessionId, { limit = 500 } = {}) {
-    const rows = this.db.prepare(`
-      SELECT event_id, seq, ts_ms, type, payload_json
-      FROM events
-      WHERE session_id=?
-      ORDER BY seq DESC
-      LIMIT ?
-    `).all(sessionId, limit)
-
-    // Return oldest-first for easier playback.
-    return rows.reverse().map((row) => ({
-      eventId: row.event_id,
-      seq: row.seq,
-      tsMs: row.ts_ms,
-      type: row.type,
-      payload: JSON.parse(row.payload_json)
-    }))
+    return listSessionEventsQuery(this.db, sessionId, { limit })
   }
 
   /**
@@ -736,57 +737,21 @@ export class Store {
    * }} [opts]
    */
   listSessionEventsPage(sessionId, { beforeSeq = null, limit = 200, mode = 'summary' } = {}) {
-    const lim = Math.max(1, Math.min(2000, Number(limit) || 200))
-    const params = [sessionId]
-    const clauses = ['session_id=?']
+    return listSessionEventsPageQuery(this.db, sessionId, { beforeSeq, limit, mode })
+  }
 
-    if (Number.isFinite(Number(beforeSeq)) && Number(beforeSeq) > 0) {
-      clauses.push('seq < ?')
-      params.push(Number(beforeSeq))
-    }
-
-    if (mode === 'summary') {
-      // "Big events" view: keep assistant text (normalized), but drop verbose
-      // streams like reasoning + tool stdout/stderr (unless un-attributed).
-      // We still keep un-attributed stderr/stdout (item_id IS NULL) since it's
-      // often important for users to see.
-      clauses.push(`(type != 'session.output' OR stream IN ('normalized') OR ((stream = 'stderr' OR stream = 'stdout') AND item_id IS NULL))`)
-    }
-
-    const rows = this.db.prepare(`
-      SELECT event_id, seq, ts_ms, type, payload_json
-      FROM events
-      WHERE ${clauses.join(' AND ')}
-      ORDER BY seq DESC
-      LIMIT ?
-    `).all(...params, lim)
-
-    const events = rows.reverse().map((row) => ({
-      eventId: row.event_id,
-      seq: row.seq,
-      tsMs: row.ts_ms,
-      type: row.type,
-      payload: JSON.parse(row.payload_json)
-    }))
-
-    const oldestSeq = events.length ? Number(events[0].seq) : null
-    let hasMoreBefore = false
-    if (oldestSeq) {
-      const params2 = [sessionId, oldestSeq]
-      const clauses2 = ['session_id=?', 'seq < ?']
-      if (mode === 'summary') {
-        clauses2.push(`(type != 'session.output' OR stream IN ('normalized') OR ((stream = 'stderr' OR stream = 'stdout') AND item_id IS NULL))`)
-      }
-      const row = this.db.prepare(`
-        SELECT 1 AS ok
-        FROM events
-        WHERE ${clauses2.join(' AND ')}
-        LIMIT 1
-      `).get(...params2)
-      hasMoreBefore = Boolean(row?.ok)
-    }
-
-    return { events, hasMoreBefore, oldestSeq }
+  /**
+   * Forward-paginated event listing for reconnect/backfill flows.
+   *
+   * @param {string} sessionId
+   * @param {{
+   *   afterSeq?: number|null,
+   *   limit?: number,
+   *   mode?: 'summary'|'full'
+   * }} [opts]
+   */
+  listSessionEventsAfter(sessionId, { afterSeq = null, limit = 200, mode = 'summary' } = {}) {
+    return listSessionEventsAfterQuery(this.db, sessionId, { afterSeq, limit, mode })
   }
 
   /**
@@ -797,44 +762,7 @@ export class Store {
    * @param {{ beforeSeq?: number|null, limit?: number }} [opts]
    */
   listItemOutputEvents(sessionId, itemId, { beforeSeq = null, limit = 500 } = {}) {
-    const lim = Math.max(1, Math.min(5000, Number(limit) || 500))
-    const params = [sessionId, itemId]
-    const clauses = [`session_id=?`, `type='session.output'`, `item_id=?`]
-
-    if (Number.isFinite(Number(beforeSeq)) && Number(beforeSeq) > 0) {
-      clauses.push('seq < ?')
-      params.push(Number(beforeSeq))
-    }
-
-    const rows = this.db.prepare(`
-      SELECT event_id, seq, ts_ms, type, payload_json
-      FROM events
-      WHERE ${clauses.join(' AND ')}
-      ORDER BY seq DESC
-      LIMIT ?
-    `).all(...params, lim)
-
-    const events = rows.reverse().map((row) => ({
-      eventId: row.event_id,
-      seq: row.seq,
-      tsMs: row.ts_ms,
-      type: row.type,
-      payload: JSON.parse(row.payload_json)
-    }))
-
-    const oldestSeq = events.length ? Number(events[0].seq) : null
-    let hasMoreBefore = false
-    if (oldestSeq) {
-      const row = this.db.prepare(`
-        SELECT 1 AS ok
-        FROM events
-        WHERE session_id=? AND type='session.output' AND item_id=? AND seq < ?
-        LIMIT 1
-      `).get(sessionId, itemId, oldestSeq)
-      hasMoreBefore = Boolean(row?.ok)
-    }
-
-    return { events, hasMoreBefore, oldestSeq }
+    return listItemOutputEventsQuery(this.db, sessionId, itemId, { beforeSeq, limit })
   }
 
   /**
@@ -846,30 +774,7 @@ export class Store {
    * @returns {{ startSeq: number, endSeq: number|null }|null}
    */
   getTurnSeqRange(sessionId, turnId) {
-    const tid = String(turnId ?? '').trim()
-    if (!tid) return null
-
-    const started = this.db.prepare(`
-      SELECT seq
-      FROM events
-      WHERE session_id=? AND type='turn.started' AND json_extract(payload_json, '$.turnId')=?
-      ORDER BY seq ASC
-      LIMIT 1
-    `).get(sessionId, tid)
-    if (!started) return null
-    const startSeq = Number(started.seq) || 0
-    if (!startSeq) return null
-
-    const completed = this.db.prepare(`
-      SELECT seq
-      FROM events
-      WHERE session_id=? AND type='turn.completed' AND json_extract(payload_json, '$.turnId')=?
-      ORDER BY seq DESC
-      LIMIT 1
-    `).get(sessionId, tid)
-    const endSeq = completed ? (Number(completed.seq) || null) : null
-
-    return { startSeq, endSeq }
+    return getTurnSeqRangeQuery(this.db, sessionId, turnId)
   }
 
   /**
@@ -880,55 +785,13 @@ export class Store {
    * @param {{ maxChars?: number }} [opts]
    */
   getTurnReasoningText(sessionId, turnId, { maxChars = 400_000 } = {}) {
-    const range = this.getTurnSeqRange(sessionId, turnId)
-    if (!range) return null
-
     const session = this.getSession(sessionId)
-    const endSeq = range.endSeq ?? (session ? Number(session.lastSeq) || null : null)
-    if (!endSeq) return { turnId, startSeq: range.startSeq, endSeq: null, text: '', truncated: false }
-
-    const rows = this.db.prepare(`
-      SELECT payload_json
-      FROM events
-      WHERE session_id=? AND type='session.output' AND stream='reasoning' AND seq >= ? AND seq <= ?
-      ORDER BY seq ASC
-    `).all(sessionId, range.startSeq, endSeq)
-
-    const cap = Math.max(1_000, Math.min(5_000_000, Number(maxChars) || 400_000))
-    let text = ''
-    let truncated = false
-
-    let lastChunk = null
-    for (const row of rows) {
-      let chunk = ''
-      try {
-        chunk = String(JSON.parse(row.payload_json)?.text ?? '')
-      } catch {
-        chunk = ''
-      }
-      if (!chunk) continue
-
-      // Codex can emit duplicate deltas (often consecutive). Drop the simplest
-      // case to reduce client-side parsing/rendering noise.
-      if (chunk === lastChunk) continue
-      lastChunk = chunk
-
-      if (text.length + chunk.length > cap) {
-        const remaining = cap - text.length
-        if (remaining > 0) text += chunk.slice(0, remaining)
-        truncated = true
-        break
-      }
-      text += chunk
-    }
-
-    return {
-      turnId: String(turnId),
-      startSeq: range.startSeq,
-      endSeq,
-      text,
-      truncated
-    }
+    return getTurnReasoningTextQuery(this.db, {
+      sessionId,
+      turnId,
+      lastSeq: session ? Number(session.lastSeq) || null : null,
+      maxChars
+    })
   }
 
   /**
@@ -940,91 +803,13 @@ export class Store {
    * @param {{ maxChars?: number }} [opts]
    */
   getTurnReasoningSections(sessionId, turnId, { maxChars = 400_000 } = {}) {
-    const range = this.getTurnSeqRange(sessionId, turnId)
-    if (!range) return null
-
     const session = this.getSession(sessionId)
-    const endSeq = range.endSeq ?? (session ? Number(session.lastSeq) || null : null)
-    if (!endSeq) {
-      return { turnId: String(turnId), startSeq: range.startSeq, endSeq: null, truncated: false, sections: [] }
-    }
-
-    const rows = this.db.prepare(`
-      SELECT seq, ts_ms, payload_json
-      FROM events
-      WHERE session_id=? AND type='session.output' AND stream='reasoning' AND seq >= ? AND seq <= ?
-      ORDER BY seq ASC
-    `).all(sessionId, range.startSeq, endSeq)
-
-    const cap = Math.max(1_000, Math.min(5_000_000, Number(maxChars) || 400_000))
-    let text = ''
-    let truncated = false
-
-    /** @type {{ start: number, end: number, seq: number|null, tsMs: number|null }[]} */
-    const segments = []
-
-    let lastChunk = null
-    for (const row of rows) {
-      let chunk = ''
-      try {
-        chunk = String(JSON.parse(row.payload_json)?.text ?? '')
-      } catch {
-        chunk = ''
-      }
-      if (!chunk) continue
-
-      // Drop the simplest consecutive-duplicate case to reduce parsing noise.
-      if (chunk === lastChunk) continue
-      lastChunk = chunk
-
-      const start = text.length
-      if (text.length + chunk.length > cap) {
-        const remaining = cap - text.length
-        if (remaining > 0) chunk = chunk.slice(0, remaining)
-        else chunk = ''
-        truncated = true
-      }
-
-      if (!chunk) break
-      text += chunk
-      const end = text.length
-
-      segments.push({
-        start,
-        end,
-        seq: Number.isFinite(Number(row.seq)) ? Number(row.seq) : null,
-        tsMs: Number.isFinite(Number(row.ts_ms)) ? Number(row.ts_ms) : null
-      })
-
-      if (truncated) break
-    }
-
-    const parsed = parseReasoningSectionsWithStart(text)
-
-    let segIdx = 0
-    const sections = parsed.map((s, idx) => {
-      const startIndex = Number(s.startIndex) || 0
-      while (segIdx < segments.length && startIndex >= segments[segIdx].end) segIdx += 1
-      const seg = segments[segIdx] ?? null
-      const inside = seg && startIndex >= seg.start && startIndex < seg.end
-      const startSeq = inside && Number.isFinite(Number(seg.seq)) ? Number(seg.seq) : range.startSeq
-      const tsMs = inside && Number.isFinite(Number(seg.tsMs)) ? Number(seg.tsMs) : null
-      return {
-        id: `r-${idx + 1}`,
-        title: s.title,
-        body: s.body,
-        startSeq,
-        ...(tsMs ? { tsMs } : {})
-      }
+    return getTurnReasoningSectionsQuery(this.db, {
+      sessionId,
+      turnId,
+      lastSeq: session ? Number(session.lastSeq) || null : null,
+      maxChars
     })
-
-    return {
-      turnId: String(turnId),
-      startSeq: range.startSeq,
-      endSeq,
-      truncated,
-      sections
-    }
   }
 
   /**
@@ -1040,61 +825,25 @@ export class Store {
    * }} input
    */
   upsertApproval({ approvalId, machineId, sessionId, kind, payload, createdMs = Date.now() }) {
-    const payloadJson = JSON.stringify(payload ?? null)
-    this.db.prepare(`
-      INSERT INTO approvals(approval_id, machine_id, session_id, kind, payload_json, created_ms)
-      VALUES(?, ?, ?, ?, ?, ?)
-      ON CONFLICT(approval_id) DO UPDATE SET
-        machine_id=excluded.machine_id,
-        session_id=excluded.session_id,
-        kind=excluded.kind,
-        payload_json=excluded.payload_json
-    `).run(approvalId, machineId, sessionId, kind, payloadJson, createdMs)
+    upsertApprovalRow(this.db, { approvalId, machineId, sessionId, kind, payload, createdMs })
   }
 
   /**
    * @param {string} approvalId
    */
   getApproval(approvalId) {
-    const row = this.db.prepare(`
-      SELECT approval_id, machine_id, session_id, kind, payload_json, created_ms
-      FROM approvals
-      WHERE approval_id=?
-    `).get(approvalId)
-    if (!row) return null
-    return {
-      approvalId: row.approval_id,
-      machineId: row.machine_id,
-      sessionId: row.session_id,
-      kind: row.kind,
-      payload: JSON.parse(row.payload_json),
-      createdMs: row.created_ms
-    }
+    return getApprovalRow(this.db, approvalId)
   }
 
   listApprovals() {
-    const rows = this.db.prepare(`
-      SELECT approval_id, machine_id, session_id, kind, payload_json, created_ms
-      FROM approvals
-      ORDER BY created_ms ASC
-      LIMIT 500
-    `).all()
-    return rows.map((row) => ({
-      approvalId: row.approval_id,
-      machineId: row.machine_id,
-      sessionId: row.session_id,
-      kind: row.kind,
-      payload: JSON.parse(row.payload_json),
-      createdMs: row.created_ms
-    }))
+    return listApprovalsRows(this.db)
   }
 
   /**
    * @param {string} approvalId
    */
   deleteApproval(approvalId) {
-    const res = this.db.prepare(`DELETE FROM approvals WHERE approval_id=?`).run(approvalId)
-    return res.changes > 0
+    return deleteApprovalRow(this.db, approvalId)
   }
 
   /**
@@ -1108,147 +857,50 @@ export class Store {
    * }} input
    */
   upsertIdeSession({ ideId, machineId, cwd, port, basePath = null, createdMs = Date.now() }) {
-    const now = Date.now()
-    this.db.prepare(`
-      INSERT INTO ide_sessions(ide_id, machine_id, cwd, port, base_path, created_ms, updated_ms)
-      VALUES(?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(ide_id) DO UPDATE SET
-        machine_id=excluded.machine_id,
-        cwd=excluded.cwd,
-        port=excluded.port,
-        base_path=excluded.base_path,
-        updated_ms=excluded.updated_ms
-    `).run(ideId, machineId, cwd, port, basePath, createdMs, now)
+    upsertIdeSessionRow(this.db, { ideId, machineId, cwd, port, basePath, createdMs })
   }
 
   /**
    * @param {string} ideId
    */
   getIdeSession(ideId) {
-    const row = this.db.prepare(`
-      SELECT ide_id, machine_id, cwd, port, base_path, created_ms, updated_ms
-      FROM ide_sessions
-      WHERE ide_id=?
-    `).get(ideId)
-    if (!row) return null
-    return {
-      ideId: row.ide_id,
-      machineId: row.machine_id,
-      cwd: row.cwd,
-      port: row.port,
-      basePath: row.base_path ?? null,
-      createdMs: row.created_ms,
-      updatedMs: row.updated_ms
-    }
+    return getIdeSessionRow(this.db, ideId)
   }
 
   listIdeSessions() {
-    const rows = this.db.prepare(`
-      SELECT ide_id, machine_id, cwd, port, base_path, created_ms, updated_ms
-      FROM ide_sessions
-      ORDER BY updated_ms DESC
-      LIMIT 200
-    `).all()
-    return rows.map((row) => ({
-      ideId: row.ide_id,
-      machineId: row.machine_id,
-      cwd: row.cwd,
-      port: row.port,
-      basePath: row.base_path ?? null,
-      createdMs: row.created_ms,
-      updatedMs: row.updated_ms
-    }))
+    return listIdeSessionsRows(this.db)
   }
 
   /**
    * @param {string} ideId
    */
   deleteIdeSession(ideId) {
-    const res = this.db.prepare(`DELETE FROM ide_sessions WHERE ide_id=?`).run(ideId)
-    return res.changes > 0
+    return deleteIdeSessionRow(this.db, ideId)
   }
 
   upsertUpload({ uploadId, sessionId, filename, mimeType, sizeBytes, hostPath, runnerPath }) {
-    const now = Date.now()
-    this.db.prepare(`
-      INSERT INTO uploads(
-        upload_id,
-        session_id,
-        filename,
-        mime_type,
-        size_bytes,
-        host_path,
-        runner_path,
-        created_ms,
-        updated_ms
-      )
-      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(upload_id) DO UPDATE SET
-        filename=excluded.filename,
-        mime_type=excluded.mime_type,
-        size_bytes=excluded.size_bytes,
-        host_path=excluded.host_path,
-        runner_path=excluded.runner_path,
-        updated_ms=excluded.updated_ms
-    `).run(uploadId, sessionId, filename, mimeType, sizeBytes, hostPath, runnerPath, now, now)
+    upsertUploadRow(this.db, { uploadId, sessionId, filename, mimeType, sizeBytes, hostPath, runnerPath })
   }
 
   /**
    * @param {{ sessionId: string, uploadId: string }} input
    */
   getUpload({ sessionId, uploadId }) {
-    const row = this.db.prepare(`
-      SELECT upload_id, session_id, filename, mime_type, size_bytes, host_path, runner_path, created_ms, updated_ms
-      FROM uploads
-      WHERE upload_id=? AND session_id=?
-    `).get(uploadId, sessionId)
-    if (!row) return null
-    return {
-      uploadId: row.upload_id,
-      sessionId: row.session_id,
-      filename: row.filename,
-      mimeType: row.mime_type,
-      sizeBytes: row.size_bytes,
-      hostPath: row.host_path,
-      runnerPath: row.runner_path,
-      createdMs: row.created_ms,
-      updatedMs: row.updated_ms
-    }
+    return getUploadRow(this.db, { sessionId, uploadId })
   }
 
   /**
    * @param {string} sessionId
    */
   listSessionUploads(sessionId) {
-    const rows = this.db.prepare(`
-      SELECT upload_id, filename, mime_type, size_bytes, host_path, runner_path, created_ms, updated_ms
-      FROM uploads
-      WHERE session_id=?
-      ORDER BY created_ms DESC
-      LIMIT 500
-    `).all(sessionId)
-    return rows.map((r) => ({
-      uploadId: r.upload_id,
-      sessionId,
-      filename: r.filename,
-      mimeType: r.mime_type,
-      sizeBytes: r.size_bytes,
-      hostPath: r.host_path,
-      runnerPath: r.runner_path,
-      createdMs: r.created_ms,
-      updatedMs: r.updated_ms
-    }))
+    return listSessionUploadsRows(this.db, sessionId)
   }
 
   /**
    * @param {{ sessionId: string, uploadId: string }} input
    */
   deleteUpload({ sessionId, uploadId }) {
-    const res = this.db.prepare(`
-      DELETE FROM uploads
-      WHERE upload_id=? AND session_id=?
-    `).run(uploadId, sessionId)
-    return res.changes > 0
+    return deleteUploadRow(this.db, { sessionId, uploadId })
   }
 
   /**
@@ -1257,153 +909,18 @@ export class Store {
    * @param {{ cutoffMs: number }} input
    */
   pruneOldData({ cutoffMs }) {
-    const oldSessionRows = this.db.prepare(`
-      SELECT session_id, machine_id
-      FROM sessions
-      WHERE updated_ms < ?
-    `).all(cutoffMs)
-
-    const oldSessions = oldSessionRows.map((r) => r.session_id)
-    const prunedSessions = oldSessionRows.map((r) => ({
-      sessionId: r.session_id,
-      machineId: r.machine_id
-    }))
-
-    const uploadHostPaths = []
-    if (oldSessions.length) {
-      const batchSize = 900
-      for (let i = 0; i < oldSessions.length; i += batchSize) {
-        const batch = oldSessions.slice(i, i + batchSize)
-        const placeholders = batch.map(() => '?').join(',')
-        const rows = this.db.prepare(`
-          SELECT host_path
-          FROM uploads
-          WHERE session_id IN (${placeholders})
-        `).all(...batch)
-        for (const row of rows) {
-          if (row?.host_path) uploadHostPaths.push(String(row.host_path))
-        }
-      }
-    }
-
-    const sessionsDeleted = this.db.prepare(`DELETE FROM sessions WHERE updated_ms < ?`).run(cutoffMs).changes
-    const machinesDeleted = this.db.prepare(`
-      DELETE FROM machines
-      WHERE last_seen_ms < ?
-        AND machine_id NOT IN (SELECT DISTINCT machine_id FROM sessions)
-    `).run(cutoffMs).changes
-
-    const ideSessionsDeleted = this.db.prepare(`DELETE FROM ide_sessions WHERE updated_ms < ?`).run(cutoffMs).changes
-
-    return { sessionsDeleted, machinesDeleted, ideSessionsDeleted, uploadHostPaths, prunedSessions }
+    return pruneOldDataQuery(this.db, { cutoffMs })
   }
 
   upsertPushSubscription({ endpoint, p256dh, auth }) {
-    const now = Date.now()
-    this.db.prepare(`
-      INSERT INTO push_subscriptions(endpoint, p256dh, auth, created_ms, updated_ms)
-      VALUES(?, ?, ?, ?, ?)
-      ON CONFLICT(endpoint) DO UPDATE SET
-        p256dh=excluded.p256dh,
-        auth=excluded.auth,
-        updated_ms=excluded.updated_ms
-    `).run(endpoint, p256dh, auth, now, now)
+    upsertPushSubscriptionRow(this.db, { endpoint, p256dh, auth })
   }
 
   deletePushSubscription(endpoint) {
-    const res = this.db.prepare(`DELETE FROM push_subscriptions WHERE endpoint=?`).run(endpoint)
-    return res.changes > 0
+    return deletePushSubscriptionRow(this.db, endpoint)
   }
 
   listPushSubscriptions() {
-    const rows = this.db.prepare(`
-      SELECT endpoint, p256dh, auth, created_ms, updated_ms
-      FROM push_subscriptions
-      ORDER BY updated_ms DESC
-      LIMIT 2000
-    `).all()
-    return rows.map((r) => ({
-      endpoint: r.endpoint,
-      p256dh: r.p256dh,
-      auth: r.auth,
-      createdMs: r.created_ms,
-      updatedMs: r.updated_ms
-    }))
+    return listPushSubscriptionsRows(this.db)
   }
-}
-
-function parseReasoningHeadingLine(line) {
-  const raw = String(line ?? '')
-  let ltrim = raw.replace(/^\s+/, '')
-  // Some models format section headers as list items like "- **Header**".
-  if (ltrim.startsWith('- ') || ltrim.startsWith('* ') || ltrim.startsWith('• ') || ltrim.startsWith('– ')) {
-    ltrim = ltrim.slice(2).replace(/^\s+/, '')
-  }
-  if (!ltrim.startsWith('**')) return null
-  const close = ltrim.indexOf('**', 2)
-  if (close < 0) return null
-  const title = ltrim.slice(2, close).trim()
-  if (!title) return null
-  const rest = ltrim.slice(close + 2)
-  return { title, rest }
-}
-
-function appendCappedStr(prev, delta, cap = 200_000) {
-  const p = String(prev ?? '')
-  const d = String(delta ?? '')
-  if (!d) return p
-  const next = p + d
-  if (next.length <= cap) return next
-  return next.slice(next.length - cap)
-}
-
-function parseReasoningSectionsWithStart(markdown, { maxSections = 200, maxBodyChars = 500_000 } = {}) {
-  const text = String(markdown ?? '').replace(/\r/g, '')
-  if (!text.trim()) return []
-
-  const lines = text.split('\n')
-  const sections = []
-  let cur = null
-  let offset = 0
-
-  const start = (title, startIndex) => {
-    if (sections.length >= maxSections) return null
-    cur = {
-      title: String(title ?? '').trim(),
-      body: '',
-      startIndex: Number(startIndex) || 0
-    }
-    sections.push(cur)
-    return cur
-  }
-
-  for (const line of lines) {
-    const heading = parseReasoningHeadingLine(line)
-    if (heading) {
-      const baseTitle = String(heading.title ?? '').trim()
-      const rest = String(heading.rest ?? '')
-      const title = (rest.trim() ? `${baseTitle}${rest}` : baseTitle).trim()
-      start(title, offset)
-      offset += line.length + 1
-      continue
-    }
-
-    if (!cur) {
-      if (!String(line ?? '').trim()) {
-        offset += line.length + 1
-        continue
-      }
-      start('Reasoning', offset)
-    }
-
-    if (!cur) break
-    cur.body = appendCappedStr(cur.body, `${line}\n`, maxBodyChars)
-    offset += line.length + 1
-  }
-
-  // Trim final trailing newlines (cosmetic).
-  for (const s of sections) {
-    if (typeof s.body === 'string') s.body = s.body.replace(/\n+$/, '\n')
-  }
-  return sections
 }

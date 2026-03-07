@@ -1,0 +1,840 @@
+import { getTurnReasoningState } from './sessionHistory.js'
+
+const DIFF_CACHE_MAX = 64
+const COMMAND_ACTIONS_CACHE = new WeakMap()
+const DIFF_CACHE = new Map()
+const CHAT_MESSAGES_CACHE = new WeakMap()
+
+function cacheDiff(key, value) {
+  if (DIFF_CACHE.has(key)) DIFF_CACHE.delete(key)
+  DIFF_CACHE.set(key, value)
+  if (DIFF_CACHE.size <= DIFF_CACHE_MAX) return value
+  const oldest = DIFF_CACHE.keys().next().value
+  if (oldest !== undefined) DIFF_CACHE.delete(oldest)
+  return value
+}
+
+function splitShellStatements(cmd) {
+  const s = String(cmd ?? '')
+  const out = []
+  let cur = ''
+  let quote = null
+
+  const push = () => {
+    const value = cur.trim()
+    cur = ''
+    if (value) out.push(value)
+  }
+
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (quote) {
+      if (ch === quote) {
+        quote = null
+        cur += ch
+        continue
+      }
+      if (quote === '"' && ch === '\\' && i + 1 < s.length) {
+        cur += ch + s[i + 1]
+        i += 1
+        continue
+      }
+      cur += ch
+      continue
+    }
+
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      cur += ch
+      continue
+    }
+
+    if (ch === ';' || ch === '\n') {
+      push()
+      continue
+    }
+
+    if (ch === '&' && s[i + 1] === '&') {
+      push()
+      i += 1
+      continue
+    }
+
+    cur += ch
+  }
+  push()
+  return out
+}
+
+function beforeFirstPipe(seg) {
+  const s = String(seg ?? '')
+  let quote = null
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (quote) {
+      if (ch === quote) quote = null
+      else if (quote === '"' && ch === '\\' && i + 1 < s.length) i += 1
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      continue
+    }
+    if (ch === '|') return s.slice(0, i).trim()
+  }
+  return s.trim()
+}
+
+function stripOuterParens(s) {
+  let value = String(s ?? '').trim()
+  for (let i = 0; i < 4; i++) {
+    if (value.startsWith('(') && value.endsWith(')')) value = value.slice(1, -1).trim()
+    else break
+  }
+  return value
+}
+
+function shellSplitWords(s) {
+  const input = String(s ?? '')
+  const out = []
+  let cur = ''
+  let quote = null
+  let tokenStarted = false
+
+  const push = () => {
+    out.push(cur)
+    cur = ''
+    tokenStarted = false
+  }
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
+    if (quote) {
+      if (ch === quote) {
+        quote = null
+        tokenStarted = true
+        continue
+      }
+      if (quote === '"' && ch === '\\' && i + 1 < input.length) {
+        cur += input[i + 1]
+        i += 1
+        tokenStarted = true
+        continue
+      }
+      cur += ch
+      tokenStarted = true
+      continue
+    }
+
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      tokenStarted = true
+      continue
+    }
+
+    if (/\s/.test(ch)) {
+      if (tokenStarted) push()
+      continue
+    }
+
+    if (ch === '\\' && i + 1 < input.length) {
+      cur += input[i + 1]
+      i += 1
+      tokenStarted = true
+      continue
+    }
+
+    cur += ch
+    tokenStarted = true
+  }
+  if (tokenStarted) push()
+  return out
+}
+
+function looksLikePath(token) {
+  const t = String(token ?? '').trim()
+  if (!t) return false
+  if (t === '.' || t === '..') return true
+  if (t.includes('/')) return true
+  if (t.startsWith('.')) return true
+  if (/\.[a-z0-9]{1,8}$/i.test(t)) return true
+  if (/^(README|LICENSE|Makefile|Dockerfile)$/i.test(t)) return true
+  if (/^(Cargo\.toml|Cargo\.lock|package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/i.test(t)) return true
+  return false
+}
+
+function looksLikeFileToken(token) {
+  const t = String(token ?? '').trim()
+  if (!t) return false
+  if (t.endsWith('/')) return false
+  const base = t.split('/').pop() || t
+  const lower = base.toLowerCase()
+  if (lower === '.vscode' || lower === '.git' || lower === '.github' || lower === '.rootgrid') return false
+  if (lower === '.gitignore' || lower === '.env' || lower === '.npmrc' || lower === '.editorconfig') return true
+  if (!base.startsWith('.') && base.includes('.')) return true
+  return false
+}
+
+function formatExploreTitle({ files = 0, searches = 0, lists = 0, active = false } = {}) {
+  const parts = []
+  const plural = (n, one, many) => (Number(n) === 1 ? one : many)
+  if (files) parts.push(`${files} ${plural(files, 'file', 'files')}`)
+  if (searches) parts.push(`${searches} ${plural(searches, 'search', 'searches')}`)
+  if (lists) parts.push(`${lists} ${plural(lists, 'list', 'lists')}`)
+  const prefix = active ? 'Exploring' : 'Explored'
+  if (!parts.length) return prefix
+  return `${prefix} ${parts.join(', ')}`
+}
+
+function formatBackgroundTitle({ hasReasoning = false, explore = null } = {}) {
+  const parts = []
+  if (hasReasoning) parts.push('Reasoning')
+  if (explore && (explore.files || explore.searches || explore.lists || explore.active)) {
+    parts.push(formatExploreTitle(explore))
+  }
+  if (!parts.length) return 'Details'
+  return `Details — ${parts.join(' · ')}`
+}
+
+function normalizeCommandActions(commandActions) {
+  if (Array.isArray(commandActions) && COMMAND_ACTIONS_CACHE.has(commandActions)) {
+    return COMMAND_ACTIONS_CACHE.get(commandActions)
+  }
+
+  const raw = Array.isArray(commandActions) ? commandActions : []
+  const out = []
+  for (const action of raw) {
+    if (!action || typeof action !== 'object') continue
+    const type = String(action.type ?? '').trim()
+    const command = String(action.command ?? '').trim()
+    if (type === 'read') {
+      const name = String(action.name ?? '').trim() || String(action.path ?? '').trim() || command
+      const path = (action.path === undefined || action.path === null) ? null : String(action.path)
+      out.push({ kind: 'read', command, name, path })
+      continue
+    }
+    if (type === 'listFiles') {
+      const path = (action.path === undefined || action.path === null) ? null : String(action.path)
+      out.push({ kind: 'list', command, path })
+      continue
+    }
+    if (type === 'search') {
+      const query = (action.query === undefined || action.query === null) ? null : String(action.query)
+      const path = (action.path === undefined || action.path === null) ? null : String(action.path)
+      out.push({ kind: 'search', command, query, path })
+      continue
+    }
+    if (type === 'unknown') {
+      out.push({ kind: 'unknown', command })
+      continue
+    }
+    if (command) out.push({ kind: 'unknown', command })
+  }
+
+  if (Array.isArray(commandActions)) COMMAND_ACTIONS_CACHE.set(commandActions, out)
+  return out
+}
+
+function isExploringCallFromActions(actions) {
+  const list = Array.isArray(actions) ? actions : []
+  if (!list.length) return false
+  return list.every((action) => action && typeof action === 'object' && (
+    action.kind === 'read' || action.kind === 'list' || action.kind === 'search'
+  ))
+}
+
+function exploreCountKey(action) {
+  if (!action || typeof action !== 'object') return null
+  if (action.kind === 'read') {
+    return `read:${String(action.name ?? '').trim() || String(action.path ?? '').trim() || String(action.command ?? '').trim()}`
+  }
+  if (action.kind === 'list') return `list:${String(action.path ?? '').trim() || String(action.command ?? '').trim()}`
+  if (action.kind === 'search') {
+    const q = String(action.query ?? '').trim() || String(action.command ?? '').trim()
+    const p = String(action.path ?? '').trim()
+    return `search:${q}::${p}`
+  }
+  return null
+}
+
+function buildTurnBackgroundTimeline({ exploreCalls, reasoningState }) {
+  const calls = Array.isArray(exploreCalls) ? exploreCalls : []
+  const reasoningLoaded = Boolean(reasoningState?.loaded)
+  const reasoningSections = (reasoningLoaded && Array.isArray(reasoningState?.sections)) ? reasoningState.sections : []
+  const items = []
+
+  for (const section of reasoningSections) {
+    if (!section) continue
+    const title = String(section.title ?? '').trim()
+    const body = String(section.body ?? '')
+    if (!title && !body.trim()) continue
+    const seq = Number(section.startSeq ?? section.seq ?? NaN)
+    const tsMs = Number(section.tsMs ?? NaN)
+    items.push({
+      kind: 'reasoning',
+      id: `reasoning-${String(section.id ?? title ?? items.length + 1)}`,
+      seq: Number.isFinite(seq) ? seq : null,
+      tsMs: Number.isFinite(tsMs) ? tsMs : null,
+      section
+    })
+  }
+
+  for (const call of calls) {
+    if (!call) continue
+    const actions = Array.isArray(call.actions) ? call.actions : []
+    if (!actions.length) continue
+    const seq = Number(call.seq ?? NaN)
+    const tsMs = Number(call.tsMs ?? NaN)
+    items.push({
+      kind: 'exploreCall',
+      id: `explorecall-${String(call.itemId ?? items.length + 1)}`,
+      seq: Number.isFinite(seq) ? seq : null,
+      tsMs: Number.isFinite(tsMs) ? tsMs : null,
+      itemId: String(call.itemId ?? ''),
+      actions
+    })
+  }
+
+  if (!items.length) return []
+
+  const useSeq = items.every((item) => (typeof item.seq === 'number' && Number.isFinite(item.seq)))
+  const ordered = items.map((item, idx) => ({
+    ...item,
+    _idx: idx,
+    _key: useSeq
+      ? item.seq
+      : ((typeof item.tsMs === 'number' && Number.isFinite(item.tsMs))
+        ? item.tsMs
+        : ((typeof item.seq === 'number' && Number.isFinite(item.seq)) ? item.seq : idx))
+  }))
+
+  ordered.sort((a, b) => (a._key - b._key) || (a._idx - b._idx))
+
+  const readsOnly = (item) => item?.kind === 'exploreCall' &&
+    Array.isArray(item.actions) &&
+    item.actions.length &&
+    item.actions.every((action) => action?.kind === 'read')
+
+  const merged = []
+  for (const item of ordered) {
+    const prev = merged.length ? merged[merged.length - 1] : null
+    if (readsOnly(prev) && readsOnly(item)) {
+      prev.actions.push(...item.actions)
+      continue
+    }
+    merged.push({ ...item })
+  }
+
+  const out = []
+
+  const pushExploreLine = (baseId, label) => {
+    const value = String(label ?? '').trim()
+    if (!value) return
+    out.push({ kind: 'explore', id: `${baseId}-${out.length + 1}`, label: value })
+  }
+
+  for (const item of merged) {
+    if (item.kind === 'reasoning') {
+      out.push({ kind: 'reasoning', id: item.id, section: item.section })
+      continue
+    }
+    if (item.kind !== 'exploreCall') continue
+
+    const actions = Array.isArray(item.actions) ? item.actions : []
+    if (!actions.length) continue
+
+    const readsOnlyActions = actions.every((action) => action?.kind === 'read')
+    if (readsOnlyActions) {
+      const seen = new Set()
+      const names = []
+      for (const action of actions) {
+        const name = String(action?.name ?? action?.path ?? action?.command ?? '').trim()
+        if (!name || seen.has(name)) continue
+        seen.add(name)
+        names.push(name)
+      }
+      if (names.length) pushExploreLine(item.id, `Read ${names.join(', ')}`)
+      continue
+    }
+
+    for (const action of actions) {
+      if (!action || typeof action !== 'object') continue
+      if (action.kind === 'read') {
+        const name = String(action.name ?? action.path ?? action.command ?? '').trim()
+        if (name) pushExploreLine(item.id, `Read ${name}`)
+      } else if (action.kind === 'list') {
+        const path = String(action.path ?? '').trim() || String(action.command ?? '').trim()
+        if (path) pushExploreLine(item.id, `List ${path}`)
+      } else if (action.kind === 'search') {
+        const query = String(action.query ?? '').trim()
+        const path = String(action.path ?? '').trim()
+        const cmd = String(action.command ?? '').trim()
+        if (query && path) pushExploreLine(item.id, `Search ${query} in ${path}`)
+        else if (query) pushExploreLine(item.id, `Search ${query}`)
+        else if (cmd) pushExploreLine(item.id, `Search ${cmd}`)
+      } else if (action.kind === 'unknown') {
+        const cmd = String(action.command ?? '').trim()
+        if (cmd) pushExploreLine(item.id, `Run ${cmd}`)
+      }
+    }
+  }
+
+  return out
+}
+
+function parseReasoningHeading(line) {
+  const raw = String(line ?? '')
+  let trimmed = raw.replace(/^\s+/, '')
+  if (trimmed.startsWith('- ') || trimmed.startsWith('* ') || trimmed.startsWith('• ') || trimmed.startsWith('– ')) {
+    trimmed = trimmed.slice(2).replace(/^\s+/, '')
+  }
+  if (!trimmed.startsWith('**')) return null
+  const close = trimmed.indexOf('**', 2)
+  if (close < 0) return null
+  const title = trimmed.slice(2, close).trim()
+  if (!title) return null
+  const rest = trimmed.slice(close + 2)
+  return { title, rest }
+}
+
+export function parseReasoningSections(markdown, { maxSections = 200, maxBodyChars = 500_000 } = {}) {
+  const text = String(markdown ?? '').replace(/\r/g, '')
+  if (!text.trim()) return []
+
+  const lines = text.split('\n')
+  const sections = []
+  let cur = null
+
+  const start = (title) => {
+    if (sections.length >= maxSections) return false
+    cur = { id: sections.length + 1, title, body: '' }
+    sections.push(cur)
+    return true
+  }
+
+  for (const line of lines) {
+    const heading = parseReasoningHeading(line)
+    if (heading) {
+      if (!start(heading.title)) break
+      const rest = String(heading.rest ?? '').replace(/^\s*:\s*/, '').trim()
+      if (rest) cur.body += rest
+      continue
+    }
+
+    if (!cur) {
+      if (!start('Summary')) break
+    } else if (cur.body) {
+      cur.body += '\n'
+    }
+    cur.body += line
+
+    if (cur.body.length > maxBodyChars) {
+      cur.body = cur.body.slice(0, maxBodyChars)
+      break
+    }
+  }
+
+  return sections
+    .map((section) => ({
+      ...section,
+      title: String(section.title ?? '').trim(),
+      body: String(section.body ?? '').trim()
+    }))
+    .filter((section) => section.title || section.body)
+}
+
+function normalizeDiffPath(path) {
+  return String(path ?? '')
+    .replace(/^[ab]\//, '')
+    .replace(/^"(.*)"$/, '$1')
+    .trim()
+}
+
+export function parseUnifiedDiff(diffText, { maxBytes = 2_000_000, maxLines = 50_000 } = {}) {
+  const key = String(diffText ?? '')
+  const cached = DIFF_CACHE.get(key)
+  if (cached) {
+    DIFF_CACHE.delete(key)
+    DIFF_CACHE.set(key, cached)
+    return cached
+  }
+
+  const text = key.replace(/\r/g, '')
+  if (!text.trim()) return cacheDiff(key, [])
+
+  if (text.length > maxBytes) {
+    return cacheDiff(key, [{
+      path: 'Diff too large',
+      added: 0,
+      removed: 0,
+      lines: [{ kind: 'meta', text: `Diff truncated (${text.length} chars)` }],
+      raw: text.slice(0, maxBytes)
+    }])
+  }
+
+  const lines = text.split('\n')
+  const limited = (lines.length > maxLines) ? lines.slice(0, maxLines) : lines
+  const files = []
+  let cur = null
+
+  const ensureCurrent = () => {
+    if (cur) return cur
+    cur = {
+      path: 'Changes',
+      oldPath: null,
+      newPath: null,
+      added: 0,
+      removed: 0,
+      lines: [],
+      raw: ''
+    }
+    files.push(cur)
+    return cur
+  }
+
+  const finalizeCurrent = () => {
+    if (!cur) return
+    cur.path = cur.newPath || cur.oldPath || cur.path || 'Changes'
+    cur.raw = cur.lines.map((line) => line.raw ?? line.text ?? '').join('\n')
+    cur = null
+  }
+
+  for (const line of limited) {
+    if (line.startsWith('diff --git ')) {
+      finalizeCurrent()
+      const next = ensureCurrent()
+      next.lines.push({ kind: 'meta', text: line, raw: line })
+      continue
+    }
+
+    if (line.startsWith('--- ')) {
+      const next = ensureCurrent()
+      next.oldPath = normalizeDiffPath(line.slice(4))
+      next.lines.push({ kind: 'meta', text: line, raw: line })
+      continue
+    }
+
+    if (line.startsWith('+++ ')) {
+      const next = ensureCurrent()
+      next.newPath = normalizeDiffPath(line.slice(4))
+      next.path = next.newPath || next.oldPath || next.path
+      next.lines.push({ kind: 'meta', text: line, raw: line })
+      continue
+    }
+
+    if (line.startsWith('@@')) {
+      ensureCurrent().lines.push({ kind: 'hunk', text: line, raw: line })
+      continue
+    }
+
+    if (line.startsWith('+') && !line.startsWith('+++')) {
+      const next = ensureCurrent()
+      next.added += 1
+      next.lines.push({ kind: 'add', text: line.slice(1), raw: line })
+      continue
+    }
+
+    if (line.startsWith('-') && !line.startsWith('---')) {
+      const next = ensureCurrent()
+      next.removed += 1
+      next.lines.push({ kind: 'del', text: line.slice(1), raw: line })
+      continue
+    }
+
+    ensureCurrent().lines.push({
+      kind: line.startsWith(' ') ? 'ctx' : 'meta',
+      text: line.startsWith(' ') ? line.slice(1) : line,
+      raw: line
+    })
+  }
+
+  finalizeCurrent()
+  return cacheDiff(key, files)
+}
+
+export function diffStepSelectedPath(stepId, files, store) {
+  const key = String(stepId ?? '').trim()
+  const list = Array.isArray(files) ? files : []
+  if (!key || !list.length) return list[0]?.path ?? ''
+  const existing = String(store?.diffSelectedFileByEventId?.get?.(key) ?? '').trim()
+  if (existing && list.some((file) => file?.path === existing)) return existing
+  const fallback = String(list[0]?.path ?? '').trim()
+  if (fallback) {
+    try { store?.diffSelectedFileByEventId?.set?.(key, fallback) } catch {}
+  }
+  return fallback
+}
+
+export function setDiffStepSelectedPath(stepId, path, store) {
+  const key = String(stepId ?? '').trim()
+  if (!key) return
+  try { store?.diffSelectedFileByEventId?.set?.(key, String(path ?? '')) } catch {}
+}
+
+export function diffStepSelectedFile(stepId, files, store) {
+  const list = Array.isArray(files) ? files : []
+  if (!list.length) return null
+  const path = diffStepSelectedPath(stepId, list, store)
+  return list.find((file) => file?.path === path) ?? list[0] ?? null
+}
+
+function buildChatMessagesSlow(store) {
+  const events = Array.isArray(store?.events) ? store.events : []
+  const msgs = []
+  let currentAssistant = null
+  let currentAssistantIdx = null
+  const toolMsgByItemId = new Map()
+  let lastDiffText = null
+
+  const reasoningTurnIds = new Set()
+  try {
+    for (const turnId of store?.turnHasReasoningTokens ?? []) reasoningTurnIds.add(String(turnId))
+  } catch {
+  }
+  try {
+    for (const turnId of store?.turnHasReasoningLive ?? []) reasoningTurnIds.add(String(turnId))
+  } catch {
+  }
+
+  let activeTurnId = null
+  const exploreFileKeys = new Set()
+  const exploreSearchKeys = new Set()
+  const exploreListKeys = new Set()
+  let exploreCalls = null
+  const exploreActiveItemIds = new Set()
+  const exploreSeenItemIds = new Set()
+
+  const resetTurnBackground = () => {
+    activeTurnId = null
+    exploreFileKeys.clear()
+    exploreSearchKeys.clear()
+    exploreListKeys.clear()
+    exploreCalls = null
+    exploreActiveItemIds.clear()
+    exploreSeenItemIds.clear()
+  }
+
+  const beginTurn = (turnId) => {
+    resetTurnBackground()
+    activeTurnId = String(turnId ?? '').trim() || null
+    if (!activeTurnId) return
+    if (Boolean(store?.backgroundExpandedByTurnId?.get?.(activeTurnId))) exploreCalls = []
+  }
+
+  const maybeEmitBackground = () => {
+    if (!activeTurnId) return
+    const hasExplore = Boolean(
+      exploreFileKeys.size ||
+      exploreSearchKeys.size ||
+      exploreListKeys.size ||
+      exploreActiveItemIds.size
+    )
+    const tokenHasReasoning = reasoningTurnIds.has(activeTurnId)
+    if (!hasExplore && !tokenHasReasoning) {
+      resetTurnBackground()
+      return
+    }
+
+    const expanded = Boolean(store?.backgroundExpandedByTurnId?.get?.(activeTurnId))
+    const explore = {
+      files: exploreFileKeys.size,
+      searches: exploreSearchKeys.size,
+      lists: exploreListKeys.size,
+      active: Boolean(exploreActiveItemIds.size)
+    }
+    const reasoningState = expanded ? getTurnReasoningState(store, activeTurnId) : null
+    const hasReasoning = tokenHasReasoning || Boolean(
+      reasoningState?.loaded &&
+      Array.isArray(reasoningState?.sections) &&
+      reasoningState.sections.length
+    )
+    const timeline = expanded
+      ? buildTurnBackgroundTimeline({ exploreCalls: exploreCalls ?? [], reasoningState })
+      : null
+
+    const msg = {
+      id: `bg-${activeTurnId}`,
+      role: 'step',
+      stepKind: 'background',
+      turnId: activeTurnId,
+      expanded,
+      title: formatBackgroundTitle({ hasReasoning, explore }),
+      hasReasoning,
+      reasoning: reasoningState,
+      explore,
+      timeline
+    }
+
+    const insertAt = (Number.isInteger(currentAssistantIdx) && currentAssistantIdx !== null)
+      ? Math.max(0, Math.min(msgs.length, currentAssistantIdx))
+      : msgs.length
+    if (insertAt === msgs.length) msgs.push(msg)
+    else {
+      msgs.splice(insertAt, 0, msg)
+      if (Number.isInteger(currentAssistantIdx) && currentAssistantIdx !== null) currentAssistantIdx += 1
+    }
+    resetTurnBackground()
+  }
+
+  const ensureAssistant = (idHint) => {
+    if (currentAssistant) return currentAssistant
+    currentAssistant = { id: idHint, role: 'assistant', text: '' }
+    currentAssistantIdx = msgs.length
+    msgs.push(currentAssistant)
+    return currentAssistant
+  }
+
+  for (const event of events) {
+    if (event.type === 'session.input') {
+      maybeEmitBackground()
+      msgs.push({
+        id: event.eventId,
+        role: 'user',
+        text: event.payload?.text ?? '',
+        attachments: Array.isArray(event.payload?.attachments) ? event.payload.attachments : []
+      })
+      currentAssistant = null
+      currentAssistantIdx = null
+      toolMsgByItemId.clear()
+      continue
+    }
+
+    if (event.type === 'turn.started') {
+      maybeEmitBackground()
+      currentAssistant = null
+      currentAssistantIdx = null
+      toolMsgByItemId.clear()
+      beginTurn(event.payload?.turnId ?? event.eventId)
+      continue
+    }
+
+    if (event.type === 'turn.completed') {
+      maybeEmitBackground()
+      currentAssistant = null
+      currentAssistantIdx = null
+      continue
+    }
+
+    if (event.type === 'diff.updated') {
+      const diff = (typeof event.payload?.diff === 'string') ? event.payload.diff : ''
+      if (!String(diff ?? '').trim()) continue
+      if (lastDiffText === diff) continue
+      lastDiffText = diff
+      msgs.push({
+        id: event.eventId,
+        role: 'step',
+        stepKind: 'diff',
+        files: parseUnifiedDiff(diff),
+        raw: diff
+      })
+      continue
+    }
+
+    if (event.type === 'session.output') {
+      const stream = event.payload?.stream ?? 'normalized'
+      const text = event.payload?.text ?? ''
+      if (stream === 'normalized') {
+        ensureAssistant(currentAssistant?.id ?? event.eventId).text += text
+      } else if ((stream === 'stderr' || stream === 'stdout') && !event.payload?.itemId) {
+        msgs.push({ id: event.eventId, role: 'system', stream, text: String(text ?? '') })
+      }
+      continue
+    }
+
+    if (event.type === 'session.status' && event.payload?.status === 'failed') {
+      msgs.push({ id: event.eventId, role: 'system', text: `Session failed: ${event.payload?.error ?? 'unknown error'}` })
+      continue
+    }
+
+    if (event.type !== 'tool.started' && event.type !== 'tool.completed') continue
+
+    const tool = event.payload?.tool
+    const itemId = String(event.payload?.itemId ?? '')
+    if (!itemId) continue
+
+    if (String(tool ?? '').toLowerCase() === 'commandexecution' && activeTurnId) {
+      const actions = normalizeCommandActions(event.payload?.commandActions)
+      if (isExploringCallFromActions(actions)) {
+        if (event.type === 'tool.started') {
+          exploreActiveItemIds.add(itemId)
+        } else {
+          exploreActiveItemIds.delete(itemId)
+          if (exploreSeenItemIds.has(itemId)) continue
+          exploreSeenItemIds.add(itemId)
+
+          for (const action of actions) {
+            const key = exploreCountKey(action)
+            if (!key) continue
+            if (action.kind === 'read') exploreFileKeys.add(key)
+            else if (action.kind === 'search') exploreSearchKeys.add(key)
+            else if (action.kind === 'list') exploreListKeys.add(key)
+          }
+          if (exploreCalls) {
+            exploreCalls.push({ itemId, actions, seq: event.seq ?? null, tsMs: event.tsMs ?? null })
+          }
+        }
+        continue
+      }
+    }
+
+    let msg = toolMsgByItemId.get(itemId) ?? null
+    if (!msg) {
+      msg = {
+        id: `tool-${itemId}`,
+        role: 'step',
+        stepKind: 'tool',
+        tool,
+        itemId,
+        command: event.payload?.command ?? null,
+        commandActions: event.payload?.commandActions ?? null,
+        cwd: event.payload?.cwd ?? null,
+        changes: Array.isArray(event.payload?.changes) ? event.payload.changes : null,
+        status: event.payload?.status ?? (event.type === 'tool.started' ? 'running' : 'completed'),
+        exitCode: event.payload?.exitCode ?? null,
+        expanded: Boolean(store?.toolExpanded?.get?.(itemId)),
+        output: store?.toolOutputByItemId?.get?.(itemId) ?? null
+      }
+      msgs.push(msg)
+      toolMsgByItemId.set(itemId, msg)
+    } else {
+      msg.tool = tool ?? msg.tool
+      msg.command = event.payload?.command ?? msg.command
+      msg.commandActions = event.payload?.commandActions ?? msg.commandActions
+      msg.cwd = event.payload?.cwd ?? msg.cwd
+      msg.changes = Array.isArray(event.payload?.changes) ? event.payload.changes : msg.changes
+      msg.status = event.payload?.status ?? msg.status
+      if (!msg.status) msg.status = (event.type === 'tool.started') ? 'running' : 'completed'
+      if (event.payload?.exitCode !== undefined) msg.exitCode = event.payload.exitCode
+      msg.expanded = Boolean(store?.toolExpanded?.get?.(itemId))
+      msg.output = store?.toolOutputByItemId?.get?.(itemId) ?? msg.output
+    }
+  }
+
+  maybeEmitBackground()
+  return msgs
+}
+
+export function buildChatMessages(store) {
+  if (!store) return []
+  const events = Array.isArray(store.events) ? store.events : []
+  const version = Number(store.messageViewVersion ?? 0)
+  const lastEventId = events.length ? String(events[events.length - 1]?.eventId ?? '') : ''
+  const cached = CHAT_MESSAGES_CACHE.get(store)
+  if (
+    cached &&
+    cached.version === version &&
+    cached.eventCount === events.length &&
+    cached.lastEventId === lastEventId
+  ) {
+    return cached.messages
+  }
+
+  const messages = buildChatMessagesSlow(store)
+  CHAT_MESSAGES_CACHE.set(store, {
+    version,
+    eventCount: events.length,
+    lastEventId,
+    messages
+  })
+  return messages
+}

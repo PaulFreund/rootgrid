@@ -112,7 +112,10 @@ Sessions:
   - query:
     - `archived=1|true` (list archived sessions)
     - `archived=all` (list both archived + non-archived)
+    - `limit` (default 200; max 500)
+    - `beforeUpdatedMs`, `beforeSessionId` (cursor for older session rows)
   - default: returns **non-archived** sessions only
+  - response: `{ sessions, hasMoreBefore, nextBeforeUpdatedMs, nextBeforeSessionId }`
 - `POST /api/sessions` body: `{ machineId?, cwd, prompt, options?, attachments? }`
   - `options` are forwarded to the runner/Codex app-server and include:
     - `model?`
@@ -122,15 +125,28 @@ Sessions:
     - v0 transport: base64-encoded bytes embedded in JSON
     - rule: at least one of `prompt` or `attachments` must be non-empty
     - limit: max **50MB** per attachment (host should return `413` if exceeded)
+- `POST /api/sessions/:sessionId/uploads?filename=<name>`
+  - request body: raw file bytes
+  - headers:
+    - `Content-Type`: file MIME type
+  - response: `{ uploadId, filename, mimeType, sizeBytes, url }`
+  - preferred browser upload path for large attachments; avoids base64 inflation in the web UI
 - `GET /api/sessions/:sessionId`
+  - query:
+    - `bootstrap=1`: return the session row plus an initial summary event window for faster thread open
+    - `limit`, `prefetchPages`, `prefetchLimit` (bootstrap tuning; internal/defaulted)
+  - bootstrap response: `{ session, events, hasMoreBefore, nextBeforeSeq, containsInput, pagesFetched }`
 - `GET /api/sessions/:sessionId/uploads/:uploadId`
   - streams a stored upload/attachment (images are served `inline`, other files as `attachment`)
 - `GET /api/sessions/:sessionId/events`
   - query:
     - `mode=summary|full` (default `summary`)
     - `beforeSeq` (pagination cursor; fetch older events with `seq < beforeSeq`)
+    - `afterSeq` (forward cursor; fetch newer events with `seq > afterSeq`, used for reconnect/backfill)
     - `limit` (default 200; max 2000)
-  - response: `{ events, hasMoreBefore, nextBeforeSeq }`
+  - response:
+    - backward paging: `{ events, hasMoreBefore, nextBeforeSeq }`
+    - forward paging: `{ events, hasMoreAfter, nextAfterSeq }`
 - `GET /api/sessions/:sessionId/items/:itemId/output`
   - paginated tool output (typically `session.output` `stdout|stderr`) for a Codex `itemId`
   - query: `beforeSeq`, `limit`
@@ -139,6 +155,9 @@ Sessions:
 - `PUT /api/sessions/:sessionId/options` body: `{ options: { model?, approvalPolicy?, sandbox? } }`
   - Updates the session’s Codex options for subsequent turns (applied on the next `turn/start`).
 - `POST /api/sessions/:sessionId/messages` body: `{ text, attachments? }`
+  - `attachments` may be either:
+    - uploaded refs: `[{ uploadId }]`
+    - inline base64 payloads: `[{ filename, mimeType, contentBase64 }]`
   - rule: at least one of `text` or `attachments` must be non-empty
 - `POST /api/sessions/:sessionId/cancel`
 - `POST /api/sessions/:sessionId/stop`
@@ -182,14 +201,17 @@ Visibility tracking:
   - `GET /api/events?sessionId=<sessionId>`: stream full session output/diffs/etc **only** for that session (while still receiving lightweight global events like approvals/turn boundaries).
   - `GET /api/events?all=true`: debug/power-user mode (broadcast everything).
   - `GET /api/events?machineId=<machineId>`: receive machine-scoped events (future-friendly; v0 mostly uses session scoping).
+- Resume hint:
+  - `GET /api/events?...&lastEventId=<id>&resume=1`
+  - when the browser already has a live registry state and the host's replay buffer still covers the gap, the host may send a lightweight `registry.hello` handshake instead of a full `registry.snapshot`, then replay missed SSE events.
 - The browser should report whether the tab/app is visible:
   - `POST /api/visibility` body: `{ connectionId, visibility: "visible"|"hidden" }`
 
 Encoding:
 - SSE frames use `data: <json>\n\n` where `<json>` is an `Envelope` object.
+- Recent events include SSE `id:` lines so reconnecting browsers can resume with `Last-Event-ID` / `lastEventId`.
 - Server sends periodic `heartbeat` envelopes to keep proxies from timing out:
   - `type: "heartbeat"`, `payload: { ts }`
-- If the server sets SSE `id:` lines, the browser can resume with `Last-Event-ID` (optional v0 enhancement).
 
 Implementation note:
 - The host maintains an in-memory set of active SSE clients so it can broadcast realtime events to all connected browsers/tabs/devices.
@@ -216,8 +238,8 @@ Host behavior (required for correctness):
 ### Machine registry (host → browser via SSE)
 
 - `registry.snapshot`
-  - payload: `{ connectionId, machines: [...], sessions: [...], approvals: [...] }`
-  - `sessions` in the snapshot are the default session list (v0: non-archived only)
+  - payload: `{ connectionId, machines: [...], sessions: [...], sessionsHasMore, sessionsNextBeforeUpdatedMs, sessionsNextBeforeSessionId, approvals: [...] }`
+  - `sessions` in the snapshot are the first page of the default session list (v0: non-archived only); the browser may page older rows through `GET /api/sessions`
 - `registry.machine.upsert`
 - `registry.machine.remove`
 - `registry.session.upsert`
@@ -226,7 +248,8 @@ Host behavior (required for correctness):
 ### UI notifications (host → browser via SSE)
 
 - `toast`
-  - payload: `{ level: "success"|"warning"|"error"|"info", title, message, sessionId? }`
+  - payload: `{ level: "success"|"warning"|"error"|"info", title, message, sessionId?, notificationKey? }`
+  - `notificationKey` is a stable dedupe key shared with browser Notification tags / Web Push tags
   - Delivery is controlled by host setting: `notifications.sseToasts = "always"|"never"|"if-not-visible"`
   - Web Push delivery is controlled by host setting: `notifications.webPush = "always"|"never"|"if-not-visible"`
 

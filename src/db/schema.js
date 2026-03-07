@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 7
+export const SCHEMA_VERSION = 8
 
 export const CREATE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS machines (
@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   FOREIGN KEY(machine_id) REFERENCES machines(machine_id) ON DELETE CASCADE
 );
 
+CREATE INDEX IF NOT EXISTS sessions_by_archived_updated ON sessions(archived_ms, updated_ms DESC);
+
 CREATE TABLE IF NOT EXISTS events (
   event_id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,
@@ -61,6 +63,7 @@ CREATE TABLE IF NOT EXISTS approvals (
 );
 
 CREATE INDEX IF NOT EXISTS approvals_by_session ON approvals(session_id, created_ms);
+CREATE INDEX IF NOT EXISTS approvals_by_created ON approvals(created_ms);
 
 -- IDE sessions for VS Code web viewer (best-effort; ephemeral).
 CREATE TABLE IF NOT EXISTS ide_sessions (

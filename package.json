@@ -23,6 +23,7 @@
     "dev:host": "node ./src/cli.js",
     "dev:web": "cd web && vite --config vite.config.js",
     "dev": "node ./scripts/dev.js",
+    "test": "node --test",
     "build:web": "cd web && vite build --config vite.config.js",
     "build": "npm run build:web",
     "prepack": "npm run build:web",

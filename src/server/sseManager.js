@@ -3,11 +3,16 @@ import { makeEnvelope } from './envelope.js'
 export class SSEManager {
   #timer
 
-  constructor({ heartbeatMs = 30_000 } = {}) {
+  constructor({ heartbeatMs = 30_000, historySize = 5_000 } = {}) {
     this.heartbeatMs = heartbeatMs
-    /** @type {Map<string, { res: import('node:http').ServerResponse, visibility: 'visible'|'hidden', all: boolean, sessionId: string|null, machineId: string|null }>} */
+    this.historySize = Math.max(0, Number(historySize) || 0)
+    this.nextSseId = 0
+    /** @type {Array<{ sseId: number, envelope: any }>} */
+    this.history = []
+    /** @type {Map<string, { res: import('node:http').ServerResponse, visibility: 'visible'|'hidden', all: boolean, sessionId: string|null, machineId: string|null, active: boolean }>} */
     this.clients = new Map()
-    this.#timer = setInterval(() => this.#heartbeat(), heartbeatMs).unref?.()
+    this.#timer = setInterval(() => this.#heartbeat(), heartbeatMs)
+    this.#timer.unref?.()
   }
 
   /**
@@ -17,28 +22,75 @@ export class SSEManager {
    *   visibility?: 'visible'|'hidden',
    *   all?: boolean,
    *   sessionId?: string|null,
-   *   machineId?: string|null
+   *   machineId?: string|null,
+   *   active?: boolean
    * }} input
    */
-  addClient({ id, res, visibility = 'visible', all = false, sessionId = null, machineId = null }) {
+  addClient({ id, res, visibility = 'visible', all = false, sessionId = null, machineId = null, active = true }) {
     this.clients.set(id, {
       res,
       visibility,
       all: Boolean(all),
       sessionId: (typeof sessionId === 'string' && sessionId.trim()) ? sessionId.trim() : null,
-      machineId: (typeof machineId === 'string' && machineId.trim()) ? machineId.trim() : null
+      machineId: (typeof machineId === 'string' && machineId.trim()) ? machineId.trim() : null,
+      active: Boolean(active)
     })
     res.on('close', () => {
       this.clients.delete(id)
     })
   }
 
-  send(envelope) {
-    const data = `data: ${JSON.stringify(envelope)}\n\n`
+  activateClient(id, { replayAfter = null } = {}) {
+    const c = this.clients.get(id)
+    if (!c) return false
+    if (Number.isFinite(Number(replayAfter)) && Number(replayAfter) > 0) {
+      this.#replayClient(id, c, Number(replayAfter))
+    }
+    c.active = true
+    return true
+  }
+
+  earliestReplayId() {
+    if (!this.history.length) return null
+    return Number(this.history[0]?.sseId ?? 0) || null
+  }
+
+  canReplayFrom(sseId) {
+    const cursor = Number(sseId ?? 0)
+    if (!Number.isFinite(cursor) || cursor <= 0 || !this.history.length) return false
+    const earliest = this.earliestReplayId()
+    const latest = Number(this.history[this.history.length - 1]?.sseId ?? 0)
+    if (!Number.isFinite(earliest) || !Number.isFinite(latest) || latest <= 0) return false
+    return cursor >= (earliest - 1) && cursor <= latest
+  }
+
+  close() {
+    if (this.#timer) {
+      try { clearInterval(this.#timer) } catch { }
+      this.#timer = null
+    }
     for (const [id, c] of this.clients.entries()) {
+      this.clients.delete(id)
+      try { c.res.end() } catch { }
+    }
+  }
+
+  sendDirect({ id = null, res, envelope, recordHistory = false } = {}) {
+    if (!res || !envelope) return false
+    const prepared = this.#prepareEnvelope(envelope, { recordHistory })
+    if (!prepared) return false
+    return this.#writeOrDrop(id ?? null, { res }, this.#formatData(prepared.sseId, prepared.envelope))
+  }
+
+  send(envelope) {
+    const prepared = this.#prepareEnvelope(envelope, { recordHistory: true })
+    if (!prepared) return
+    const data = this.#formatData(prepared.sseId, prepared.envelope)
+    for (const [id, c] of this.clients.entries()) {
+      if (!c.active) continue
       if (!this.#shouldSend(c, envelope)) continue
       try {
-        c.res.write(data)
+        this.#writeOrDrop(id, c, data)
       } catch {
         this.clients.delete(id)
       }
@@ -54,16 +106,18 @@ export class SSEManager {
    */
   sendToast(envelope, { policy }) {
     if (policy === 'never') return 0
-    const data = `data: ${JSON.stringify(envelope)}\n\n`
+    const prepared = this.#prepareEnvelope(envelope, { recordHistory: true })
+    if (!prepared) return 0
+    const data = this.#formatData(prepared.sseId, prepared.envelope)
     let delivered = 0
 
     for (const [id, c] of this.clients.entries()) {
+      if (!c.active) continue
       const visible = c.visibility === 'visible'
       const shouldSend = policy === 'always' || (policy === 'if-not-visible' && !visible)
       if (!shouldSend) continue
       try {
-        c.res.write(data)
-        delivered += 1
+        if (this.#writeOrDrop(id, c, data)) delivered += 1
       } catch {
         this.clients.delete(id)
       }
@@ -174,13 +228,68 @@ export class SSEManager {
 
   #heartbeat() {
     const hb = makeEnvelope({ type: 'heartbeat', payload: { ts: Date.now() } })
-    const data = `data: ${JSON.stringify(hb)}\n\n`
+    const prepared = this.#prepareEnvelope(hb, { recordHistory: false })
+    if (!prepared) return
+    const data = this.#formatData(prepared.sseId, prepared.envelope)
     for (const [id, c] of this.clients.entries()) {
+      if (!c.active) continue
       try {
-        c.res.write(data)
+        this.#writeOrDrop(id, c, data)
       } catch {
         this.clients.delete(id)
       }
     }
+  }
+
+  #prepareEnvelope(envelope, { recordHistory = true } = {}) {
+    if (!envelope || typeof envelope !== 'object') return null
+    let sseId = Number(envelope.sseId ?? 0)
+    if (!Number.isFinite(sseId) || sseId <= 0) {
+      this.nextSseId += 1
+      sseId = this.nextSseId
+      envelope.sseId = sseId
+    } else if (sseId > this.nextSseId) {
+      this.nextSseId = sseId
+    }
+
+    if (recordHistory) {
+      this.history.push({ sseId, envelope })
+      if (this.history.length > this.historySize) {
+        this.history.splice(0, this.history.length - this.historySize)
+      }
+    }
+
+    return { sseId, envelope }
+  }
+
+  #formatData(sseId, envelope) {
+    return `id: ${String(sseId)}\ndata: ${JSON.stringify(envelope)}\n\n`
+  }
+
+  #replayClient(id, client, replayAfter) {
+    for (const entry of this.history) {
+      if (entry.sseId <= replayAfter) continue
+      if (!this.#shouldReplay(client, entry.envelope)) continue
+      try {
+        const ok = this.#writeOrDrop(id, client, this.#formatData(entry.sseId, entry.envelope))
+        if (!ok) return
+      } catch {
+        this.clients.delete(id)
+        return
+      }
+    }
+  }
+
+  #shouldReplay(client, envelope) {
+    if (envelope?.type === 'toast') return true
+    return this.#shouldSend(client, envelope)
+  }
+
+  #writeOrDrop(id, client, data) {
+    const ok = client.res.write(data)
+    if (ok !== false) return true
+    this.clients.delete(id)
+    try { client.res.end() } catch { }
+    return false
   }
 }

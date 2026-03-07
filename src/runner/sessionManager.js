@@ -1,18 +1,12 @@
 import crypto from 'node:crypto'
-import { mkdir, readdir, rm, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
 
 import { CodexAppServerSession } from './sessions/CodexAppServerSession.js'
-import { JsonRpcStdioClient } from './sessions/JsonRpcStdioClient.js'
 import { RunnerIdeManager } from './ideManager.js'
-import { getUploadsDir } from '../lib/paths.js'
+import { RunnerUploadManager } from './runnerUploadManager.js'
+import { listCodexModels, listWorkspaceDirectories } from './runnerWorkspaceApi.js'
 
-function safeFilename(input) {
-  const raw = String(input ?? 'upload')
-  // Drop any path separators and control chars.
-  const base = raw.replace(/[/\\\\]/g, '_').replace(/[\u0000-\u001f\u007f]/g, '').trim()
-  return base || 'upload'
+function nextTurnOfLoop() {
+  return new Promise((resolve) => setImmediate(resolve))
 }
 
 export class RunnerSessionManager {
@@ -34,6 +28,10 @@ export class RunnerSessionManager {
       machineId,
       emit: (type, payload) => this.#emit(type, { machineId: this.machineId }, payload)
     })
+    this.uploads = new RunnerUploadManager({
+      machineId,
+      emit: (type, scope, payload, options) => this.#emit(type, scope, payload, options)
+    })
   }
 
   /**
@@ -48,6 +46,10 @@ export class RunnerSessionManager {
     if (type === 'session.start') return this.#onSessionStart(payload)
     if (type === 'session.send') return this.#onSessionSend(payload)
     if (type === 'session.options.update') return this.#onSessionOptionsUpdate(payload)
+    if (type === 'session.upload.begin') return this.#onSessionUploadBegin(payload)
+    if (type === 'session.upload.chunk') return this.#onSessionUploadChunk(payload)
+    if (type === 'session.upload.end') return this.#onSessionUploadEnd(payload)
+    if (type === 'session.upload.abort') return this.#onSessionUploadAbort(payload)
     if (type === 'session.upload') return this.#onSessionUpload(payload)
     if (type === 'session.upload.delete') return this.#onSessionUploadDelete(payload)
     if (type === 'session.cleanup') return this.#onSessionCleanup(payload)
@@ -66,18 +68,38 @@ export class RunnerSessionManager {
     return { machineId: this.machineId, sessionId }
   }
 
+  #respondCommand(requestId, sessionId, kind, { ok, error = null } = {}) {
+    if (!requestId || typeof requestId !== 'string') return
+    this.#emit(ok ? 'session.command.accepted' : 'session.command.rejected', this.#sessionScope(sessionId), {
+      requestId,
+      sessionId,
+      kind,
+      ...(ok ? {} : { error: String(error ?? 'command rejected') })
+    }, { track: false })
+  }
+
   async #onSessionStart(payload) {
+    const requestId = payload?.requestId ?? null
     const sessionId = payload?.sessionId ?? crypto.randomUUID()
     const cwd = payload?.cwd
     const prompt = payload?.prompt
     const input = payload?.input ?? null
     const options = payload?.options ?? null
 
-    if (!cwd || typeof cwd !== 'string') return
+    if (!cwd || typeof cwd !== 'string') {
+      this.#respondCommand(requestId, sessionId, 'start', { ok: false, error: 'cwd is required' })
+      return
+    }
     const startInput = (Array.isArray(input) && input.length) ? input : prompt
-    if (!startInput || (typeof startInput !== 'string' && !Array.isArray(startInput))) return
+    if (!startInput || (typeof startInput !== 'string' && !Array.isArray(startInput))) {
+      this.#respondCommand(requestId, sessionId, 'start', { ok: false, error: 'prompt or input is required' })
+      return
+    }
 
-    if (this.sessions.has(sessionId)) return
+    if (this.sessions.has(sessionId)) {
+      this.#respondCommand(requestId, sessionId, 'start', { ok: false, error: 'session already exists' })
+      return
+    }
 
     const session = new CodexAppServerSession({
       sessionId,
@@ -86,8 +108,10 @@ export class RunnerSessionManager {
       emit: (type, eventPayload) => this.#emit(type, this.#sessionScope(sessionId), eventPayload)
     })
     this.sessions.set(sessionId, session)
+    this.#respondCommand(requestId, sessionId, 'start', { ok: true })
 
     try {
+      await nextTurnOfLoop()
       await session.start(startInput)
     } catch (err) {
       this.#emit('session.status', this.#sessionScope(sessionId), {
@@ -100,12 +124,19 @@ export class RunnerSessionManager {
   }
 
   async #onSessionSend(payload) {
+    const requestId = payload?.requestId ?? null
     const sessionId = payload?.sessionId
     const text = payload?.text
     const input = payload?.input ?? null
-    if (!sessionId || typeof sessionId !== 'string') return
+    if (!sessionId || typeof sessionId !== 'string') {
+      this.#respondCommand(requestId, String(sessionId ?? ''), 'send', { ok: false, error: 'sessionId is required' })
+      return
+    }
     const sendInput = (Array.isArray(input) && input.length) ? input : text
-    if (!sendInput || (typeof sendInput !== 'string' && !Array.isArray(sendInput))) return
+    if (!sendInput || (typeof sendInput !== 'string' && !Array.isArray(sendInput))) {
+      this.#respondCommand(requestId, sessionId, 'send', { ok: false, error: 'text or input is required' })
+      return
+    }
 
     let session = this.sessions.get(sessionId)
     if (!session) {
@@ -113,6 +144,7 @@ export class RunnerSessionManager {
       const codexThreadId = payload?.codexThreadId ?? null
       const options = payload?.options ?? null
       if (!cwd || typeof cwd !== 'string') {
+        this.#respondCommand(requestId, sessionId, 'send', { ok: false, error: 'missing cwd for resume' })
         this.#emit('session.output', this.#sessionScope(sessionId), {
           sessionId,
           seq: 1,
@@ -129,8 +161,10 @@ export class RunnerSessionManager {
         emit: (type, eventPayload) => this.#emit(type, this.#sessionScope(sessionId), eventPayload)
       })
       this.sessions.set(sessionId, session)
+      this.#respondCommand(requestId, sessionId, 'send', { ok: true })
 
       try {
+        await nextTurnOfLoop()
         await session.start(sendInput, { threadId: (typeof codexThreadId === 'string' && codexThreadId) ? codexThreadId : null })
       } catch (err) {
         this.#emit('session.status', this.#sessionScope(sessionId), {
@@ -143,7 +177,10 @@ export class RunnerSessionManager {
       return
     }
 
+    this.#respondCommand(requestId, sessionId, 'send', { ok: true })
+
     try {
+      await nextTurnOfLoop()
       await session.send(sendInput)
     } catch (err) {
       this.#emit('session.output', this.#sessionScope(sessionId), {
@@ -177,178 +214,63 @@ export class RunnerSessionManager {
   }
 
   async #onSessionUpload(payload) {
-    const sessionId = payload?.sessionId
-    const uploadId = payload?.uploadId ?? crypto.randomUUID()
-    const filename = safeFilename(payload?.filename ?? payload?.name ?? 'upload')
-    const mimeType = (typeof payload?.mimeType === 'string' && payload.mimeType.trim())
-      ? payload.mimeType.trim()
-      : 'application/octet-stream'
-    const contentBase64 = payload?.contentBase64 ?? payload?.content ?? null
+    await this.uploads.handleLegacyUpload(payload)
+  }
 
-    if (!sessionId || typeof sessionId !== 'string') return
-    if (!contentBase64 || typeof contentBase64 !== 'string') return
+  async #onSessionUploadBegin(payload) {
+    await this.uploads.begin(payload)
+  }
 
-    try {
-      const dir = join(getUploadsDir(), sessionId)
-      await mkdir(dir, { recursive: true, mode: 0o700 })
-      const path = join(dir, `${uploadId}-${filename}`)
-      const buf = Buffer.from(contentBase64, 'base64')
-      await writeFile(path, buf, { mode: 0o600 })
+  async #onSessionUploadChunk(payload) {
+    await this.uploads.chunk(payload)
+  }
 
-      this.#emit('session.uploaded', this.#sessionScope(sessionId), {
-        sessionId,
-        uploadId,
-        path,
-        filename,
-        mimeType,
-        sizeBytes: buf.length
-      })
-    } catch (err) {
-      this.#emit('session.upload.failed', this.#sessionScope(sessionId), {
-        sessionId,
-        uploadId,
-        error: String(err?.message ?? err)
-      })
-    }
+  async #onSessionUploadEnd(payload) {
+    await this.uploads.end(payload)
+  }
+
+  async #onSessionUploadAbort(payload) {
+    await this.uploads.abort(payload)
   }
 
   async #onSessionUploadDelete(payload) {
-    const sessionId = payload?.sessionId
-    const uploadId = payload?.uploadId
-    if (!sessionId || typeof sessionId !== 'string') return
-    if (!uploadId || typeof uploadId !== 'string') return
-
-    const dir = join(getUploadsDir(), sessionId)
-    let entries = []
-    try {
-      entries = await readdir(dir, { withFileTypes: true })
-    } catch {
-      return
-    }
-
-    const prefix = `${uploadId}-`
-    for (const ent of entries) {
-      const name = ent?.name
-      if (!name || typeof name !== 'string') continue
-      if (!name.startsWith(prefix)) continue
-      try {
-        await rm(join(dir, name), { force: true })
-      } catch {
-      }
-    }
+    await this.uploads.delete(payload)
   }
 
   async #onFsList(payload) {
     const requestId = payload?.requestId
     if (!requestId || typeof requestId !== 'string') return
 
-    const home = homedir()
-    let dir = String(payload?.path ?? '').trim()
-    if (!dir || dir === '~') {
-      dir = home
-    } else if (dir.startsWith('~/') || dir.startsWith('~\\')) {
-      dir = join(home, dir.slice(2))
-    } else if (!dir.startsWith('/')) {
-      // Treat relative paths as relative to the user's home.
-      dir = resolve(home, dir)
-    }
-
-    dir = resolve(dir)
-
-    let entries = []
     try {
-      const raw = await readdir(dir, { withFileTypes: true })
-      entries = raw
-        .filter((ent) => Boolean(ent?.isDirectory?.()))
-        .map((ent) => ({
-          name: ent.name,
-          path: join(dir, ent.name),
-          kind: 'dir'
-        }))
-        .sort((a, b) => String(a.name).localeCompare(String(b.name)))
-        .slice(0, 500)
+      const out = await listWorkspaceDirectories(payload?.path)
+      this.#emit('fs.list.result', { machineId: this.machineId }, {
+        requestId,
+        ok: true,
+        ...out
+      }, { track: false })
     } catch (err) {
       this.#emit('fs.list.result', { machineId: this.machineId }, {
         requestId,
         ok: false,
         error: String(err?.message ?? err)
       }, { track: false })
-      return
     }
-
-    let parent = null
-    try {
-      const p = dirname(dir)
-      if (p && p !== dir) parent = p
-    } catch {
-    }
-
-    this.#emit('fs.list.result', { machineId: this.machineId }, {
-      requestId,
-      ok: true,
-      path: dir,
-      parent,
-      entries
-    }, { track: false })
   }
 
   async #onCodexModelList(payload) {
     const requestId = payload?.requestId
     if (!requestId || typeof requestId !== 'string') return
 
-    const cwd = (typeof payload?.cwd === 'string' && payload.cwd.trim()) ? payload.cwd.trim() : homedir()
-    const limit = Number(payload?.limit)
-    const includeHidden = Boolean(payload?.includeHidden)
-
-    const rpc = new JsonRpcStdioClient({
-      command: 'codex',
-      args: ['app-server'],
-      cwd,
-      env: process.env,
-      onNotification: () => {},
-      onRequest: async () => null,
-      onStderr: () => {}
-    })
-
     try {
-      await rpc.start()
-      await rpc.sendRequest('initialize', {
-        clientInfo: {
-          name: 'rootgrid',
-          title: 'Rootgrid',
-          version: '0.0.0'
-        }
+      const out = await listCodexModels({
+        cwd: payload?.cwd,
+        limit: payload?.limit,
+        includeHidden: payload?.includeHidden
       })
-      rpc.sendNotification('initialized', {})
-
-      const params = {
-        limit: Number.isFinite(limit) && limit > 0 ? limit : 200,
-        includeHidden
-      }
-
-      let result = null
-      let lastErr = null
-      for (const method of ['model/list', 'models/list']) {
-        try {
-          result = await rpc.sendRequest(method, params)
-          break
-        } catch (err) {
-          lastErr = err
-        }
-      }
-      if (!result) throw lastErr ?? new Error('model list failed')
-
-      const models = Array.isArray(result?.models)
-        ? result.models
-        : (Array.isArray(result?.data) ? result.data : (Array.isArray(result?.items) ? result.items : []))
-      const nextCursorRaw = result?.nextCursor ?? result?.next_cursor ?? result?.cursor ?? null
-      const nextCursor = (nextCursorRaw === null || nextCursorRaw === undefined) ? null : String(nextCursorRaw)
-
       this.#emit('codex.model.list.result', { machineId: this.machineId }, {
         requestId,
         ok: true,
-        models,
-        nextCursor
+        ...out
       }, { track: false })
     } catch (err) {
       this.#emit('codex.model.list.result', { machineId: this.machineId }, {
@@ -356,8 +278,6 @@ export class RunnerSessionManager {
         ok: false,
         error: String(err?.message ?? err)
       }, { track: false })
-    } finally {
-      try { rpc.stop({ signal: 'SIGTERM' }) } catch {}
     }
   }
 
@@ -381,12 +301,7 @@ export class RunnerSessionManager {
       this.sessions.delete(sessionId)
     }
 
-    // Best-effort: remove the whole per-session uploads directory.
-    try {
-      const dir = join(getUploadsDir(), sessionId)
-      await rm(dir, { recursive: true, force: true })
-    } catch {
-    }
+    await this.uploads.cleanupSession(sessionId)
   }
 
   async #onApprovalRespond(payload) {

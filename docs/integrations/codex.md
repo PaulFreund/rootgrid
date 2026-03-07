@@ -48,10 +48,11 @@ Rootgrid uses this to support images:
 - Image (local file on the runner): `{ type: "localImage", path: "/abs/path/on/runner.png" }`
 
 Implementation notes (Rootgrid v0):
-- The browser uploads attachment bytes to the host (base64-in-JSON in v0).
+- Preferred path: the browser uploads attachment bytes to the host as raw request bodies (`POST /api/sessions/:sessionId/uploads?...`) so the web UI does not need to base64-buffer large files in memory.
+- Backward-compatible fallback: base64-in-JSON attachments are still accepted on session/message POSTs.
 - Attachment size limit (v0): max **50MB** per file.
 - The host stores attachments on disk (`~/.rootgrid/uploads/<sessionId>/...`) so the UI can download/preview them later.
-- The host also forwards attachments to the runner (via `session.upload`) and receives a runner-local path.
+- The host also forwards attachments to the runner and receives a runner-local path.
 - When starting/sending a turn, the host builds `input: UserInput[]` containing:
   - one `text` item (the user’s message; if empty, a placeholder like `"(see attachments)"`)
   - one `localImage` item per image attachment

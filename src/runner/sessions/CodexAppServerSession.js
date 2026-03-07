@@ -1,237 +1,36 @@
 import crypto from 'node:crypto'
 
 import { JsonRpcStdioClient } from './JsonRpcStdioClient.js'
-
-function uniqStrings(values) {
-  const out = []
-  const seen = new Set()
-  for (const v of values) {
-    if (typeof v !== 'string') continue
-    const s = v.trim()
-    if (!s || seen.has(s)) continue
-    seen.add(s)
-    out.push(s)
-  }
-  return out
-}
-
-function approvalPolicyCandidates(input) {
-  if (!input) return []
-  const raw = String(input).trim()
-  if (!raw) return []
-
-  const out = []
-
-  // App-server style values (Codex v2+).
-  if (raw === 'untrusted') out.push('unlessTrusted')
-  if (raw === 'on-request') out.push('onRequest')
-  if (raw === 'on-failure') out.push('onFailure')
-  if (raw === 'never') out.push('never')
-
-  // Already app-server style.
-  if (raw === 'unlessTrusted' || raw === 'onRequest' || raw === 'onFailure' || raw === 'never') out.push(raw)
-
-  // Legacy CLI-style strings (still used in `config.toml`).
-  if (raw === 'untrusted' || raw === 'on-request' || raw === 'on-failure' || raw === 'never') out.push(raw)
-
-  return uniqStrings(out)
-}
-
-function sandboxCandidates(input) {
-  if (!input) return []
-  const raw = String(input).trim()
-  if (!raw) return []
-
-  const out = []
-
-  // App-server style values.
-  if (raw === 'read-only') out.push('readOnly')
-  if (raw === 'workspace-write') out.push('workspaceWrite')
-  if (raw === 'danger-full-access') out.push('dangerFullAccess')
-
-  // Already app-server style.
-  if (raw === 'readOnly' || raw === 'workspaceWrite' || raw === 'dangerFullAccess' || raw === 'externalSandbox') out.push(raw)
-
-  // Legacy CLI-style strings.
-  if (raw === 'read-only' || raw === 'workspace-write' || raw === 'danger-full-access') out.push(raw)
-
-  return uniqStrings(out)
-}
-
-function sandboxPolicyCandidates(input, cwd) {
-  const modes = sandboxCandidates(input)
-
-  const toType = (mode) => {
-    if (mode === 'read-only') return 'readOnly'
-    if (mode === 'workspace-write') return 'workspaceWrite'
-    if (mode === 'danger-full-access') return 'dangerFullAccess'
-    if (mode === 'readOnly' || mode === 'workspaceWrite' || mode === 'dangerFullAccess' || mode === 'externalSandbox') return mode
-    return null
-  }
-
-  /** @type {any[]} */
-  const out = []
-
-  // Prefer string values per the current app-server docs.
-  for (const m of modes) out.push(m)
-
-  // Best-effort object variants for older schemas / stricter sandbox root handling.
-  for (const m of modes) {
-    const type = toType(m)
-    if (!type) continue
-
-    out.push({ type })
-
-    if (type === 'workspaceWrite' && typeof cwd === 'string' && cwd) {
-      out.push({ type, writableRoots: [cwd] })
-    }
-  }
-
-  const seen = new Set()
-  const deduped = []
-  for (const obj of out) {
-    const key = JSON.stringify(obj)
-    if (seen.has(key)) continue
-    seen.add(key)
-    deduped.push(obj)
-  }
-  return deduped
-}
-
-function reasoningEffortCandidates(input) {
-  if (!input) return []
-  const raw = String(input).trim()
-  if (!raw) return []
-
-  const norm = raw.toLowerCase().replace(/[\s_]+/g, '-')
-  const out = []
-
-  if (norm === 'none' || norm === 'minimal' || norm === 'low' || norm === 'medium' || norm === 'high') {
-    out.push(norm)
-    // common casing variants (best-effort)
-    out.push(norm.toUpperCase().slice(0, 1) + norm.slice(1))
-  } else if (norm === 'xhigh' || norm === 'x-high' || norm === 'extra-high' || norm === 'extrahigh') {
-    out.push('xhigh')
-    out.push('xHigh')
-    out.push('x_high')
-    out.push('x-high')
-    // older/alternate spelling
-    out.push('extra-high')
-    out.push('extraHigh')
-    out.push('extra_high')
-  } else {
-    out.push(raw)
-    if (norm !== raw) out.push(norm)
-  }
-
-  return uniqStrings(out)
-}
-
-function reasoningParamObjects(effort) {
-  const e = safeString(effort)
-  if (!e) return []
-  return [
-    { effort: e },
-    { reasoningEffort: e },
-    { reasoning_effort: e },
-    { reasoning: { effort: e } },
-    { reasoning: e }
-  ]
-}
-
-function tryExtractDeltaText(params) {
-  // Best-effort: schemas may evolve.
-  const candidates = [
-    params?.delta,
-    params?.textDelta,
-    params?.outputDelta,
-    params?.chunk,
-    params?.text
-  ]
-  for (const c of candidates) {
-    if (typeof c === 'string' && c.length > 0) return c
-    if (c && typeof c === 'object') {
-      if (typeof c.text === 'string' && c.text.length > 0) return c.text
-      if (typeof c.delta === 'string' && c.delta.length > 0) return c.delta
-      if (typeof c.value === 'string' && c.value.length > 0) return c.value
-    }
-  }
-  return null
-}
-
-function tryExtractAgentMessageText(item) {
-  if (!item || typeof item !== 'object') return null
-  const content = item.content ?? item.message ?? item.text ?? null
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    const parts = []
-    for (const p of content) {
-      if (typeof p === 'string') parts.push(p)
-      else if (p && typeof p === 'object') {
-        if (typeof p.text === 'string') parts.push(p.text)
-        else if (typeof p.content === 'string') parts.push(p.content)
-        else if (typeof p.value === 'string') parts.push(p.value)
-      }
-    }
-    const joined = parts.join('')
-    return joined ? joined : null
-  }
-  if (content && typeof content === 'object') {
-    if (typeof content.text === 'string') return content.text
-  }
-  return null
-}
-
-function tryExtractReasoningText(item) {
-  if (!item || typeof item !== 'object') return null
-
-  // Prefer summary if present (often safer/shorter).
-  const summary = item.summary ?? item.summary_text ?? item.summaryText ?? null
-  if (Array.isArray(summary)) {
-    const parts = summary.filter((x) => typeof x === 'string' && x.length > 0)
-    const joined = parts.join('\n')
-    if (joined) return joined
-  }
-
-  const content = item.content ?? null
-  if (Array.isArray(content)) {
-    const parts = content.filter((x) => typeof x === 'string' && x.length > 0)
-    const joined = parts.join('')
-    if (joined) return joined
-  }
-
-  return tryExtractAgentMessageText(item)
-}
-
-function tryExtractPlanText(item) {
-  if (!item || typeof item !== 'object') return null
-  const text = safeString(item.text)
-  if (text) return text
-  return tryExtractAgentMessageText(item)
-}
-
-function normalizeItemType(value) {
-  if (typeof value !== 'string') return null
-  const t = value.toLowerCase().replace(/[\s_-]/g, '')
-  return t || null
-}
-
-function safeString(value) {
-  return (typeof value === 'string' && value.trim()) ? value : null
-}
-
-function minimizeFileChanges(changes) {
-  if (!Array.isArray(changes)) return null
-  const out = []
-  for (const c of changes) {
-    if (!c || typeof c !== 'object') continue
-    const path = safeString(c.path)
-    const kind = safeString(c.kind)
-    if (!path) continue
-    out.push({ path, ...(kind ? { kind } : {}) })
-  }
-  return out
-}
+import {
+  approvalPolicyCandidates,
+  buildResumeThreadAttempts,
+  buildStartThreadAttempts,
+  buildStartTurnAttempts,
+  normalizeItemType,
+  reasoningEffortCandidates,
+  safeString,
+  sandboxCandidates,
+  sandboxPolicyCandidates,
+  tryExtractAgentMessageText,
+  tryExtractDeltaText,
+  tryExtractPlanText,
+  tryExtractReasoningText
+} from './codexSessionProtocol.js'
+import {
+  buildCodexErrorOutputText,
+  buildPlanUpdatedEvent,
+  buildTerminalInteractionOutputText,
+  buildThreadTokenUsageEvent,
+  buildToolCompletedEvent,
+  buildToolStartedEvent,
+  normalizeWrappedNotification
+} from './codexSessionNotifications.js'
+import {
+  buildApprovalRequestEvent,
+  buildUserInputRequestEvent,
+  isApprovalRequestMethod,
+  isUserInputRequestMethod
+} from './codexSessionRequests.js'
 
 export class CodexAppServerSession {
   /**
@@ -284,6 +83,8 @@ export class CodexAppServerSession {
     this.pendingWrappedNotifications = []
     /** @type {any} */
     this.pendingWrappedTimer = null
+    /** @type {Map<string, { stream: string, itemId: string|null, text: string, timer: any }>} */
+    this.outputBuffers = new Map()
 
     this.rpc = new JsonRpcStdioClient({
       command: 'codex',
@@ -293,14 +94,12 @@ export class CodexAppServerSession {
       onNotification: (msg) => this.#onNotification(msg),
       onRequest: (msg) => this.#onRequest(msg),
       onStderr: (chunk) => {
-        this.emit('session.output', {
-          sessionId: this.sessionId,
-          seq: this.nextSeq(),
-          stream: 'stderr',
-          text: chunk
-        })
+        this.#bufferOutput({ stream: 'stderr', text: chunk })
       },
       onExit: ({ code, signal }) => {
+        this.#disposeWrappedNotifications()
+        this.#rejectPendingApprovals(new Error('session exited'))
+        this.#flushAllOutputBuffers()
         const status = (code === 0) ? 'exited' : 'failed'
         this.emit('session.status', {
           sessionId: this.sessionId,
@@ -310,6 +109,32 @@ export class CodexAppServerSession {
         })
       }
     })
+  }
+
+  #resetTurnScopedState() {
+    this.turnText = ''
+    this.lastNormalizedChunk = { text: null, tsMs: 0 }
+    this.lastReasoningChunk = { text: null, tsMs: 0 }
+    try { this.seenToolStarted.clear() } catch { }
+    try { this.seenToolCompleted.clear() } catch { }
+    try { this.itemState.clear() } catch { }
+    try { this.lastDeltaByKey.clear() } catch { }
+  }
+
+  #disposeWrappedNotifications() {
+    if (this.pendingWrappedTimer) {
+      try { clearTimeout(this.pendingWrappedTimer) } catch { }
+    }
+    this.pendingWrappedTimer = null
+    this.pendingWrappedNotifications = []
+  }
+
+  #rejectPendingApprovals(error) {
+    const err = (error instanceof Error) ? error : new Error(String(error ?? 'approval cancelled'))
+    for (const [approvalId, pending] of this.pendingApprovals.entries()) {
+      this.pendingApprovals.delete(approvalId)
+      try { pending.reject(err) } catch { }
+    }
   }
 
   #appendTurnText(chunk) {
@@ -324,6 +149,66 @@ export class CodexAppServerSession {
     const t = String(this.turnText ?? '').replace(/\s+/g, ' ').trim()
     if (!t) return null
     return t.length > 200 ? `${t.slice(0, 197)}…` : t
+  }
+
+  #bufferOutput({ stream, text, itemId = null }) {
+    const body = String(text ?? '')
+    if (!body) return
+
+    const sid = (typeof itemId === 'string' && itemId.trim()) ? itemId.trim() : null
+    const key = `${String(stream ?? 'normalized')}:${sid ?? ''}`
+    let entry = this.outputBuffers.get(key)
+    if (!entry) {
+      entry = {
+        stream: String(stream ?? 'normalized'),
+        itemId: sid,
+        text: '',
+        timer: null
+      }
+      this.outputBuffers.set(key, entry)
+    }
+
+    entry.text += body
+
+    const flushNow = entry.text.length >= 16 * 1024 || entry.stream === 'stderr'
+    if (flushNow) {
+      this.#flushOutputBuffer(key)
+      return
+    }
+
+    if (entry.timer) return
+    entry.timer = setTimeout(() => this.#flushOutputBuffer(key), 40)
+    try { entry.timer.unref?.() } catch { }
+  }
+
+  #flushOutputBuffer(key) {
+    const entry = this.outputBuffers.get(key)
+    if (!entry) return
+    this.outputBuffers.delete(key)
+    try { if (entry.timer) clearTimeout(entry.timer) } catch { }
+    if (!entry.text) return
+    this.emit('session.output', {
+      sessionId: this.sessionId,
+      seq: this.nextSeq(),
+      stream: entry.stream,
+      text: entry.text,
+      ...(entry.itemId ? { itemId: entry.itemId } : {})
+    })
+  }
+
+  #flushAllOutputBuffers() {
+    for (const key of Array.from(this.outputBuffers.keys())) {
+      this.#flushOutputBuffer(key)
+    }
+  }
+
+  #flushOutputBuffersForItem(itemId) {
+    const tid = safeString(itemId)
+    if (!tid) return
+    for (const [key, entry] of this.outputBuffers.entries()) {
+      if (entry?.itemId !== tid) continue
+      this.#flushOutputBuffer(key)
+    }
   }
 
   /**
@@ -397,41 +282,14 @@ export class CodexAppServerSession {
     let effectiveThreadId = null
 
     if (threadId && typeof threadId === 'string') {
-      const approvalVals = approvalPolicies.length ? approvalPolicies : [null]
-      const sandboxVals = sandboxes.length ? sandboxes : [null]
-      const paramVariants = []
-
-      for (const ap of approvalVals) {
-        for (const sb of sandboxVals) {
-          const baseA = {
-            threadId,
-            cwd: this.cwd,
-            ...(model ? { model } : {}),
-            ...(ap ? { approvalPolicy: ap } : {}),
-            ...(sb ? { sandbox: sb } : {})
-          }
-          if (reasoningEfforts.length) {
-            for (const re of reasoningEfforts) {
-              for (const ro of reasoningParamObjects(re)) paramVariants.push({ ...baseA, ...ro })
-            }
-          }
-          paramVariants.push(baseA)
-          // Older/alternate schema (best-effort): some builds used `id` instead of `threadId`.
-          const baseB = {
-            id: threadId,
-            cwd: this.cwd,
-            ...(model ? { model } : {}),
-            ...(ap ? { approvalPolicy: ap } : {}),
-            ...(sb ? { sandbox: sb } : {})
-          }
-          if (reasoningEfforts.length) {
-            for (const re of reasoningEfforts) {
-              for (const ro of reasoningParamObjects(re)) paramVariants.push({ ...baseB, ...ro })
-            }
-          }
-          paramVariants.push(baseB)
-        }
-      }
+      const paramVariants = buildResumeThreadAttempts({
+        threadId,
+        cwd: this.cwd,
+        model,
+        approvalPolicies,
+        sandboxes,
+        reasoningEfforts
+      })
 
       let resumeOk = false
       for (const params of paramVariants) {
@@ -450,39 +308,23 @@ export class CodexAppServerSession {
     }
 
     if (!effectiveThreadId) {
-      const approvalVals = approvalPolicies.length ? approvalPolicies : [null]
-      const sandboxVals = sandboxes.length ? sandboxes : [null]
       let startedOk = false
       let lastErr = null
-      for (const ap of approvalVals) {
-        for (const sb of sandboxVals) {
-          const base = {
-              ...(model ? { model } : {}),
-              cwd: this.cwd,
-              ...(ap ? { approvalPolicy: ap } : {}),
-              ...(sb ? { sandbox: sb } : {})
-          }
-
-          const attempts = []
-          if (reasoningEfforts.length) {
-            for (const re of reasoningEfforts) {
-              for (const ro of reasoningParamObjects(re)) attempts.push({ ...base, ...ro })
-            }
-          }
-          attempts.push(base)
-
-          for (const params of attempts) {
-            try {
-              threadRes = await this.rpc.sendRequest('thread/start', params)
-              startedOk = true
-              break
-            } catch (err) {
-              lastErr = err
-            }
-          }
-          if (startedOk) break
+      const attempts = buildStartThreadAttempts({
+        cwd: this.cwd,
+        model,
+        approvalPolicies,
+        sandboxes,
+        reasoningEfforts
+      })
+      for (const params of attempts) {
+        try {
+          threadRes = await this.rpc.sendRequest('thread/start', params)
+          startedOk = true
+          break
+        } catch (err) {
+          lastErr = err
         }
-        if (startedOk) break
       }
       if (!startedOk) throw lastErr ?? new Error('thread/start failed')
       effectiveThreadId = threadRes?.thread?.id ?? threadRes?.threadId ?? threadRes?.id ?? null
@@ -535,6 +377,7 @@ export class CodexAppServerSession {
       const tid = interruptTurnId
       const done = () => {
         if (this.activeTurnId !== tid) return
+        this.#flushAllOutputBuffers()
         const preview = this.#turnPreview()
         this.emit('turn.completed', {
           sessionId: this.sessionId,
@@ -543,7 +386,7 @@ export class CodexAppServerSession {
           ...(preview ? { preview } : {})
         })
         this.activeTurnId = null
-        this.turnText = ''
+        this.#resetTurnScopedState()
       }
       const timer = setTimeout(done, 1_500)
       timer.unref?.()
@@ -553,6 +396,9 @@ export class CodexAppServerSession {
   async stop() {
     // Best-effort graceful.
     await this.cancel()
+    this.#disposeWrappedNotifications()
+    this.#rejectPendingApprovals(new Error('session stopped'))
+    this.#flushAllOutputBuffers()
     this.rpc.stop({ signal: 'SIGTERM' })
   }
 
@@ -588,75 +434,19 @@ export class CodexAppServerSession {
     const sandboxes = sandboxCandidates(this.options?.sandbox)
     const sandboxPolicies = sandboxPolicyCandidates(this.options?.sandbox, this.cwd)
     const reasoningEfforts = reasoningEffortCandidates(this.options?.reasoningEffort)
-
-    const base = {
+    const attempts = buildStartTurnAttempts({
       threadId: this.threadId,
       cwd: this.cwd,
-      input: items
-    }
-
-    const approvalVals = approvalPolicies.length ? approvalPolicies : [null]
-    const sandboxPolicyVals = sandboxPolicies.length ? sandboxPolicies : [null]
-    const sandboxVals = sandboxes.length ? sandboxes : [null]
-
-    /** @type {any[]} */
-    const attempts = []
-
-    // Prefer the documented v2-style `sandboxPolicy`, but keep fallbacks for older schemas.
-    for (const ap of approvalVals) {
-      for (const sp of sandboxPolicyVals) {
-        const params = {
-          ...base,
-          ...(model ? { model } : {}),
-          ...(ap ? { approvalPolicy: ap } : {}),
-          ...(sp ? { sandboxPolicy: sp } : {})
-        }
-        if (reasoningEfforts.length) {
-          for (const re of reasoningEfforts) {
-            for (const ro of reasoningParamObjects(re)) attempts.push({ ...params, ...ro })
-          }
-        }
-        attempts.push(params)
-      }
-      for (const sb of sandboxVals) {
-        const params = {
-          ...base,
-          ...(model ? { model } : {}),
-          ...(ap ? { approvalPolicy: ap } : {}),
-          ...(sb ? { sandbox: sb } : {})
-        }
-        if (reasoningEfforts.length) {
-          for (const re of reasoningEfforts) {
-            for (const ro of reasoningParamObjects(re)) attempts.push({ ...params, ...ro })
-          }
-        }
-        attempts.push(params)
-      }
-    }
-
-    // Final fallback: no per-turn overrides.
-    const fallback = {
-      ...base,
-      ...(model ? { model } : {})
-    }
-    if (reasoningEfforts.length) {
-      for (const re of reasoningEfforts) {
-        for (const ro of reasoningParamObjects(re)) attempts.push({ ...fallback, ...ro })
-      }
-    }
-    attempts.push(fallback)
-
-    const seen = new Set()
-    const uniqueAttempts = []
-    for (const a of attempts) {
-      const key = JSON.stringify(a)
-      if (seen.has(key)) continue
-      seen.add(key)
-      uniqueAttempts.push(a)
-    }
+      input: items,
+      model,
+      approvalPolicies,
+      sandboxes,
+      sandboxPolicies,
+      reasoningEfforts
+    })
 
     let lastErr = null
-    for (const params of uniqueAttempts) {
+    for (const params of attempts) {
       try {
         await this.rpc.sendRequest('turn/start', params)
         return
@@ -700,11 +490,7 @@ export class CodexAppServerSession {
       const fromWrapped = Boolean(params?.__rgFromWrapped)
       if (!this.notificationMode) {
         this.notificationMode = 'direct'
-        if (this.pendingWrappedTimer) {
-          try { clearTimeout(this.pendingWrappedTimer) } catch { }
-          this.pendingWrappedTimer = null
-        }
-        this.pendingWrappedNotifications = []
+        this.#disposeWrappedNotifications()
       } else if (this.notificationMode === 'wrapped' && !fromWrapped) {
         return
       }
@@ -714,141 +500,24 @@ export class CodexAppServerSession {
     // real event discriminator lives in `params.msg.type`. Normalize a few common
     // ones back into the v2-style notification methods we already handle.
     if (typeof method === 'string' && method.startsWith('codex/event/')) {
-      const wrapped = params?.msg
-      const msgType = safeString(wrapped?.type)
-      if (!msgType) return
-
-      const turnId = safeString(wrapped?.turn_id ?? wrapped?.turnId)
-
-      if (msgType === 'item_started' || msgType === 'item_completed') {
-        const itemMethod = (msgType === 'item_started') ? 'item/started' : 'item/completed'
-        const item = wrapped?.item ?? null
-        const itemId = safeString(wrapped?.item_id ?? wrapped?.itemId ?? item?.id)
-        const threadId = safeString(wrapped?.thread_id ?? wrapped?.threadId)
-        this.#onNotification({
-          method: itemMethod,
-          params: {
-            __rgFromWrapped: true,
-            ...(item ? { item } : {}),
-            ...(itemId ? { itemId } : {}),
-            ...(threadId ? { threadId } : {}),
-            ...(turnId ? { turnId } : {})
-          }
-        })
+      const normalized = normalizeWrappedNotification({
+        method,
+        params,
+        sessionId: this.sessionId
+      })
+      if (!normalized || normalized.kind === 'ignore') return
+      if (normalized.kind === 'emit') {
+        this.emit(normalized.eventType, normalized.payload)
         return
       }
-
-      if (msgType === 'task_started' && turnId) {
-        this.#onNotification({ method: 'turn/started', params: { __rgFromWrapped: true, turn: { id: turnId } } })
-        return
-      }
-
-      if ((msgType === 'task_complete' || msgType === 'turn_complete') && turnId) {
-        this.#onNotification({ method: 'turn/completed', params: { __rgFromWrapped: true, turn: { id: turnId, status: 'completed' } } })
-        return
-      }
-
-      if (msgType === 'turn_aborted' && turnId) {
-        this.#onNotification({ method: 'turn/completed', params: { __rgFromWrapped: true, turn: { id: turnId, status: 'interrupted' } } })
-        return
-      }
-
-      if (msgType === 'task_failed' && turnId) {
-        const err = safeString(wrapped?.error ?? wrapped?.message ?? wrapped?.reason ?? wrapped?.error_message)
-        this.#onNotification({
-          method: 'turn/completed',
-          params: { __rgFromWrapped: true, turn: { id: turnId, status: 'failed', ...(err ? { error: { message: err } } : {}) } }
-        })
-        return
-      }
-
-      if (msgType === 'agent_message_delta' || msgType === 'agent_message_content_delta') {
-        const itemId = safeString(wrapped?.item_id ?? wrapped?.itemId ?? wrapped?.id) ?? 'agent-message'
-        const delta = safeString(wrapped?.delta ?? wrapped?.text ?? wrapped?.message)
-        if (!delta) return
-        this.#onNotification({ method: 'item/agentMessage/delta', params: { __rgFromWrapped: true, itemId, delta } })
-        return
-      }
-
-      if (msgType === 'reasoning_content_delta' || msgType === 'agent_reasoning_delta') {
-        const itemId = safeString(wrapped?.item_id ?? wrapped?.itemId ?? wrapped?.id) ?? 'reasoning'
-        const delta = safeString(wrapped?.delta ?? wrapped?.text ?? wrapped?.message)
-        if (!delta) return
-        const summaryIndex = wrapped?.summary_index ?? wrapped?.summaryIndex ?? null
-        this.#onNotification({
-          method: 'item/reasoning/summaryTextDelta',
-          params: {
-            __rgFromWrapped: true,
-            itemId,
-            delta,
-            ...(Number.isFinite(Number(summaryIndex)) ? { summaryIndex: Number(summaryIndex) } : {})
-          }
-        })
-        return
-      }
-
-      if (msgType === 'agent_reasoning_section_break') {
-        const itemId = safeString(wrapped?.item_id ?? wrapped?.itemId ?? wrapped?.id) ?? 'reasoning'
-        const summaryIndex = wrapped?.summary_index ?? wrapped?.summaryIndex ?? null
-        this.#onNotification({
-          method: 'item/reasoning/summaryPartAdded',
-          params: {
-            __rgFromWrapped: true,
-            itemId,
-            ...(Number.isFinite(Number(summaryIndex)) ? { summaryIndex: Number(summaryIndex) } : {})
-          }
-        })
-        return
-      }
-
-      if (msgType === 'token_count') {
-        const info = wrapped?.info ?? null
-        const rateLimits = wrapped?.rate_limits ?? wrapped?.rateLimits ?? null
-        this.emit('token.count', {
-          sessionId: this.sessionId,
-          ...(info ? { info } : {}),
-          ...(rateLimits ? { rateLimits } : {})
-        })
-        return
-      }
-
-      if (msgType === 'exec_command_output_delta') {
-        const itemId = safeString(wrapped?.call_id ?? wrapped?.callId ?? wrapped?.item_id ?? wrapped?.itemId ?? wrapped?.id)
-        const delta = safeString(wrapped?.delta ?? wrapped?.output ?? wrapped?.stdout ?? wrapped?.text)
-        if (!itemId || !delta) return
-        this.#onNotification({ method: 'item/commandExecution/outputDelta', params: { __rgFromWrapped: true, itemId, delta } })
-        return
-      }
-
-      if (msgType === 'error') {
-        const willRetry = Boolean(wrapped?.will_retry ?? wrapped?.willRetry)
-        const message = safeString(wrapped?.message)
-        this.#onNotification({ method: 'error', params: { __rgFromWrapped: true, willRetry, message } })
-        return
-      }
-
-      // Ignore unknown wrapped message types (best-effort).
+      for (const next of normalized.notifications ?? []) this.#onNotification(next)
       return
     }
 
     if (method === 'error') {
-      const willRetry = Boolean(params?.willRetry ?? params?.will_retry)
-      if (willRetry) return
-      const errorMessage = safeString(params?.error?.message ?? params?.message) ?? 'Unknown error'
-      const details = safeString(params?.error?.additionalDetails ?? params?.details)
-      const codexErrorInfo = params?.error?.codexErrorInfo ?? null
-      const extra = []
-      if (details) extra.push(details)
-      if (codexErrorInfo) {
-        try { extra.push(JSON.stringify(codexErrorInfo)) } catch { }
-      }
-      const text = `[codex] ${errorMessage}${extra.length ? `\n${extra.join('\n')}` : ''}\n`
-      this.emit('session.output', {
-        sessionId: this.sessionId,
-        seq: this.nextSeq(),
-        stream: 'stderr',
-        text
-      })
+      const text = buildCodexErrorOutputText(params)
+      if (!text) return
+      this.#bufferOutput({ stream: 'stderr', text })
       return
     }
 
@@ -861,11 +530,8 @@ export class CodexAppServerSession {
 
       this.activeTurnId = nextTurnId ?? this.activeTurnId ?? null
       this.lastTurnStartedId = this.activeTurnId
-      this.turnText = ''
-      this.lastNormalizedChunk = { text: null, tsMs: 0 }
-      this.lastReasoningChunk = { text: null, tsMs: 0 }
-      try { this.seenToolStarted.clear() } catch { }
-      try { this.seenToolCompleted.clear() } catch { }
+      this.#resetTurnScopedState()
+      this.#flushAllOutputBuffers()
       this.emit('turn.started', { sessionId: this.sessionId, ...(this.activeTurnId ? { turnId: this.activeTurnId } : {}) })
       return
     }
@@ -880,6 +546,7 @@ export class CodexAppServerSession {
       if (tid && tid === this.lastTurnCompletedId) return
       if (tid) this.lastTurnCompletedId = tid
 
+      this.#flushAllOutputBuffers()
       const preview = this.#turnPreview()
       this.emit('turn.completed', {
         sessionId: this.sessionId,
@@ -890,16 +557,12 @@ export class CodexAppServerSession {
       })
 
       if (status === 'failed' && errorMessage) {
-        this.emit('session.output', {
-          sessionId: this.sessionId,
-          seq: this.nextSeq(),
-          stream: 'stderr',
-          text: `[codex] Turn failed: ${errorMessage}\n`
-        })
+        this.#bufferOutput({ stream: 'stderr', text: `[codex] Turn failed: ${errorMessage}\n` })
+        this.#flushAllOutputBuffers()
       }
 
       this.activeTurnId = null
-      this.turnText = ''
+      this.#resetTurnScopedState()
       return
     }
 
@@ -912,31 +575,17 @@ export class CodexAppServerSession {
     }
 
     if (method === 'thread/tokenUsage/updated') {
-      const threadId = safeString(params?.threadId)
-      const turnId = safeString(params?.turnId)
-      const tokenUsage = params?.tokenUsage ?? null
-      this.emit('thread.tokenUsage.updated', {
+      this.emit('thread.tokenUsage.updated', buildThreadTokenUsageEvent({
         sessionId: this.sessionId,
-        ...(threadId ? { threadId } : {}),
-        ...(turnId ? { turnId } : {}),
-        ...(tokenUsage ? { tokenUsage } : {})
-      })
+        params
+      }))
       return
     }
 
     if (method === 'turn/plan/updated') {
-      const threadId = safeString(params?.threadId)
-      const turnId = safeString(params?.turnId)
-      const explanation = safeString(params?.explanation)
-      const plan = Array.isArray(params?.plan) ? params.plan : null
-      if (!plan) return
-      this.emit('plan.updated', {
-        sessionId: this.sessionId,
-        ...(threadId ? { threadId } : {}),
-        ...(turnId ? { turnId } : {}),
-        ...(explanation ? { explanation } : {}),
-        plan
-      })
+      const event = buildPlanUpdatedEvent({ sessionId: this.sessionId, params })
+      if (!event) return
+      this.emit('plan.updated', event)
       return
     }
 
@@ -955,12 +604,7 @@ export class CodexAppServerSession {
         if (this.#shouldDropNormalizedChunk(text)) return
 
         this.#appendTurnText(text)
-        this.emit('session.output', {
-          sessionId: this.sessionId,
-          seq: this.nextSeq(),
-          stream: 'normalized',
-          text
-        })
+        this.#bufferOutput({ stream: 'normalized', text })
       }
       return
     }
@@ -973,12 +617,7 @@ export class CodexAppServerSession {
       this.lastDeltaByKey.set(key, '1')
 
       if (this.#shouldDropReasoningChunk('\n\n')) return
-      this.emit('session.output', {
-        sessionId: this.sessionId,
-        seq: this.nextSeq(),
-        stream: 'reasoning',
-        text: '\n\n'
-      })
+      this.#bufferOutput({ stream: 'reasoning', text: '\n\n' })
       return
     }
 
@@ -997,12 +636,7 @@ export class CodexAppServerSession {
         if (this.lastDeltaByKey.get(key) === text) return
         this.lastDeltaByKey.set(key, text)
         if (this.#shouldDropReasoningChunk(text)) return
-        this.emit('session.output', {
-          sessionId: this.sessionId,
-          seq: this.nextSeq(),
-          stream: 'reasoning',
-          text
-        })
+        this.#bufferOutput({ stream: 'reasoning', text })
       }
       return
     }
@@ -1018,12 +652,7 @@ export class CodexAppServerSession {
         const key = `plan:${itemId ?? ''}`
         if (this.lastDeltaByKey.get(key) === text) return
         this.lastDeltaByKey.set(key, text)
-        this.emit('session.output', {
-          sessionId: this.sessionId,
-          seq: this.nextSeq(),
-          stream: 'plan',
-          text
-        })
+        this.#bufferOutput({ stream: 'plan', text })
       }
       return
     }
@@ -1040,13 +669,7 @@ export class CodexAppServerSession {
         if (this.lastDeltaByKey.get(key) === text) return
         this.lastDeltaByKey.set(key, text)
 
-        this.emit('session.output', {
-          sessionId: this.sessionId,
-          seq: this.nextSeq(),
-          stream: 'stdout',
-          text,
-          ...(itemId ? { itemId: safeString(itemId) } : {})
-        })
+        this.#bufferOutput({ stream: 'stdout', text, itemId: safeString(itemId) })
       }
       return
     }
@@ -1063,65 +686,27 @@ export class CodexAppServerSession {
         if (this.lastDeltaByKey.get(key) === text) return
         this.lastDeltaByKey.set(key, text)
 
-        this.emit('session.output', {
-          sessionId: this.sessionId,
-          seq: this.nextSeq(),
-          stream: 'stdout',
-          text,
-          ...(itemId ? { itemId: safeString(itemId) } : {})
-        })
+        this.#bufferOutput({ stream: 'stdout', text, itemId: safeString(itemId) })
       }
       return
     }
 
     if (method === 'item/commandExecution/terminalInteraction') {
-      const stdin = safeString(params?.stdin)
       const itemId = safeString(params?.itemId)
-      const text = `[codex] terminal interaction${itemId ? ` (${itemId})` : ''}${stdin ? `: ${stdin}` : ''}\n`
-      this.emit('session.output', {
-        sessionId: this.sessionId,
-        seq: this.nextSeq(),
-        stream: 'stderr',
-        text,
-        ...(itemId ? { itemId } : {})
-      })
+      const text = buildTerminalInteractionOutputText({ itemId, stdin: params?.stdin })
+      this.#bufferOutput({ stream: 'stderr', text, itemId })
       return
     }
 
     if (method === 'item/started') {
-      const item = params?.item ?? null
-      const type = normalizeItemType(item?.type)
-      const itemId = safeString(item?.id)
-      if (!type || !itemId) return
-
-      if (type === 'commandexecution') {
-        const key = `commandexecution:${itemId}`
-        if (this.seenToolStarted.has(key)) return
-        this.seenToolStarted.add(key)
-        this.emit('tool.started', {
-          sessionId: this.sessionId,
-          tool: 'commandExecution',
-          itemId,
-          command: item.command,
-          cwd: item.cwd,
-          commandActions: item.commandActions ?? null,
-          status: item.status ?? null
-        })
-      }
-
-      if (type === 'filechange') {
-        const key = `filechange:${itemId}`
-        if (this.seenToolStarted.has(key)) return
-        this.seenToolStarted.add(key)
-        this.emit('tool.started', {
-          sessionId: this.sessionId,
-          tool: 'fileChange',
-          itemId,
-          changes: minimizeFileChanges(item.changes),
-          status: item.status ?? null
-        })
-      }
-
+      const started = buildToolStartedEvent({
+        sessionId: this.sessionId,
+        item: params?.item ?? null
+      })
+      if (!started) return
+      if (this.seenToolStarted.has(started.dedupeKey)) return
+      this.seenToolStarted.add(started.dedupeKey)
+      this.emit('tool.started', started.payload)
       return
     }
 
@@ -1137,12 +722,7 @@ export class CodexAppServerSession {
           if (text) {
             if (this.#shouldDropNormalizedChunk(text)) return
             this.#appendTurnText(text)
-            this.emit('session.output', {
-              sessionId: this.sessionId,
-              seq: this.nextSeq(),
-              stream: 'normalized',
-              text
-            })
+            this.#bufferOutput({ stream: 'normalized', text })
           }
         }
       }
@@ -1153,12 +733,7 @@ export class CodexAppServerSession {
           const text = tryExtractReasoningText(item)
           if (text) {
             if (this.#shouldDropReasoningChunk(text)) return
-            this.emit('session.output', {
-              sessionId: this.sessionId,
-              seq: this.nextSeq(),
-              stream: 'reasoning',
-              text
-            })
+            this.#bufferOutput({ stream: 'reasoning', text })
           }
         }
       }
@@ -1168,54 +743,24 @@ export class CodexAppServerSession {
         if (!sawDelta) {
           const text = tryExtractPlanText(item)
           if (text) {
-            this.emit('session.output', {
-              sessionId: this.sessionId,
-              seq: this.nextSeq(),
-              stream: 'plan',
-              text
-            })
+            this.#bufferOutput({ stream: 'plan', text })
           }
         }
       }
 
-      if (type === 'commandexecution') {
+      if (type === 'commandexecution' || type === 'filechange') {
         const tid = safeString(itemId)
         const sawOutput = tid ? (this.itemState.get(tid)?.sawDelta ?? false) : false
-        const key = tid ? `commandexecution:${tid}` : null
-        if (key) {
-          if (this.seenToolCompleted.has(key)) return
-          this.seenToolCompleted.add(key)
-        }
-        this.emit('tool.completed', {
+        const completed = buildToolCompletedEvent({
           sessionId: this.sessionId,
-          tool: 'commandExecution',
-          itemId: tid,
-          command: item.command,
-          cwd: item.cwd,
-          commandActions: item.commandActions ?? null,
-          status: item.status ?? null,
-          exitCode: item.exitCode ?? null,
-          hadOutput: sawOutput,
-          durationMs: item.durationMs ?? null
-        })
-      }
-
-      if (type === 'filechange') {
-        const tid = safeString(itemId)
-        const sawOutput = tid ? (this.itemState.get(tid)?.sawDelta ?? false) : false
-        const key = tid ? `filechange:${tid}` : null
-        if (key) {
-          if (this.seenToolCompleted.has(key)) return
-          this.seenToolCompleted.add(key)
-        }
-        this.emit('tool.completed', {
-          sessionId: this.sessionId,
-          tool: 'fileChange',
-          itemId: tid,
-          changes: minimizeFileChanges(item.changes),
-          status: item.status ?? null,
+          item,
           hadOutput: sawOutput
         })
+        if (!completed) return
+        if (this.seenToolCompleted.has(completed.dedupeKey)) return
+        this.seenToolCompleted.add(completed.dedupeKey)
+        this.#flushOutputBuffersForItem(completed.itemId)
+        this.emit('tool.completed', completed.payload)
       }
       return
     }
@@ -1228,50 +773,19 @@ export class CodexAppServerSession {
     const { method, params } = req
 
     // Codex-managed approvals
-    if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
+    if (isApprovalRequestMethod(method)) {
       const approvalId = crypto.randomUUID()
-      const kind = method.includes('commandExecution') ? 'command' : 'fileChange'
-
-      const itemId = params?.itemId ?? params?.item?.id ?? null
-      const threadId = params?.threadId ?? null
-      const turnId = params?.turnId ?? null
-      const approvalCallbackId = params?.approvalId ?? null
-
-      const reason = params?.reason ?? params?.prompt ?? null
-      const command = params?.command ?? params?.item?.command ?? null
-      const cwd = params?.cwd ?? this.cwd ?? null
-
-      const availableDecisions = params?.availableDecisions ?? null
-      const additionalPermissions = params?.additionalPermissions ?? null
-      const commandActions = params?.commandActions ?? null
-      const proposedExecpolicyAmendment = params?.proposedExecpolicyAmendment ?? null
-      const proposedNetworkPolicyAmendments = params?.proposedNetworkPolicyAmendments ?? null
-      const networkApprovalContext = params?.networkApprovalContext ?? null
-      const grantRoot = params?.grantRoot ?? null
-
       const decisionP = new Promise((resolve, reject) => {
         this.pendingApprovals.set(approvalId, { resolve, reject })
       })
 
-      this.emit('approval.request', {
+      this.emit('approval.request', buildApprovalRequestEvent({
         approvalId,
         sessionId: this.sessionId,
-        kind,
-        ...(itemId ? { itemId } : {}),
-        ...(threadId ? { threadId } : {}),
-        ...(turnId ? { turnId } : {}),
-        ...(approvalCallbackId ? { approvalCallbackId } : {}),
-        ...(reason ? { reason } : {}),
-        ...(command ? { command } : {}),
-        ...(cwd ? { cwd } : {}),
-        ...(grantRoot ? { grantRoot } : {}),
-        ...(availableDecisions ? { availableDecisions } : {}),
-        ...(additionalPermissions ? { additionalPermissions } : {}),
-        ...(commandActions ? { commandActions } : {}),
-        ...(proposedExecpolicyAmendment ? { proposedExecpolicyAmendment } : {}),
-        ...(proposedNetworkPolicyAmendments ? { proposedNetworkPolicyAmendments } : {}),
-        ...(networkApprovalContext ? { networkApprovalContext } : {})
-      })
+        cwd: this.cwd,
+        method,
+        params
+      }))
 
       // Wait for host/UI decision.
       return await decisionP
@@ -1283,28 +797,19 @@ export class CodexAppServerSession {
     //   "item/tool/requestUserInput"
     //
     // Docs may also refer to it without the leading "item/" prefix.
-    if (method === 'item/tool/requestUserInput' || method === 'tool/requestUserInput') {
+    if (isUserInputRequestMethod(method)) {
       const approvalId = crypto.randomUUID()
-
-      const questions = Array.isArray(params?.questions) ? params.questions : []
-      const itemId = params?.itemId ?? null
-      const threadId = params?.threadId ?? null
-      const turnId = params?.turnId ?? null
 
       const responseP = new Promise((resolve, reject) => {
         this.pendingApprovals.set(approvalId, { resolve, reject })
       })
 
-      this.emit('approval.request', {
+      this.emit('approval.request', buildUserInputRequestEvent({
         approvalId,
         sessionId: this.sessionId,
-        kind: 'userInput',
-        ...(itemId ? { itemId } : {}),
-        ...(threadId ? { threadId } : {}),
-        ...(turnId ? { turnId } : {}),
-        questions,
-        ...(this.cwd ? { cwd: this.cwd } : {})
-      })
+        cwd: this.cwd,
+        params
+      }))
 
       return await responseP
     }

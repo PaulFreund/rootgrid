@@ -65,6 +65,11 @@ See: `docs/reverse-proxy.md`.
 
 - `rootgrid setup`: interactive wizard (prereqs, optional installs, autostart, runner + host/upstream config). See `docs/setup.md`.
 
+## Dev checks
+
+- `npm test`
+- `npm run build`
+
 ---
 
 ## Web UI (planned)

@@ -123,6 +123,7 @@ export class AuthService {
 
     res.statusCode = 200
     res.setHeader('Content-Type', 'application/json; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-store')
     const secure = this.isSecureRequest(req)
     res.setHeader('Set-Cookie', [
       `rootgrid_session=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(this.ttlMs / 1000)}${secure ? '; Secure' : ''}`
@@ -130,9 +131,21 @@ export class AuthService {
     res.end(JSON.stringify({ ok: true }))
   }
 
+  handleLogout(req, res) {
+    res.statusCode = 200
+    res.setHeader('Content-Type', 'application/json; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-store')
+    const secure = this.isSecureRequest(req)
+    res.setHeader('Set-Cookie', [
+      `rootgrid_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT${secure ? '; Secure' : ''}`
+    ])
+    res.end(JSON.stringify({ ok: true }))
+  }
+
   #unauthorized(res) {
     res.statusCode = 401
     res.setHeader('Content-Type', 'application/json; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-store')
     res.end(JSON.stringify({ error: 'unauthorized' }))
     return false
   }
@@ -140,6 +153,7 @@ export class AuthService {
   #badRequest(res, msg) {
     res.statusCode = 400
     res.setHeader('Content-Type', 'application/json; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-store')
     res.end(JSON.stringify({ error: msg }))
     return false
   }
