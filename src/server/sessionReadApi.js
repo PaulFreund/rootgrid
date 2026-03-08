@@ -10,6 +10,26 @@ function hasSessionInput(events) {
   return Array.isArray(events) && events.some((event) => event?.type === 'session.input')
 }
 
+function collectTurnIds(events) {
+  const out = new Set()
+  for (const event of Array.isArray(events) ? events : []) {
+    const turnId = String(event?.payload?.turnId ?? '').trim()
+    if (!turnId) continue
+    if (event?.type === 'turn.started' || event?.type === 'turn.completed') out.add(turnId)
+  }
+  return Array.from(out)
+}
+
+function buildReasoningTurnHints(store, sessionId, events) {
+  const turnIds = collectTurnIds(events)
+  if (!turnIds.length) return []
+  try {
+    return store.listTurnsWithReasoning(sessionId, turnIds)
+  } catch {
+    return []
+  }
+}
+
 export function buildSessionBootstrapPayload(
   store,
   sessionId,
@@ -55,6 +75,7 @@ export function buildSessionBootstrapPayload(
     events,
     hasMoreBefore,
     nextBeforeSeq,
+    reasoningTurnIds: buildReasoningTurnHints(store, sessionId, events),
     containsInput: hasSessionInput(events),
     pagesFetched
   }
@@ -148,7 +169,8 @@ export function createSessionReadApi({
           json(res, 200, {
             events: page.events,
             hasMoreAfter: page.hasMoreAfter,
-            nextAfterSeq: page.newestSeq
+            nextAfterSeq: page.newestSeq,
+            reasoningTurnIds: buildReasoningTurnHints(store, sessionId, page.events)
           })
           return true
         }
@@ -161,7 +183,8 @@ export function createSessionReadApi({
         json(res, 200, {
           events: page.events,
           hasMoreBefore: page.hasMoreBefore,
-          nextBeforeSeq: page.oldestSeq
+          nextBeforeSeq: page.oldestSeq,
+          reasoningTurnIds: buildReasoningTurnHints(store, sessionId, page.events)
         })
         return true
       }
@@ -173,9 +196,13 @@ export function createSessionReadApi({
         if (!getSessionOr404(res, sessionId)) return true
 
         const maxCharsRaw = url.searchParams.get('maxChars')
+        const metaOnly = url.searchParams.get('meta') === '1'
         const maxChars = maxCharsRaw ? Number.parseInt(String(maxCharsRaw), 10) : 400_000
 
-        const out = store.getTurnReasoningSections(sessionId, turnId, { maxChars })
+        const out = store.getTurnReasoningSections(sessionId, turnId, {
+          maxChars,
+          includeBody: !metaOnly
+        })
         if (!out) {
           json(res, 404, { error: 'not found' })
           return true

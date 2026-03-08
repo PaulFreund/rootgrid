@@ -240,3 +240,61 @@ test('buildChatMessages keeps active assistant output above the Thinking row', (
   assert.equal(messages[2].title, 'Thinking')
   assert.equal(messages[2].active, true)
 })
+
+test('buildChatMessages interleaves live reasoning chunks with command steps by seq', () => {
+  const store = createSessionStoreState()
+  store.currentTurnId = 'turn-live'
+
+  store.events.push(
+    {
+      eventId: 'u-1',
+      type: 'session.input',
+      payload: { text: 'Inspect project', attachments: [] }
+    },
+    {
+      eventId: 't-1',
+      type: 'turn.started',
+      seq: 1,
+      tsMs: 1,
+      payload: { turnId: 'turn-live' }
+    },
+    {
+      eventId: 'r-1',
+      type: 'session.output',
+      seq: 2,
+      tsMs: 2,
+      payload: { stream: 'reasoning', text: 'Looking for the relevant files.\n' }
+    },
+    {
+      eventId: 'c-1',
+      type: 'tool.completed',
+      seq: 3,
+      tsMs: 3,
+      payload: {
+        tool: 'CommandExecution',
+        itemId: 'read-1',
+        status: 'completed',
+        commandActions: [{ type: 'read', name: 'README.md', path: 'README.md', command: 'cat README.md' }]
+      }
+    },
+    {
+      eventId: 'r-2',
+      type: 'session.output',
+      seq: 4,
+      tsMs: 4,
+      payload: { stream: 'reasoning', text: 'Now I know where to make the change.' }
+    }
+  )
+
+  const messages = buildChatMessages(store)
+  assert.equal(messages.length, 2)
+  assert.equal(messages[1].stepKind, 'background')
+  assert.equal(messages[1].active, true)
+  assert.deepEqual(
+    messages[1].timeline.map((it) => it.kind),
+    ['reasoningText', 'explore', 'reasoningText']
+  )
+  assert.match(messages[1].timeline[0].text, /Looking for the relevant files/)
+  assert.equal(messages[1].timeline[1].label, 'Read README.md')
+  assert.match(messages[1].timeline[2].text, /Now I know where to make the change/)
+})

@@ -28,7 +28,7 @@ function buildSessionEventFilter({ sessionId, beforeSeq = null, afterSeq = null,
   return { clauses, params }
 }
 
-function buildReasoningSections(parsedSections, segments, fallbackStartSeq) {
+function buildReasoningSections(parsedSections, segments, fallbackStartSeq, { includeBody = true } = {}) {
   let segIdx = 0
   return (Array.isArray(parsedSections) ? parsedSections : []).map((section, idx) => {
     const startIndex = Number(section?.startIndex) || 0
@@ -40,8 +40,8 @@ function buildReasoningSections(parsedSections, segments, fallbackStartSeq) {
     return {
       id: `r-${idx + 1}`,
       title: section.title,
-      body: section.body,
       startSeq,
+      ...(includeBody ? { body: section.body } : {}),
       ...(tsMs ? { tsMs } : {})
     }
   })
@@ -118,6 +118,49 @@ export function listItemOutputEvents(db, sessionId, itemId, { beforeSeq = null, 
   return { events, hasMoreBefore, oldestSeq }
 }
 
+export function listTurnsWithReasoning(db, { sessionId, turnIds, lastSeq = null } = {}) {
+  const ids = Array.from(new Set((Array.isArray(turnIds) ? turnIds : [])
+    .map((turnId) => String(turnId ?? '').trim())
+    .filter(Boolean)))
+  if (!ids.length) return []
+
+  const placeholders = ids.map(() => '?').join(', ')
+  const endSeqFallback = Number.isFinite(Number(lastSeq)) && Number(lastSeq) > 0
+    ? Number(lastSeq)
+    : Number.MAX_SAFE_INTEGER
+
+  const rows = db.prepare(`
+    WITH starts AS (
+      SELECT json_extract(payload_json, '$.turnId') AS turn_id, seq AS start_seq
+      FROM events
+      WHERE session_id=? AND type='turn.started' AND json_extract(payload_json, '$.turnId') IN (${placeholders})
+    ),
+    completions AS (
+      SELECT json_extract(payload_json, '$.turnId') AS turn_id, MAX(seq) AS end_seq
+      FROM events
+      WHERE session_id=? AND type='turn.completed' AND json_extract(payload_json, '$.turnId') IN (${placeholders})
+      GROUP BY 1
+    )
+    SELECT s.turn_id
+    FROM starts s
+    LEFT JOIN completions c ON c.turn_id = s.turn_id
+    WHERE EXISTS (
+      SELECT 1
+      FROM events e
+      WHERE e.session_id=?
+        AND e.type='session.output'
+        AND e.stream='reasoning'
+        AND e.seq >= s.start_seq
+        AND e.seq <= COALESCE(c.end_seq, ?)
+      LIMIT 1
+    )
+  `).all(sessionId, ...ids, sessionId, ...ids, sessionId, endSeqFallback)
+
+  return rows
+    .map((row) => String(row?.turn_id ?? '').trim())
+    .filter(Boolean)
+}
+
 export function getTurnSeqRange(db, sessionId, turnId) {
   const tid = String(turnId ?? '').trim()
   if (!tid) return null
@@ -172,7 +215,7 @@ export function getTurnReasoningText(db, { sessionId, turnId, lastSeq = null, ma
   }
 }
 
-export function getTurnReasoningSections(db, { sessionId, turnId, lastSeq = null, maxChars = 400_000 } = {}) {
+export function getTurnReasoningSections(db, { sessionId, turnId, lastSeq = null, maxChars = 400_000, includeBody = true } = {}) {
   const range = getTurnSeqRange(db, sessionId, turnId)
   if (!range) return null
 
@@ -195,6 +238,6 @@ export function getTurnReasoningSections(db, { sessionId, turnId, lastSeq = null
     startSeq: range.startSeq,
     endSeq,
     truncated,
-    sections: buildReasoningSections(parsed, segments, range.startSeq)
+    sections: buildReasoningSections(parsed, segments, range.startSeq, { includeBody })
   }
 }

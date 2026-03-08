@@ -247,11 +247,14 @@ function exploreCountKey(action) {
   return null
 }
 
-function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, commandCalls }) {
+function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, commandCalls, reasoningChunks }) {
   const calls = Array.isArray(exploreCalls) ? exploreCalls : []
   const commands = Array.isArray(commandCalls) ? commandCalls : []
+  const rawReasoningChunks = Array.isArray(reasoningChunks) ? reasoningChunks : []
   const reasoningLoaded = Boolean(reasoningState?.loaded)
-  const reasoningSections = (reasoningLoaded && Array.isArray(reasoningState?.sections)) ? reasoningState.sections : []
+  const reasoningSections = rawReasoningChunks.length
+    ? []
+    : ((reasoningLoaded && Array.isArray(reasoningState?.sections)) ? reasoningState.sections : [])
   const items = []
 
   for (const section of reasoningSections) {
@@ -267,6 +270,21 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, commandCall
       seq: Number.isFinite(seq) ? seq : null,
       tsMs: Number.isFinite(tsMs) ? tsMs : null,
       section
+    })
+  }
+
+  for (const chunk of rawReasoningChunks) {
+    if (!chunk) continue
+    const text = String(chunk.text ?? '')
+    if (!text.trim()) continue
+    const seq = Number(chunk.seq ?? NaN)
+    const tsMs = Number(chunk.tsMs ?? NaN)
+    items.push({
+      kind: 'reasoningChunk',
+      id: `reasoning-live-${String(chunk.id ?? items.length + 1)}`,
+      seq: Number.isFinite(seq) ? seq : null,
+      tsMs: Number.isFinite(tsMs) ? tsMs : null,
+      text
     })
   }
 
@@ -322,6 +340,10 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, commandCall
   const merged = []
   for (const item of ordered) {
     const prev = merged.length ? merged[merged.length - 1] : null
+    if (prev?.kind === 'reasoningChunk' && item.kind === 'reasoningChunk') {
+      prev.text += item.text
+      continue
+    }
     if (readsOnly(prev) && readsOnly(item)) {
       prev.actions.push(...item.actions)
       continue
@@ -338,6 +360,14 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, commandCall
   }
 
   for (const item of merged) {
+    if (item.kind === 'reasoningChunk') {
+      out.push({
+        kind: 'reasoningText',
+        id: item.id,
+        text: item.text
+      })
+      continue
+    }
     if (item.kind === 'reasoning') {
       out.push({ kind: 'reasoning', id: item.id, section: item.section })
       continue
@@ -633,6 +663,10 @@ function buildChatMessagesSlow(store) {
     for (const turnId of store?.turnHasReasoningLive ?? []) reasoningTurnIds.add(String(turnId))
   } catch {
   }
+  try {
+    for (const turnId of store?.turnHasReasoningHistory ?? []) reasoningTurnIds.add(String(turnId))
+  } catch {
+  }
 
   let activeTurnId = null
   const turnStateById = new Map()
@@ -668,8 +702,9 @@ function buildChatMessagesSlow(store) {
       exploreListKeys: new Set(),
       exploreCalls: [],
       exploreActiveItemIds: new Set(),
-      exploreSeenItemIds: new Set(),
-      commandByItemId: new Map()
+        exploreSeenItemIds: new Set(),
+      commandByItemId: new Map(),
+      reasoningChunks: []
     }
     turnStateById.set(key, state)
     return state
@@ -754,6 +789,21 @@ function buildChatMessagesSlow(store) {
     if (event.type === 'session.output') {
       const stream = event.payload?.stream ?? 'normalized'
       const text = event.payload?.text ?? ''
+      if (stream === 'reasoning') {
+        const turnId = String(activeTurnId ?? '').trim()
+        if (turnId) {
+          const state = ensureTurnBackgroundMessage(turnId)
+          if (state && String(text ?? '').trim()) {
+            state.reasoningChunks.push({
+              id: event.eventId,
+              text: String(text ?? ''),
+              seq: event.seq ?? null,
+              tsMs: event.tsMs ?? null
+            })
+          }
+        }
+        continue
+      }
       if (stream === 'normalized') {
         ensureAssistant(currentAssistant?.id ?? event.eventId).text += text
       } else if ((stream === 'stderr' || stream === 'stdout') && !event.payload?.itemId) {
@@ -913,7 +963,8 @@ function buildChatMessagesSlow(store) {
       ? buildTurnBackgroundTimeline({
           exploreCalls: state.exploreCalls,
           reasoningState,
-          commandCalls
+          commandCalls,
+          reasoningChunks: state.reasoningChunks
         })
       : null
     return true

@@ -18,7 +18,8 @@ import {
   listItemOutputEvents as listItemOutputEventsQuery,
   listSessionEvents as listSessionEventsQuery,
   listSessionEventsAfter as listSessionEventsAfterQuery,
-  listSessionEventsPage as listSessionEventsPageQuery
+  listSessionEventsPage as listSessionEventsPageQuery,
+  listTurnsWithReasoning as listTurnsWithReasoningQuery
 } from './storeEvents.js'
 import {
   buildCreateSessionRow,
@@ -766,6 +767,21 @@ export class Store {
   }
 
   /**
+   * Return turn ids that have persisted reasoning output.
+   *
+   * @param {string} sessionId
+   * @param {string[]} turnIds
+   */
+  listTurnsWithReasoning(sessionId, turnIds) {
+    const session = this.getSession(sessionId)
+    return listTurnsWithReasoningQuery(this.db, {
+      sessionId,
+      turnIds,
+      lastSeq: session ? Number(session.lastSeq) || null : null
+    })
+  }
+
+  /**
    * Resolve a turn's seq range so clients can fetch turn-scoped details on demand
    * (e.g. reasoning text).
    *
@@ -800,15 +816,16 @@ export class Store {
    *
    * @param {string} sessionId
    * @param {string} turnId
-   * @param {{ maxChars?: number }} [opts]
+   * @param {{ maxChars?: number, includeBody?: boolean }} [opts]
    */
-  getTurnReasoningSections(sessionId, turnId, { maxChars = 400_000 } = {}) {
+  getTurnReasoningSections(sessionId, turnId, { maxChars = 400_000, includeBody = true } = {}) {
     const session = this.getSession(sessionId)
     return getTurnReasoningSectionsQuery(this.db, {
       sessionId,
       turnId,
       lastSeq: session ? Number(session.lastSeq) || null : null,
-      maxChars
+      maxChars,
+      includeBody
     })
   }
 

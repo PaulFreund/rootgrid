@@ -72,6 +72,7 @@ import {
   appendToolOutput as appendToolOutputHelper,
   backfillSessionAfter as backfillSessionAfterHelper,
   ensureToolOutputLoaded as ensureToolOutputLoadedHelper,
+  ensureTurnReasoningBodyLoaded as ensureTurnReasoningBodyLoadedHelper,
   ensureTurnReasoningLoaded as ensureTurnReasoningLoadedHelper,
   loadMoreSessionHistoryBefore as loadMoreSessionHistoryBeforeHelper,
   loadMoreToolOutputBefore as loadMoreToolOutputBeforeHelper,
@@ -128,6 +129,7 @@ const machineRowsById = reactive(new Map())
 const sessionRowsById = reactive(new Map())
 const selectedSessionId = ref(null)
 const hasSnapshot = ref(false)
+const activeThinkingLabelChars = Array.from('Thinking...')
 const sessionListScrollEl = ref(null)
 const sessionListScrollTop = ref(0)
 const sessionListViewportHeight = ref(720)
@@ -637,6 +639,16 @@ async function ensureTurnReasoningLoaded(sessionId, turnId) {
   })
 }
 
+async function ensureTurnReasoningBodyLoaded(sessionId, turnId) {
+  await ensureTurnReasoningBodyLoadedHelper({
+    apiFetch,
+    getSessionStore,
+    parseReasoningSections,
+    sessionId,
+    turnId
+  })
+}
+
 function setBackgroundExpanded(turnId, open) {
   const sid = selectedSessionId.value
   if (!sid || !turnId) return
@@ -653,6 +665,14 @@ function toggleBackgroundExpanded(message) {
   const turnId = String(message?.turnId ?? '').trim()
   if (!turnId || message?.active) return
   setBackgroundExpanded(turnId, !Boolean(message?.expanded))
+}
+
+function onReasoningSectionToggle(turnId, ev) {
+  const sid = selectedSessionId.value
+  if (!sid || !turnId) return
+  const open = Boolean(ev?.target?.open)
+  if (!open) return
+  ensureTurnReasoningBodyLoaded(sid, turnId).catch(() => {})
 }
 
 function toolDisplayCommand(m) {
@@ -1678,7 +1698,10 @@ watch(
                   v-for="m in chatMessages"
                   :key="m.id"
                   class="flex"
-                  :class="m.role === 'user' ? 'justify-end' : 'justify-start'"
+                  :class="[
+                    m.role === 'user' ? 'justify-end' : 'justify-start',
+                    (m.stepKind === 'background' && m.active) ? '-mt-2' : ''
+                  ]"
                 >
                   <!-- Interleaved "step lines" (reasoning sections + tools) -->
                   <div v-if="m.role === 'step'" class="w-full">
@@ -1693,10 +1716,26 @@ watch(
 
                         <div v-if="Array.isArray(m.timeline) && m.timeline.length" class="space-y-2">
                           <template v-for="it in m.timeline" :key="it.id">
-                            <details v-if="it.kind === 'reasoning'" class="group">
+                            <div
+                              v-if="it.kind === 'reasoningText'"
+                              class="whitespace-pre-wrap text-sm leading-7 text-slate-700"
+                            >
+                              {{ it.text }}
+                            </div>
+                            <details
+                              v-else-if="it.kind === 'reasoning'"
+                              class="group"
+                              @toggle="onReasoningSectionToggle(m.turnId, $event)"
+                            >
                               <summary class="cursor-pointer select-none truncate text-xs font-medium text-slate-700 hover:text-slate-900">
                                 {{ it.section?.title || 'Reasoning' }}
                               </summary>
+                              <div
+                                v-if="m.reasoning?.loadingBody && !String(it.section?.body ?? '').trim()"
+                                class="mt-2 border-l border-slate-200 pl-4 text-xs text-slate-500"
+                              >
+                                Loading reasoning…
+                              </div>
                               <div v-if="String(it.section?.body ?? '').trim()" class="mt-2 border-l border-slate-200 pl-4">
                                 <MarkdownView :source="it.section.body" />
                               </div>
@@ -1772,12 +1811,19 @@ watch(
 
                       <button
                         type="button"
-                        class="flex w-full items-center gap-2 text-left text-xs font-medium text-slate-700 transition-colors hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                        class="flex w-full items-center gap-2 text-left text-sm font-semibold leading-7 text-slate-700 transition-colors hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
                         :class="m.active ? 'cursor-default' : 'cursor-pointer'"
                         @click="toggleBackgroundExpanded(m)"
                       >
                         <span>
-                          {{ m.title || 'Thinking' }}<span v-if="m.active" class="rg-thinking-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+                          <span v-if="m.active" class="rg-thinking-rainbow" aria-label="Thinking...">
+                            <span
+                              v-for="(ch, idx) in activeThinkingLabelChars"
+                              :key="`thinking-char-${idx}`"
+                              :style="{ '--rg-letter-index': idx }"
+                            >{{ ch }}</span>
+                          </span>
+                          <span v-else>{{ m.title || 'Thinking' }}</span>
                         </span>
                         <span v-if="!m.active" class="ml-auto inline-flex items-center text-slate-400 opacity-0 transition-opacity group-hover:opacity-100">
                           <ChevronUp v-if="m.expanded" class="h-3.5 w-3.5" />

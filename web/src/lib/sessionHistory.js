@@ -158,6 +158,8 @@ export function getTurnReasoningState(store, turnId) {
     state = reactive({
       loading: false,
       loaded: false,
+      loadingBody: false,
+      bodyLoaded: false,
       error: '',
       truncated: false,
       sections: []
@@ -184,6 +186,50 @@ export async function ensureTurnReasoningLoaded({
   st.loading = true
   st.error = ''
   try {
+    const res = await apiFetch(`/api/sessions/${sid}/turns/${encodeURIComponent(tid)}/reasoning?maxChars=400000&meta=1`)
+    const data = await res.json().catch(() => null)
+    if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+
+    const sections = Array.isArray(data?.sections) ? data.sections : null
+    if (sections) {
+      st.sections = sections
+    } else {
+      const text = String(data?.text ?? '')
+      st.sections = parseReasoningSections(text).map((section) => ({
+        ...section,
+        body: null
+      }))
+    }
+    st.truncated = Boolean(data?.truncated)
+    st.loaded = true
+    st.bodyLoaded = false
+    if (st.sections.length) store.turnHasReasoningHistory.add(tid)
+    store.messageViewVersion = Number(store.messageViewVersion ?? 0) + 1
+  } catch (err) {
+    st.error = String(err?.message ?? err)
+    store.messageViewVersion = Number(store.messageViewVersion ?? 0) + 1
+  } finally {
+    st.loading = false
+  }
+}
+
+export async function ensureTurnReasoningBodyLoaded({
+  apiFetch,
+  getSessionStore,
+  parseReasoningSections,
+  sessionId,
+  turnId
+}) {
+  const sid = String(sessionId ?? '').trim()
+  const tid = String(turnId ?? '').trim()
+  if (!sid || !tid) return
+  const store = getSessionStore(sid)
+  const st = getTurnReasoningState(store, tid)
+  if (!st || st.loadingBody || st.bodyLoaded) return
+
+  st.loadingBody = true
+  st.error = ''
+  try {
     const res = await apiFetch(`/api/sessions/${sid}/turns/${encodeURIComponent(tid)}/reasoning?maxChars=400000`)
     const data = await res.json().catch(() => null)
     if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
@@ -197,12 +243,14 @@ export async function ensureTurnReasoningLoaded({
     }
     st.truncated = Boolean(data?.truncated)
     st.loaded = true
+    st.bodyLoaded = true
+    if (st.sections.length) store.turnHasReasoningHistory.add(tid)
     store.messageViewVersion = Number(store.messageViewVersion ?? 0) + 1
   } catch (err) {
     st.error = String(err?.message ?? err)
     store.messageViewVersion = Number(store.messageViewVersion ?? 0) + 1
   } finally {
-    st.loading = false
+    st.loadingBody = false
   }
 }
 
@@ -241,6 +289,7 @@ export function resetSessionStoreState(store) {
   store.planExplanation = null
   store.currentTurnId = null
   store.turnHasReasoningLive.clear()
+  store.turnHasReasoningHistory.clear()
   store.turnHasReasoningTokens.clear()
   store.backgroundExpandedByTurnId.clear()
   store.reasoningByTurnId.clear()
@@ -269,6 +318,20 @@ export function getSessionStoreLoadedSeq(store) {
   return maxSeq
 }
 
+export function applyTurnReasoningHints(store, turnIds) {
+  const ids = Array.isArray(turnIds) ? turnIds : []
+  let changed = false
+  for (const turnId of ids) {
+    const key = String(turnId ?? '').trim()
+    if (!key) continue
+    if (store.turnHasReasoningHistory.has(key)) continue
+    store.turnHasReasoningHistory.add(key)
+    changed = true
+  }
+  if (changed) store.messageViewVersion = Number(store.messageViewVersion ?? 0) + 1
+  return changed
+}
+
 export function shouldReuseSessionHistory(store, sessionRow) {
   if (!store || !store.historyLoaded) return false
   const knownSeq = getSessionStoreLoadedSeq(store)
@@ -286,9 +349,13 @@ export function shouldBackfillSessionHistory(store, sessionRow) {
 
 function applySessionEventsPage({
   events,
+  reasoningTurnIds = [],
   sessionId,
-  addSessionEvent
+  addSessionEvent,
+  getSessionStore
 }) {
+  const store = getSessionStore(sessionId)
+  applyTurnReasoningHints(store, reasoningTurnIds)
   const list = Array.isArray(events) ? events : []
   for (const event of list) {
     addSessionEvent({
@@ -370,6 +437,7 @@ export async function loadMoreSessionHistoryBefore({
       if (!res.ok) break
       const page = await res.json().catch(() => null)
       const events = Array.isArray(page?.events) ? page.events : []
+      applyTurnReasoningHints(store, page?.reasoningTurnIds)
 
       const toAdd = []
       for (const ev of events) {
@@ -450,8 +518,10 @@ export async function loadSessionHistory({
     if (Array.isArray(data?.events)) {
       applySessionEventsPage({
         events: data.events,
+        reasoningTurnIds: data?.reasoningTurnIds,
         sessionId,
-        addSessionEvent
+        addSessionEvent,
+        getSessionStore
       })
       store.hasMoreBefore = Boolean(data?.hasMoreBefore)
       store.nextBeforeSeq = data?.nextBeforeSeq ?? null
@@ -462,8 +532,10 @@ export async function loadSessionHistory({
       if (nonce !== loadSessionNonce.value) return
       applySessionEventsPage({
         events: page?.events,
+        reasoningTurnIds: page?.reasoningTurnIds,
         sessionId,
-        addSessionEvent
+        addSessionEvent,
+        getSessionStore
       })
       store.hasMoreBefore = Boolean(page?.hasMoreBefore)
       store.nextBeforeSeq = page?.nextBeforeSeq ?? null

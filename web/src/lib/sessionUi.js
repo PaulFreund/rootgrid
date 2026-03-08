@@ -7,6 +7,7 @@ export function createSessionStoreState() {
     planPinnedOpen: true,
     currentTurnId: null,
     turnHasReasoningLive: new Set(),
+    turnHasReasoningHistory: new Set(),
     turnHasReasoningTokens: new Set(),
     backgroundExpandedByTurnId: new Map(),
     reasoningByTurnId: new Map(),

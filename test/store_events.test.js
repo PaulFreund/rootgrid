@@ -7,7 +7,8 @@ import {
   getTurnReasoningText,
   getTurnSeqRange,
   listItemOutputEvents,
-  listSessionEventsPage
+  listSessionEventsPage,
+  listTurnsWithReasoning
 } from '../src/db/storeEvents.js'
 
 function buildStore() {
@@ -140,6 +141,28 @@ test('turn reasoning helpers resolve range, dedupe chunks, and attach section or
       { id: 'r-2', title: 'Answer done', body: '', startSeq: 4, tsMs: 4 }
     ]
   })
+
+  assert.deepEqual(getTurnReasoningSections(store.db, {
+    sessionId: 's-1',
+    turnId: 'turn-1',
+    lastSeq: 5,
+    includeBody: false
+  }), {
+    turnId: 'turn-1',
+    startSeq: 1,
+    endSeq: 5,
+    truncated: false,
+    sections: [
+      { id: 'r-1', title: 'Plan', startSeq: 2, tsMs: 2 },
+      { id: 'r-2', title: 'Answer done', startSeq: 4, tsMs: 4 }
+    ]
+  })
+
+  assert.deepEqual(listTurnsWithReasoning(store.db, {
+    sessionId: 's-1',
+    turnIds: ['turn-1', 'turn-missing'],
+    lastSeq: 5
+  }), ['turn-1'])
 })
 
 test('event pagination uses limit-plus-one lookahead for history and tool output pages', () => {

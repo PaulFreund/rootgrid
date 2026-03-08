@@ -6,6 +6,8 @@ import {
   addSessionEvent,
   canCoalesceSessionEvent,
   coalesceSessionEvent,
+  ensureTurnReasoningBodyLoaded,
+  ensureTurnReasoningLoaded,
   loadSessionHistory,
   resetSessionStoreState,
   toolOutputHasMeaningfulText
@@ -60,6 +62,7 @@ test('resetSessionStoreState clears derived session store state', () => {
     planExplanation: 'because',
     currentTurnId: 'turn-1',
     turnHasReasoningLive: new Set(['turn-1']),
+    turnHasReasoningHistory: new Set(['turn-1']),
     turnHasReasoningTokens: new Set(['turn-1']),
     backgroundExpandedByTurnId: new Map([['turn-1', true]]),
     reasoningByTurnId: new Map([['turn-1', { loaded: true }]]),
@@ -83,6 +86,7 @@ test('resetSessionStoreState clears derived session store state', () => {
   assert.equal(store.planExplanation, null)
   assert.equal(store.currentTurnId, null)
   assert.equal(store.turnHasReasoningLive.size, 0)
+  assert.equal(store.turnHasReasoningHistory.size, 0)
   assert.equal(store.turnHasReasoningTokens.size, 0)
   assert.equal(store.backgroundExpandedByTurnId.size, 0)
   assert.equal(store.reasoningByTurnId.size, 0)
@@ -132,6 +136,7 @@ test('loadSessionHistory uses bootstrap payload for the initial render in one re
               { eventId: 'e-2', seq: 2, type: 'turn.started', payload: { turnId: 'turn-1' } },
               { eventId: 'e-3', seq: 3, type: 'session.output', payload: { stream: 'normalized', text: 'world' } }
             ],
+            reasoningTurnIds: ['turn-1'],
             hasMoreBefore: false,
             nextBeforeSeq: 1,
             containsInput: true
@@ -157,9 +162,80 @@ test('loadSessionHistory uses bootstrap payload for the initial render in one re
   const store = getSessionStore('s-1')
   assert.deepEqual(store.events.map((event) => event.eventId), ['e-1', 'e-2', 'e-3'])
   assert.equal(store.currentTurnId, 'turn-1')
+  assert.equal(store.turnHasReasoningHistory.has('turn-1'), true)
   assert.equal(store.hasMoreBefore, false)
   assert.equal(store.nextBeforeSeq, 1)
   assert.equal(scheduled.length, 1)
+})
+
+test('reasoning history loads metadata first and full body only on demand', async () => {
+  const stores = new Map()
+  const getSessionStore = (sessionId) => {
+    let store = stores.get(sessionId)
+    if (!store) {
+      store = createSessionStoreState()
+      stores.set(sessionId, store)
+    }
+    return store
+  }
+
+  const requested = []
+  const apiFetch = async (path) => {
+    requested.push(path)
+    if (String(path).includes('&meta=1')) {
+      return {
+        ok: true,
+        async json() {
+          return {
+            sections: [
+              { id: 'r-1', title: 'Reasoning', startSeq: 2, tsMs: 2 }
+            ],
+            truncated: false
+          }
+        }
+      }
+    }
+    return {
+      ok: true,
+      async json() {
+        return {
+          sections: [
+            { id: 'r-1', title: 'Reasoning', body: 'Detailed reasoning', startSeq: 2, tsMs: 2 }
+          ],
+          truncated: false
+        }
+      }
+    }
+  }
+
+  await ensureTurnReasoningLoaded({
+    apiFetch,
+    getSessionStore,
+    parseReasoningSections: () => [],
+    sessionId: 's-1',
+    turnId: 'turn-1'
+  })
+
+  const store = getSessionStore('s-1')
+  const state = store.reasoningByTurnId.get('turn-1')
+  assert.equal(state.loaded, true)
+  assert.equal(state.bodyLoaded, false)
+  assert.equal(state.sections[0].body, undefined)
+
+  await ensureTurnReasoningBodyLoaded({
+    apiFetch,
+    getSessionStore,
+    parseReasoningSections: () => [],
+    sessionId: 's-1',
+    turnId: 'turn-1'
+  })
+
+  assert.equal(state.bodyLoaded, true)
+  assert.equal(state.sections[0].body, 'Detailed reasoning')
+  assert.deepEqual(requested, [
+    '/api/sessions/s-1/turns/turn-1/reasoning?maxChars=400000&meta=1',
+    '/api/sessions/s-1/turns/turn-1/reasoning?maxChars=400000'
+  ])
 })
 
 test('addSessionEvent merges consecutive session output text into the previous stored event', () => {
