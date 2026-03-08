@@ -2,8 +2,9 @@ import crypto from 'node:crypto'
 
 import { CodexAppServerSession } from './sessions/CodexAppServerSession.js'
 import { RunnerIdeManager } from './ideManager.js'
+import { RunnerReleaseManager } from './runnerReleaseManager.js'
 import { RunnerUploadManager } from './runnerUploadManager.js'
-import { listCodexModels, listWorkspaceDirectories } from './runnerWorkspaceApi.js'
+import { execTerminalCommand, getGitStatus, listCodexModels, listWorkspaceEntries, readWorkspaceFile } from './runnerWorkspaceApi.js'
 
 function nextTurnOfLoop() {
   return new Promise((resolve) => setImmediate(resolve))
@@ -15,10 +16,12 @@ export class RunnerSessionManager {
    *   machineId: string,
    *   send: (envelope: any) => boolean,
    *   debug?: any,
+   *   upgrade?: any,
+   *   autostart?: any,
    *   makeEnvelope: (input: { type: string, scope?: any, payload?: any, track?: boolean }) => any
    * }} opts
    */
-  constructor({ machineId, send, debug = null, makeEnvelope }) {
+  constructor({ machineId, send, debug = null, upgrade = null, autostart = null, makeEnvelope }) {
     this.machineId = machineId
     this.send = send
     this.debug = debug ?? null
@@ -34,6 +37,12 @@ export class RunnerSessionManager {
       machineId,
       emit: (type, scope, payload, options) => this.#emit(type, scope, payload, options)
     })
+    this.upgrade = new RunnerReleaseManager({
+      machineId,
+      upgrade,
+      autostart,
+      emit: (type, payload, options) => this.#emit(type, { machineId: this.machineId }, payload, options)
+    })
   }
 
   /**
@@ -44,6 +53,9 @@ export class RunnerSessionManager {
     const payload = env?.payload ?? null
 
     if (type === 'fs.list') return this.#onFsList(payload)
+    if (type === 'fs.read') return this.#onFsRead(payload)
+    if (type === 'git.status') return this.#onGitStatus(payload)
+    if (type === 'terminal.exec') return this.#onTerminalExec(payload)
     if (type === 'codex.model.list') return this.#onCodexModelList(payload)
     if (type === 'session.start') return this.#onSessionStart(payload)
     if (type === 'session.send') return this.#onSessionSend(payload)
@@ -58,6 +70,10 @@ export class RunnerSessionManager {
     if (type === 'session.cancel') return this.#onSessionCancel(payload)
     if (type === 'session.stop') return this.#onSessionStop(payload)
     if (type === 'approval.respond') return this.#onApprovalRespond(payload)
+    if (type === 'machine.upgrade.start') return this.#onMachineUpgradeStart(payload)
+    if (type === 'machine.upgrade.chunk') return this.#onMachineUpgradeChunk(payload)
+    if (type === 'machine.upgrade.end') return this.#onMachineUpgradeEnd(payload)
+    if (type === 'machine.upgrade.abort') return this.#onMachineUpgradeAbort(payload)
     if (type === 'ide.start') return this.#onIdeStart(payload)
     if (type === 'ide.stop') return this.#onIdeStop(payload)
   }
@@ -246,7 +262,9 @@ export class RunnerSessionManager {
     if (!requestId || typeof requestId !== 'string') return
 
     try {
-      const out = await listWorkspaceDirectories(payload?.path)
+      const out = await listWorkspaceEntries(payload?.path, {
+        includeFiles: Boolean(payload?.includeFiles)
+      })
       this.#emit('fs.list.result', { machineId: this.machineId }, {
         requestId,
         ok: true,
@@ -258,6 +276,122 @@ export class RunnerSessionManager {
         ok: false,
         error: String(err?.message ?? err)
       }, { track: false })
+    }
+  }
+
+  async #onFsRead(payload) {
+    const requestId = payload?.requestId
+    if (!requestId || typeof requestId !== 'string') return
+
+    try {
+      const out = await readWorkspaceFile(payload?.path, {
+        maxBytes: Number(payload?.maxBytes) || 200_000
+      })
+      this.#emit('fs.read.result', { machineId: this.machineId }, {
+        requestId,
+        ok: true,
+        ...out
+      }, { track: false })
+    } catch (err) {
+      this.#emit('fs.read.result', { machineId: this.machineId }, {
+        requestId,
+        ok: false,
+        error: String(err?.message ?? err)
+      }, { track: false })
+    }
+  }
+
+  async #onGitStatus(payload) {
+    const requestId = payload?.requestId
+    if (!requestId || typeof requestId !== 'string') return
+
+    try {
+      const out = await getGitStatus({
+        cwd: payload?.cwd,
+        timeoutMs: Number(payload?.timeoutMs) || 10_000
+      })
+      this.#emit('git.status.result', { machineId: this.machineId }, {
+        requestId,
+        ok: true,
+        ...out
+      }, { track: false })
+    } catch (err) {
+      this.#emit('git.status.result', { machineId: this.machineId }, {
+        requestId,
+        ok: false,
+        error: String(err?.message ?? err)
+      }, { track: false })
+    }
+  }
+
+  async #onTerminalExec(payload) {
+    const requestId = payload?.requestId
+    if (!requestId || typeof requestId !== 'string') return
+
+    try {
+      const out = await execTerminalCommand({
+        cwd: payload?.cwd,
+        command: payload?.command,
+        timeoutMs: Number(payload?.timeoutMs) || 60_000
+      })
+      this.#emit('terminal.exec.result', { machineId: this.machineId }, {
+        requestId,
+        ok: true,
+        ...out
+      }, { track: false })
+    } catch (err) {
+      this.#emit('terminal.exec.result', { machineId: this.machineId }, {
+        requestId,
+        ok: false,
+        error: String(err?.message ?? err)
+      }, { track: false })
+    }
+  }
+
+  async #onMachineUpgradeStart(payload) {
+    const requestId = payload?.requestId
+    if (!requestId || typeof requestId !== 'string') return
+
+    try {
+      await this.upgrade.begin(payload)
+      this.#emit('machine.upgrade.accepted', { machineId: this.machineId }, {
+        requestId,
+        machineId: this.machineId
+      }, { track: false })
+    } catch (err) {
+      this.#emit('machine.upgrade.rejected', { machineId: this.machineId }, {
+        requestId,
+        machineId: this.machineId,
+        error: String(err?.message ?? err)
+      }, { track: false })
+    }
+  }
+
+  async #onMachineUpgradeChunk(payload) {
+    try {
+      await this.upgrade.chunk(payload)
+    } catch (err) {
+      const requestId = payload?.requestId
+      if (!requestId) return
+      this.#emit('machine.upgrade.bundle.failed', { machineId: this.machineId }, {
+        requestId,
+        machineId: this.machineId,
+        error: String(err?.message ?? err)
+      }, { track: false })
+    }
+  }
+
+  async #onMachineUpgradeEnd(payload) {
+    try {
+      await this.upgrade.end(payload)
+    } catch {
+    }
+  }
+
+  async #onMachineUpgradeAbort(payload) {
+    try {
+      await this.upgrade.abort(payload)
+    } catch {
     }
   }
 

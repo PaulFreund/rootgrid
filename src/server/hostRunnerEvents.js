@@ -100,7 +100,12 @@ export function createHostRunnerEventHandlers({
   makeEnvelope,
   getUploadService,
   pendingRunnerCommands,
+  pendingMachineUpgrades,
+  pendingMachineUpgradeTransfers,
   pendingFsLists,
+  pendingFsReads,
+  pendingGitStatuses,
+  pendingTerminalExecs,
   pendingModelLists,
   pendingIdeStarts,
   httpError
@@ -126,6 +131,70 @@ export function createHostRunnerEventHandlers({
         if (!requestId) return
         if (msg.payload?.ok === false) pendingFsLists.reject(requestId, new Error(msg.payload?.error ?? 'fs list failed'))
         else pendingFsLists.resolve(requestId, msg.payload)
+        return
+      }
+
+      if (msg?.type === 'fs.read.result') {
+        const requestId = msg.payload?.requestId
+        if (!requestId) return
+        if (msg.payload?.ok === false) pendingFsReads.reject(requestId, new Error(msg.payload?.error ?? 'fs read failed'))
+        else pendingFsReads.resolve(requestId, msg.payload)
+        return
+      }
+
+      if (msg?.type === 'git.status.result') {
+        const requestId = msg.payload?.requestId
+        if (!requestId) return
+        if (msg.payload?.ok === false) pendingGitStatuses.reject(requestId, new Error(msg.payload?.error ?? 'git status failed'))
+        else pendingGitStatuses.resolve(requestId, msg.payload)
+        return
+      }
+
+      if (msg?.type === 'terminal.exec.result') {
+        const requestId = msg.payload?.requestId
+        if (!requestId) return
+        if (msg.payload?.ok === false) pendingTerminalExecs.reject(requestId, new Error(msg.payload?.error ?? 'terminal command failed'))
+        else pendingTerminalExecs.resolve(requestId, msg.payload)
+        return
+      }
+
+      if (msg?.type === 'machine.upgrade.accepted') {
+        const requestId = msg.payload?.requestId
+        if (requestId) pendingMachineUpgrades.resolve(requestId, msg.payload ?? null)
+        return
+      }
+
+      if (msg?.type === 'machine.upgrade.rejected') {
+        const requestId = msg.payload?.requestId
+        if (requestId) pendingMachineUpgrades.reject(requestId, httpError(400, msg.payload?.error ?? 'runner rejected upgrade'))
+        return
+      }
+
+      if (msg?.type === 'machine.upgrade.state') {
+        sse.send(makeEnvelope({
+          type: 'registry.machine.upsert',
+          scope: { machineId },
+          payload: {
+            machineId,
+            upgrade: {
+              state: String(msg.payload?.state ?? 'unknown'),
+              ...(msg.payload?.message ? { message: String(msg.payload.message) } : {}),
+              updatedAtMs: Date.now()
+            }
+          }
+        }))
+        return
+      }
+
+      if (msg?.type === 'machine.upgrade.bundle.received') {
+        const requestId = msg.payload?.requestId
+        if (requestId) pendingMachineUpgradeTransfers.resolve(requestId, msg.payload ?? null)
+        return
+      }
+
+      if (msg?.type === 'machine.upgrade.bundle.failed') {
+        const requestId = msg.payload?.requestId
+        if (requestId) pendingMachineUpgradeTransfers.reject(requestId, httpError(400, msg.payload?.error ?? 'upgrade bundle failed'))
         return
       }
 
@@ -261,7 +330,12 @@ export function createHostRunnerEventHandlers({
 
     onRunnerDisconnect({ machineId }) {
       pendingRunnerCommands.rejectByMachine(machineId, httpError(503, 'runner disconnected'))
+      pendingMachineUpgrades.rejectByMachine(machineId, httpError(503, 'runner disconnected while upgrading'))
+      pendingMachineUpgradeTransfers.rejectByMachine(machineId, httpError(503, 'runner disconnected while installing upgrade'))
       pendingFsLists.rejectByMachine(machineId, httpError(503, 'runner disconnected'))
+      pendingFsReads.rejectByMachine(machineId, httpError(503, 'runner disconnected'))
+      pendingGitStatuses.rejectByMachine(machineId, httpError(503, 'runner disconnected'))
+      pendingTerminalExecs.rejectByMachine(machineId, httpError(503, 'runner disconnected'))
       pendingModelLists.rejectByMachine(machineId, httpError(503, 'runner disconnected'))
       pendingIdeStarts.rejectByMachine(machineId, new Error('runner disconnected while starting ide session'))
       getUploadService?.()?.handleRunnerDisconnect(machineId)

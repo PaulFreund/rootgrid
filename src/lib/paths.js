@@ -2,6 +2,8 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 export function getRootgridDir() {
+  const override = String(process.env.ROOTGRID_HOME_DIR ?? '').trim()
+  if (override) return override
   return join(homedir(), '.rootgrid')
 }
 
@@ -27,4 +29,24 @@ export function getUploadsDir() {
 
 export function getCodexDebugDir() {
   return join(getRootgridDir(), 'debug', 'codex')
+}
+
+export function getReleasesDir() {
+  return join(getRootgridDir(), 'releases')
+}
+
+export function getCurrentReleaseLinkPath() {
+  return join(getRootgridDir(), 'current')
+}
+
+export function getRootgridTmpDir() {
+  return join(getRootgridDir(), 'tmp')
+}
+
+export function getReleaseBundlesDir() {
+  return join(getRootgridTmpDir(), 'bundles')
+}
+
+export function getReleaseTransfersDir() {
+  return join(getRootgridTmpDir(), 'releases')
 }

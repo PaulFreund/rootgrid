@@ -226,7 +226,7 @@ export function createRunnerWsServer({
             sse.send(makeEnvelope({
               type: 'registry.machine.upsert',
               scope: { machineId },
-              payload: { machineId, connected: false }
+              payload: { machineId, connected: false, upgrade: null }
             }))
             try {
               onRunnerDisconnect?.({ machineId })
@@ -248,7 +248,7 @@ export function createRunnerWsServer({
         sse.send(makeEnvelope({
           type: 'registry.machine.upsert',
           scope: { machineId },
-          payload: { machineId, machineName, platform, lastSeenMs: Date.now(), capabilities, connected: true }
+          payload: { machineId, machineName, platform, lastSeenMs: Date.now(), capabilities, connected: true, upgrade: null }
         }))
 
         return

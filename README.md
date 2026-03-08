@@ -22,6 +22,17 @@ npx rootgrid setup
 npx rootgrid
 ```
 
+Git-based private install also works:
+
+```bash
+git clone <repo-url>
+cd rootgrid
+npm ci
+npm run build
+node src/cli.js setup
+node src/cli.js
+```
+
 Then:
 - Open the printed URL (default `http://127.0.0.1:7337/`)
 - Paste the **client token** from `~/.rootgrid/config.json` into the login screen
@@ -31,6 +42,13 @@ Configuration is written to:
 
 - `~/.rootgrid/config.json`
 - `config.example.json` – example config covering every current field
+
+Setup also installs a managed runtime under:
+
+- `~/.rootgrid/releases/<release-id>/`
+- `~/.rootgrid/current -> ~/.rootgrid/releases/<release-id>/`
+
+That managed runtime is what autostart services and remote upgrades use on both Linux and macOS.
 
 ---
 
@@ -58,6 +76,7 @@ See: `docs/reverse-proxy.md`.
 - **“no runner connected”**: ensure `runner.enabled=true` and Rootgrid is running on the runner machine
 - **Codex not found**: install the Codex CLI (`codex`) and re-run `rootgrid`
 - **Need raw Codex traffic for debugging**: set `debug.codexRawCapture.enabled=true` in `~/.rootgrid/config.json`; captures land in `~/.rootgrid/debug/codex/` by default
+- **Want web-triggered runner upgrades on version mismatch**: it is enabled by default for managed installs; the host now ships a prebuilt release bundle to the runner and the runner restarts via its user service
 - **SSE stuck behind proxy**: disable proxy buffering for `/api/events`
 - **VS Code button fails**: install `code-server` on the runner; ensure the runner tunnel (`/v1/tunnel`) is connected
 

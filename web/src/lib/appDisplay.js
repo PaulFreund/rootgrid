@@ -153,6 +153,35 @@ export function machineStatusLabel(nowMs, machine) {
   return 'offline'
 }
 
+export function machineRootgridVersion(machine) {
+  const value = machine?.capabilities?.rootgridVersion
+  const text = String(value ?? '').trim()
+  return text || null
+}
+
+export function machineHasVersionMismatch(machine, hostVersion) {
+  const runnerVersion = machineRootgridVersion(machine)
+  const host = String(hostVersion ?? '').trim()
+  return Boolean(runnerVersion && host && runnerVersion !== host)
+}
+
+export function machineSupportsWebUpgrade(machine) {
+  return Boolean(machine?.capabilities?.upgrade?.enabled)
+}
+
+export function machineUpgradeStatusText(machine) {
+  const state = String(machine?.upgrade?.state ?? '').trim()
+  if (!state) return ''
+  const message = String(machine?.upgrade?.message ?? '').trim()
+  if (state === 'starting') return 'Preparing upgrade…'
+  if (state === 'receiving') return 'Receiving release bundle…'
+  if (state === 'installing') return 'Installing release…'
+  if (state === 'updating') return 'Updating runner…'
+  if (state === 'restarting') return 'Restarting runner…'
+  if (state === 'failed') return message ? `Upgrade failed: ${message}` : 'Upgrade failed.'
+  return message || state
+}
+
 export function planStatusKey(status) {
   return String(status ?? '')
     .trim()

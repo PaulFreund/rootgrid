@@ -3,13 +3,37 @@ import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { spawn } from 'node:child_process'
 
 import {
+  execTerminalCommand,
+  getGitStatus,
   listCodexModels,
+  listWorkspaceEntries,
   listWorkspaceDirectories,
   normalizeCodexModelListResult,
+  parseGitStatusOutput,
+  readWorkspaceFile,
   resolveWorkspaceListPath
 } from '../src/runner/runnerWorkspaceApi.js'
+
+async function run(cmd, args, { cwd } = {}) {
+  await new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, {
+      cwd,
+      stdio: ['ignore', 'ignore', 'pipe']
+    })
+    let stderr = ''
+    proc.stderr.on('data', (chunk) => {
+      stderr += String(chunk ?? '')
+    })
+    proc.once('error', reject)
+    proc.once('exit', (code) => {
+      if (code === 0) resolve()
+      else reject(new Error(stderr || `${cmd} exited ${code}`))
+    })
+  })
+}
 
 test('resolveWorkspaceListPath expands home and relative paths', () => {
   const homeDir = '/tmp/rootgrid-home'
@@ -32,6 +56,81 @@ test('listWorkspaceDirectories returns sorted directory entries only', async (t)
   assert.equal(out.path, dir)
   assert.deepEqual(out.entries.map((entry) => entry.name), ['a-dir', 'b-dir'])
   assert.ok(out.entries.every((entry) => entry.kind === 'dir'))
+})
+
+test('listWorkspaceEntries can include files and sort directories first', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'rootgrid-runner-fs-all-'))
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  await mkdir(join(dir, 'b-dir'))
+  await writeFile(join(dir, 'z-file.txt'), 'z')
+  await mkdir(join(dir, 'a-dir'))
+  await writeFile(join(dir, 'a-file.txt'), 'alpha')
+
+  const out = await listWorkspaceEntries(dir, { includeFiles: true })
+  assert.deepEqual(out.entries.map((entry) => [entry.kind, entry.name]), [
+    ['dir', 'a-dir'],
+    ['dir', 'b-dir'],
+    ['file', 'a-file.txt'],
+    ['file', 'z-file.txt']
+  ])
+})
+
+test('readWorkspaceFile reads text files and flags truncation', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'rootgrid-runner-read-'))
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+  const filePath = join(dir, 'note.txt')
+  await writeFile(filePath, 'hello world')
+
+  const out = await readWorkspaceFile(filePath, { maxBytes: 5 })
+  assert.equal(out.path, filePath)
+  assert.equal(out.binary, false)
+  assert.equal(out.truncated, true)
+  assert.equal(out.text, 'hello')
+})
+
+test('parseGitStatusOutput parses branch metadata and entries', () => {
+  const out = parseGitStatusOutput('## main...origin/main [ahead 2, behind 1]\n M src/file.js\n?? new.txt\n', { cwd: '/repo' })
+  assert.equal(out.cwd, '/repo')
+  assert.equal(out.branch, 'main')
+  assert.equal(out.upstream, 'origin/main')
+  assert.equal(out.ahead, 2)
+  assert.equal(out.behind, 1)
+  assert.deepEqual(out.entries.map((entry) => ({ path: entry.path, label: entry.label })), [
+    { path: 'src/file.js', label: 'M' },
+    { path: 'new.txt', label: '??' }
+  ])
+})
+
+test('getGitStatus reports repo state for workspace changes', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'rootgrid-runner-git-'))
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  await run('git', ['init'], { cwd: dir })
+  await writeFile(join(dir, 'untracked.txt'), 'hello')
+
+  const out = await getGitStatus({ cwd: dir })
+  assert.equal(out.cwd, dir)
+  assert.equal(out.notRepo, false)
+  assert.ok(Array.isArray(out.entries))
+  assert.equal(out.entries.some((entry) => entry.path === 'untracked.txt'), true)
+})
+
+test('execTerminalCommand captures stdout and exit status', async () => {
+  const out = await execTerminalCommand({
+    cwd: tmpdir(),
+    command: 'printf "hello terminal"',
+    timeoutMs: 5_000
+  })
+  assert.equal(out.exitCode, 0)
+  assert.equal(out.stdout, 'hello terminal')
+  assert.equal(out.timedOut, false)
 })
 
 test('normalizeCodexModelListResult preserves fallback response shapes', () => {

@@ -156,3 +156,9 @@ body {
     animation: none !important;
   }
 }
+
+body.rootgrid-col-resize-active,
+body.rootgrid-col-resize-active * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}

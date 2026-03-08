@@ -592,8 +592,6 @@ export function parseUnifiedDiff(diffText, { maxBytes = 2_000_000, maxLines = 50
   if (text.length > maxBytes) {
     return cacheDiff(key, [{
       path: 'Diff too large',
-      added: 0,
-      removed: 0,
       lines: [{ kind: 'meta', text: `Diff truncated (${text.length} chars)` }],
       raw: text.slice(0, maxBytes)
     }])
@@ -610,8 +608,6 @@ export function parseUnifiedDiff(diffText, { maxBytes = 2_000_000, maxLines = 50
       path: 'Changes',
       oldPath: null,
       newPath: null,
-      added: 0,
-      removed: 0,
       lines: [],
       raw: ''
     }
@@ -655,16 +651,12 @@ export function parseUnifiedDiff(diffText, { maxBytes = 2_000_000, maxLines = 50
     }
 
     if (line.startsWith('+') && !line.startsWith('+++')) {
-      const next = ensureCurrent()
-      next.added += 1
-      next.lines.push({ kind: 'add', text: line.slice(1), raw: line })
+      ensureCurrent().lines.push({ kind: 'add', text: line.slice(1), raw: line })
       continue
     }
 
     if (line.startsWith('-') && !line.startsWith('---')) {
-      const next = ensureCurrent()
-      next.removed += 1
-      next.lines.push({ kind: 'del', text: line.slice(1), raw: line })
+      ensureCurrent().lines.push({ kind: 'del', text: line.slice(1), raw: line })
       continue
     }
 
@@ -690,7 +682,7 @@ export function summarizeUnifiedDiff(diffText, { maxBytes = 2_000_000, maxLines 
 
   const text = key.replace(/\r/g, '')
   if (!text.trim()) {
-    const empty = { files: 0, added: 0, removed: 0, paths: [] }
+    const empty = { files: 0, paths: [] }
     DIFF_SUMMARY_CACHE.set(key, empty)
     return empty
   }

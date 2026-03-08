@@ -18,6 +18,8 @@ test('config.example.json includes all config fields and validates against the s
   assert.ok(Object.hasOwn(parsed, 'host'))
   assert.ok(Object.hasOwn(parsed, 'upstream'))
   assert.ok(Object.hasOwn(parsed.debug, 'codexRawCapture'))
+  assert.ok(Object.hasOwn(parsed.runner, 'upgrade'))
+  assert.ok(Object.hasOwn(parsed.runner.upgrade, 'keepReleases'))
   assert.ok(Object.hasOwn(parsed.host, 'listen'))
   assert.ok(Object.hasOwn(parsed.host, 'publicUrl'))
   assert.ok(Object.hasOwn(parsed.host, 'trustProxy'))

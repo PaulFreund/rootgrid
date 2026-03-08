@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import http from 'node:http'
 import { rm } from 'node:fs/promises'
 
+import { stripIdeBasePath } from '../lib/idePaths.js'
 import { getDbPath, getSecretKeyPath } from '../lib/paths.js'
 import { getOrCreateVapidKeys } from '../lib/vapidKeys.js'
 import { Store } from '../db/store.js'
@@ -15,6 +16,7 @@ import { readJsonBody, json } from './httpUtil.js'
 import { createModelCatalogCache } from './modelCatalogCache.js'
 import { createPendingRequestBook } from './pendingRequestBook.js'
 import { PushService } from './pushService.js'
+import { createReleaseBundleManager } from './releaseBundleManager.js'
 import { recoverAfterRunnerRestart } from './recovery.js'
 import { createSessionApi } from './sessionApi.js'
 import { SSEManager } from './sseManager.js'
@@ -45,9 +47,15 @@ export async function startHost({ config }) {
   const approvals = new Map() // approvalId -> { machineId, sessionId }
   const ideSessions = new Map() // ideId -> { machineId, cwd, port, basePath }
   const pendingIdeStarts = createPendingRequestBook()
+  const pendingMachineUpgrades = createPendingRequestBook()
+  const pendingMachineUpgradeTransfers = createPendingRequestBook()
   const pendingFsLists = createPendingRequestBook()
+  const pendingFsReads = createPendingRequestBook()
+  const pendingGitStatuses = createPendingRequestBook()
+  const pendingTerminalExecs = createPendingRequestBook()
   const pendingModelLists = createPendingRequestBook()
   const pendingRunnerCommands = createPendingRequestBook()
+  const releaseBundles = createReleaseBundleManager()
 
   const tunnelHub = new TunnelHub()
 
@@ -96,7 +104,12 @@ export async function startHost({ config }) {
     makeEnvelope,
     getUploadService: () => uploadService,
     pendingRunnerCommands,
+    pendingMachineUpgrades,
+    pendingMachineUpgradeTransfers,
     pendingFsLists,
+    pendingFsReads,
+    pendingGitStatuses,
+    pendingTerminalExecs,
     pendingModelLists,
     pendingIdeStarts,
     httpError
@@ -171,7 +184,7 @@ export async function startHost({ config }) {
     return await resultP
   }
 
-  async function fsListOnRunner({ machineId, path }) {
+  async function fsListOnRunner({ machineId, path, includeFiles = false }) {
     const requestId = crypto.randomUUID()
     const resultP = pendingFsLists.create(requestId, {
       machineId,
@@ -182,7 +195,7 @@ export async function startHost({ config }) {
     const ok = runnerWs.sendToMachine(machineId, makeEnvelope({
       type: 'fs.list',
       scope: { machineId },
-      payload: { requestId, path: String(path ?? '') }
+      payload: { requestId, path: String(path ?? ''), includeFiles: Boolean(includeFiles) }
     }))
     if (!ok) {
       pendingFsLists.cancel(requestId)
@@ -194,6 +207,115 @@ export async function startHost({ config }) {
       path: payload?.path ?? '',
       parent: payload?.parent ?? null,
       entries: Array.isArray(payload?.entries) ? payload.entries : []
+    }
+  }
+
+  async function fsReadOnRunner({ machineId, path, maxBytes = 200_000 }) {
+    const requestId = crypto.randomUUID()
+    const resultP = pendingFsReads.create(requestId, {
+      machineId,
+      timeoutMs: 10_000,
+      onTimeout: () => httpError(504, 'timeout reading file')
+    })
+
+    const ok = runnerWs.sendToMachine(machineId, makeEnvelope({
+      type: 'fs.read',
+      scope: { machineId },
+      payload: { requestId, path: String(path ?? ''), maxBytes: Number(maxBytes) || 200_000 }
+    }))
+    if (!ok) {
+      pendingFsReads.cancel(requestId)
+      throw httpError(503, 'runner not connected')
+    }
+    return await resultP
+  }
+
+  async function gitStatusOnRunner({ machineId, cwd, timeoutMs = 10_000 }) {
+    const requestId = crypto.randomUUID()
+    const resultP = pendingGitStatuses.create(requestId, {
+      machineId,
+      timeoutMs: Math.max(5_000, Number(timeoutMs) || 10_000),
+      onTimeout: () => httpError(504, 'timeout reading git status')
+    })
+
+    const ok = runnerWs.sendToMachine(machineId, makeEnvelope({
+      type: 'git.status',
+      scope: { machineId },
+      payload: { requestId, cwd: String(cwd ?? ''), timeoutMs: Number(timeoutMs) || 10_000 }
+    }))
+    if (!ok) {
+      pendingGitStatuses.cancel(requestId)
+      throw httpError(503, 'runner not connected')
+    }
+    return await resultP
+  }
+
+  async function terminalExecOnRunner({ machineId, cwd, command, timeoutMs = 60_000 }) {
+    const requestId = crypto.randomUUID()
+    const resultP = pendingTerminalExecs.create(requestId, {
+      machineId,
+      timeoutMs: Math.max(10_000, Number(timeoutMs) || 60_000) + 1_000,
+      onTimeout: () => httpError(504, 'timeout waiting for command output')
+    })
+
+    const ok = runnerWs.sendToMachine(machineId, makeEnvelope({
+      type: 'terminal.exec',
+      scope: { machineId },
+      payload: {
+        requestId,
+        cwd: String(cwd ?? ''),
+        command: String(command ?? ''),
+        timeoutMs: Number(timeoutMs) || 60_000
+      }
+    }))
+    if (!ok) {
+      pendingTerminalExecs.cancel(requestId)
+      throw httpError(503, 'runner not connected')
+    }
+    return await resultP
+  }
+
+  async function requestMachineUpgrade({ machineId, hostVersion = null, timeoutMs = 10_000 }) {
+    const requestId = releaseBundles.nextRequestId()
+    try {
+      const bundle = await releaseBundles.getBundle()
+      const acceptedP = pendingMachineUpgrades.create(requestId, {
+        machineId,
+        timeoutMs,
+        onTimeout: () => httpError(504, 'timeout waiting for runner to accept upgrade')
+      })
+      await releaseBundles.sendBundleToMachine({
+        machineId,
+        requestId,
+        runnerWs,
+        makeEnvelope,
+        bundle
+      })
+      await acceptedP
+      const installedP = pendingMachineUpgradeTransfers.create(requestId, {
+        machineId,
+        timeoutMs: 60_000,
+        onTimeout: () => httpError(504, 'timeout waiting for runner to install upgrade bundle')
+      })
+      await releaseBundles.streamBundleToMachine({
+        machineId,
+        requestId,
+        runnerWs,
+        makeEnvelope
+      })
+      await installedP
+      return {
+        machineId,
+        requestId,
+        releaseId: bundle.releaseId,
+        version: bundle.version,
+        ...(hostVersion ? { hostVersion } : {})
+      }
+    } catch (err) {
+      pendingMachineUpgrades.cancel(requestId)
+      pendingMachineUpgradeTransfers.cancel(requestId)
+      if (Number(err?.statusCode)) throw err
+      throw httpError(503, String(err?.message ?? err))
     }
   }
 
@@ -269,8 +391,12 @@ export async function startHost({ config }) {
     readJsonBody,
     pickMachineId,
     fsListOnRunner,
+    fsReadOnRunner,
+    gitStatusOnRunner,
+    terminalExecOnRunner,
     codexModelListOnRunner: modelCatalogCache.list,
-    pendingIdeStarts
+    pendingIdeStarts,
+    requestMachineUpgrade
   })
 
   const hostApprovalApi = createHostApprovalApi({
@@ -321,13 +447,14 @@ export async function startHost({ config }) {
 
         let stream
         try {
+          const proxiedPath = `${stripIdeBasePath(url.pathname, ideId)}${url.search ?? ''}`
           stream = tunnelHub.openStream({
             machineId: ide.machineId,
             mode: 'http',
             host: '127.0.0.1',
             port: ide.port,
             method: req.method ?? 'GET',
-            path: req.url ?? '/',
+            path: proxiedPath,
             headers: req.headers ?? {}
           })
         } catch (err) {
@@ -482,6 +609,7 @@ export async function startHost({ config }) {
         })
 
         // Reconstruct the original HTTP upgrade request and send it over the TCP stream.
+        const proxiedPath = `${stripIdeBasePath(url.pathname, ideId)}${url.search ?? ''}`
         let headerLines = ''
         for (let i = 0; i < (req.rawHeaders?.length ?? 0); i += 2) {
           const k = req.rawHeaders[i]
@@ -491,7 +619,7 @@ export async function startHost({ config }) {
           headerLines += `${k}: ${v}\r\n`
         }
         headerLines += `Host: 127.0.0.1:${ide.port}\r\n`
-        const requestLine = `${req.method ?? 'GET'} ${req.url ?? '/'} HTTP/1.1\r\n`
+        const requestLine = `${req.method ?? 'GET'} ${proxiedPath} HTTP/1.1\r\n`
         stream.write(Buffer.from(requestLine + headerLines + '\r\n', 'utf8'))
         if (head && head.length) stream.write(head)
 

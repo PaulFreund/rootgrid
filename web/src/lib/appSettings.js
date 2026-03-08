@@ -32,6 +32,7 @@ export function normalizeNotificationSettings(input, fallback = DEFAULT_NOTIFICA
 export function normalizeAppSettingsPayload(input, fallback = {}) {
   const base = (fallback && typeof fallback === 'object') ? fallback : {}
   return {
+    appVersion: String(input?.appVersion ?? base.appVersion ?? '').trim() || null,
     retentionDays: normalizeRetentionDays(input?.retentionDays, normalizeRetentionDays(base.retentionDays)),
     notifications: normalizeNotificationSettings(input?.notifications, base.notifications),
     host: input?.host ?? base.host ?? null,
@@ -88,6 +89,7 @@ export function applyAppSettingsPayload({
   webPushDraft
 }, payload) {
   const normalized = normalizeAppSettingsPayload(payload, appSettings)
+  appSettings.appVersion = normalized.appVersion
   appSettings.retentionDays = normalized.retentionDays
   appSettings.notifications = normalized.notifications
   appSettings.host = normalized.host

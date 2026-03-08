@@ -2,12 +2,14 @@ import crypto from 'node:crypto'
 import { chmod, rename, writeFile } from 'node:fs/promises'
 
 import { RootgridConfigSchema } from '../config/schema.js'
+import { ROOTGRID_VERSION } from '../lib/rootgridVersion.js'
 import { getConfigPath } from '../lib/paths.js'
 
 const SNAPSHOT_SESSION_LIMIT = 150
 
 function buildSettingsPayload(config) {
   return {
+    appVersion: ROOTGRID_VERSION,
     retentionDays: config.retentionDays,
     notifications: {
       sseToasts: config.notifications?.sseToasts ?? 'if-not-visible',

@@ -3,6 +3,7 @@ import { hostname, platform as osPlatform } from 'node:os'
 
 import WebSocket from 'ws'
 
+import { ROOTGRID_VERSION } from '../lib/rootgridVersion.js'
 import { RunnerSessionManager } from './sessionManager.js'
 import { OutboxSpool } from './outboxSpool.js'
 
@@ -28,7 +29,7 @@ function makeEnvelope({ type, scope = null, payload = null }) {
   return { v: 1, type, ts: Date.now(), id: crypto.randomUUID(), scope, payload }
 }
 
-export async function startRunnerClient({ url, token, machineId, machineName, debug = null }) {
+export async function startRunnerClient({ url, token, machineId, machineName, debug = null, upgrade = null, autostart = null }) {
   if (!token) throw new Error('Runner token missing')
 
   const wsUrl = `${toWsBaseUrl(url)}/v1/runner/ws`
@@ -105,6 +106,8 @@ export async function startRunnerClient({ url, token, machineId, machineName, de
     machineId,
     send: sendToHost,
     debug,
+    upgrade,
+    autostart,
     makeEnvelope: makeTrackedEnvelope
   })
 
@@ -115,22 +118,30 @@ export async function startRunnerClient({ url, token, machineId, machineName, de
 
     ws.on('open', () => {
       attempt = 0
-      ws.send(JSON.stringify(makeTrackedEnvelope({
-        type: 'hello',
-        scope: { machineId },
-        payload: {
-          token,
-          machine: {
-            id: machineId,
-            name: machineName || hostname(),
-            platform: detectPlatform(),
-            capabilities: { bootId: runnerBootId, startedAtMs: runnerStartedAtMs }
-          }
-        },
-        track: false
-      })))
+      void (async () => {
+        const upgradeCapabilities = await sessions.upgrade.capabilities()
+        ws.send(JSON.stringify(makeTrackedEnvelope({
+          type: 'hello',
+          scope: { machineId },
+          payload: {
+            token,
+            machine: {
+              id: machineId,
+              name: machineName || hostname(),
+              platform: detectPlatform(),
+              capabilities: {
+                bootId: runnerBootId,
+                startedAtMs: runnerStartedAtMs,
+                rootgridVersion: ROOTGRID_VERSION,
+                upgrade: upgradeCapabilities
+              }
+            }
+          },
+          track: false
+        })))
 
-      flushPending()
+        flushPending()
+      })()
     })
 
     const aliveTimer = setInterval(() => {

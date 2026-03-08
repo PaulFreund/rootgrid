@@ -10,6 +10,7 @@ import {
 
 test('normalizeAppSettingsPayload applies defaults for invalid values', () => {
   const out = normalizeAppSettingsPayload({
+    appVersion: '1.2.3',
     retentionDays: 0,
     notifications: {
       sseToasts: 'always',
@@ -26,6 +27,7 @@ test('normalizeAppSettingsPayload applies defaults for invalid values', () => {
   })
 
   assert.equal(out.retentionDays, 45)
+  assert.equal(out.appVersion, '1.2.3')
   assert.deepEqual(out.notifications, {
     sseToasts: 'always',
     webPush: 'never'
@@ -73,6 +75,7 @@ test('createAppSettingsActions login loads settings and connects SSE on success'
   const authToken = ref('secret-token')
   const authError = ref('')
   const appSettings = reactive({
+    appVersion: null,
     retentionDays: 30,
     notifications: { sseToasts: 'if-not-visible', webPush: 'if-not-visible' },
     host: null,
@@ -103,6 +106,7 @@ test('createAppSettingsActions login loads settings and connects SSE on success'
           status: 200,
           async json() {
             return {
+              appVersion: '9.9.9',
               retentionDays: 14,
               notifications: {
                 sseToasts: 'always',
@@ -135,6 +139,7 @@ test('createAppSettingsActions login loads settings and connects SSE on success'
   assert.equal(authed.value, true)
   assert.equal(authError.value, '')
   assert.equal(appSettingsLoaded.value, true)
+  assert.equal(appSettings.appVersion, '9.9.9')
   assert.equal(appSettings.retentionDays, 14)
   assert.deepEqual(appSettings.notifications, {
     sseToasts: 'always',

@@ -7,8 +7,12 @@ import {
   formatAgeShort,
   formatAgo,
   formatCompactInt,
+  machineHasVersionMismatch,
   machineIsOnline,
+  machineRootgridVersion,
   machineStatusLabel,
+  machineSupportsWebUpgrade,
+  machineUpgradeStatusText,
   normalizeTokenUsage,
   planStepIsCompleted,
   updateTokenUsageMap
@@ -73,6 +77,10 @@ test('machine status and plan helpers derive labels consistently', () => {
   assert.equal(machineIsOnline(now, { lastSeenMs: now - 10_000 }), true)
   assert.equal(machineStatusLabel(now, { lastSeenMs: now - 10_000 }), 'online')
   assert.match(machineStatusLabel(now, { lastSeenMs: now - (10 * 60 * 1000) }), /last seen/)
+  assert.equal(machineRootgridVersion({ capabilities: { rootgridVersion: '1.2.3' } }), '1.2.3')
+  assert.equal(machineHasVersionMismatch({ capabilities: { rootgridVersion: '1.2.3' } }, '1.2.4'), true)
+  assert.equal(machineSupportsWebUpgrade({ capabilities: { upgrade: { enabled: true } } }), true)
+  assert.equal(machineUpgradeStatusText({ upgrade: { state: 'failed', message: 'boom' } }), 'Upgrade failed: boom')
   assert.equal(planStepIsCompleted({ status: 'Completed' }), true)
   assert.equal(planStepIsCompleted({ status: 'in_progress' }), false)
   assert.deepEqual(finalizeCompletedPlan([

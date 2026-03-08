@@ -13,8 +13,12 @@ export function createHostMachineApi({
   readJsonBody,
   pickMachineId,
   fsListOnRunner,
+  fsReadOnRunner,
+  gitStatusOnRunner,
+  terminalExecOnRunner,
   codexModelListOnRunner,
-  pendingIdeStarts
+  pendingIdeStarts,
+  requestMachineUpgrade
 }) {
   function clearPendingIdeStart(ideId) {
     pendingIdeStarts.cancel(ideId)
@@ -112,11 +116,40 @@ export function createHostMachineApi({
         return true
       }
 
+      if (parts[0] === 'api' && parts[1] === 'machines' && parts[2] && parts[3] === 'upgrade' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        const machineId = parts[2]
+        if (!runnerWs.listConnectedMachineIds().includes(machineId)) {
+          json(res, 404, { error: 'runner not connected' })
+          return true
+        }
+
+        const body = await readJsonBody(req)
+        const hostVersion = String(body?.hostVersion ?? '').trim() || null
+
+        try {
+          const accepted = await requestMachineUpgrade({ machineId, hostVersion })
+          json(res, 200, {
+            ok: true,
+            machineId,
+            accepted: true,
+            ...(accepted && typeof accepted === 'object' ? accepted : {})
+          })
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          json(res, code, { error: String(err?.message ?? err) })
+        }
+        return true
+      }
+
       if (url.pathname === '/api/fs/list' && req.method === 'GET') {
         if (!auth.requireAuth(req, res)) return true
-        const machineId = url.searchParams.get('machineId')
-        if (!machineId || typeof machineId !== 'string') {
-          json(res, 400, { error: 'machineId is required' })
+        const preferredMachineId = url.searchParams.get('machineId')
+        const machineId = pickMachineId(
+          (typeof preferredMachineId === 'string' && preferredMachineId.trim()) ? preferredMachineId.trim() : null
+        )
+        if (!machineId) {
+          json(res, 503, { error: 'no runner connected' })
           return true
         }
         if (!runnerWs.listConnectedMachineIds().includes(machineId)) {
@@ -124,9 +157,103 @@ export function createHostMachineApi({
           return true
         }
         const path = url.searchParams.get('path') ?? ''
+        const includeFiles = (url.searchParams.get('includeFiles') === '1' || url.searchParams.get('includeFiles') === 'true')
         try {
-          const out = await fsListOnRunner({ machineId, path })
+          const out = await fsListOnRunner({ machineId, path, includeFiles })
           json(res, 200, out)
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          json(res, code, { error: String(err?.message ?? err) })
+        }
+        return true
+      }
+
+      if (url.pathname === '/api/fs/read' && req.method === 'GET') {
+        if (!auth.requireAuth(req, res)) return true
+        const preferredMachineId = url.searchParams.get('machineId')
+        const machineId = pickMachineId(
+          (typeof preferredMachineId === 'string' && preferredMachineId.trim()) ? preferredMachineId.trim() : null
+        )
+        if (!machineId) {
+          json(res, 503, { error: 'no runner connected' })
+          return true
+        }
+        if (!runnerWs.listConnectedMachineIds().includes(machineId)) {
+          json(res, 503, { error: 'runner not connected' })
+          return true
+        }
+        const path = url.searchParams.get('path') ?? ''
+        if (!path || typeof path !== 'string') {
+          json(res, 400, { error: 'path is required' })
+          return true
+        }
+        const maxBytes = Number(url.searchParams.get('maxBytes') ?? 200_000)
+        try {
+          const out = await fsReadOnRunner({ machineId, path, maxBytes })
+          json(res, 200, out)
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          json(res, code, { error: String(err?.message ?? err) })
+        }
+        return true
+      }
+
+      if (url.pathname === '/api/git/status' && req.method === 'GET') {
+        if (!auth.requireAuth(req, res)) return true
+        const preferredMachineId = url.searchParams.get('machineId')
+        const machineId = pickMachineId(
+          (typeof preferredMachineId === 'string' && preferredMachineId.trim()) ? preferredMachineId.trim() : null
+        )
+        if (!machineId) {
+          json(res, 503, { error: 'no runner connected' })
+          return true
+        }
+        if (!runnerWs.listConnectedMachineIds().includes(machineId)) {
+          json(res, 503, { error: 'runner not connected' })
+          return true
+        }
+        const cwd = url.searchParams.get('cwd') ?? ''
+        if (!cwd || typeof cwd !== 'string') {
+          json(res, 400, { error: 'cwd is required' })
+          return true
+        }
+        try {
+          const out = await gitStatusOnRunner({ machineId, cwd })
+          json(res, 200, out)
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          json(res, code, { error: String(err?.message ?? err) })
+        }
+        return true
+      }
+
+      if (url.pathname === '/api/terminal/exec' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        const body = await readJsonBody(req)
+        const preferredMachineId = body?.machineId ?? null
+        const cwd = body?.cwd
+        const command = body?.command
+        if (!cwd || typeof cwd !== 'string') {
+          json(res, 400, { error: 'cwd is required' })
+          return true
+        }
+        if (!command || typeof command !== 'string') {
+          json(res, 400, { error: 'command is required' })
+          return true
+        }
+        const machineId = pickMachineId(preferredMachineId)
+        if (!machineId) {
+          json(res, 503, { error: 'no runner connected' })
+          return true
+        }
+        try {
+          const out = await terminalExecOnRunner({
+            machineId,
+            cwd,
+            command,
+            timeoutMs: Number(body?.timeoutMs) || 60_000
+          })
+          json(res, 200, { machineId, ...out })
         } catch (err) {
           const code = Number(err?.statusCode) || 500
           json(res, code, { error: String(err?.message ?? err) })

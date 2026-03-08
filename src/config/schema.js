@@ -5,6 +5,21 @@ const ListenSchema = z.object({
   port: z.number().int().min(1).max(65535)
 })
 
+const RunnerUpgradeSchema = z.object({
+  enabled: z.boolean().default(true),
+  keepReleases: z.number().int().min(1).max(50).default(3)
+}).default({
+  enabled: true,
+  keepReleases: 3
+})
+
+const RunnerSchema = z.object({
+  enabled: z.boolean(),
+  machineId: z.string().min(1),
+  machineName: z.string().min(1),
+  upgrade: RunnerUpgradeSchema
+})
+
 export const RootgridConfigSchema = z.object({
   version: z.number().int().min(1),
   retentionDays: z.number().int().min(1).default(30),
@@ -20,13 +35,9 @@ export const RootgridConfigSchema = z.object({
   }).default({ codexRawCapture: { enabled: false, dir: null } }),
   autostart: z.object({
     enabled: z.boolean(),
-    method: z.enum(['systemd-user']).nullable()
+    method: z.enum(['systemd-user', 'launchd-user']).nullable()
   }),
-  runner: z.object({
-    enabled: z.boolean(),
-    machineId: z.string().min(1),
-    machineName: z.string().min(1)
-  }),
+  runner: RunnerSchema,
   host: z.object({
     enabled: z.boolean(),
     listen: ListenSchema,

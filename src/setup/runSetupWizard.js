@@ -1,15 +1,23 @@
 import { spawn } from 'node:child_process'
-import { access, chmod, mkdir, readFile } from 'node:fs/promises'
+import { access, chmod, mkdir } from 'node:fs/promises'
 import { createInterface } from 'node:readline/promises'
 import process from 'node:process'
 import { stdin, stdout } from 'node:process'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 
 import { buildDefaultConfig } from '../config/defaultConfig.js'
 import { RootgridConfigSchema } from '../config/schema.js'
+import {
+  getCurrentPackageRoot,
+  getCurrentReleaseLinkPath,
+  installManagedRelease,
+  ROOTGRID_USER_SERVICE_NAME
+} from '../lib/managedRelease.js'
 import { writeJsonFile } from '../lib/jsonFile.js'
 import { getConfigPath, getRootgridDir } from '../lib/paths.js'
-import { checkCodeServerInstalled, checkCodexInstalled, checkGitInstalled, checkSystemdUserAvailable } from './setupChecks.js'
+import { ROOTGRID_VERSION } from '../lib/rootgridVersion.js'
+import { checkCodeServerInstalled, checkCodexInstalled, checkGitInstalled, checkLaunchdUserAvailable, checkSystemdUserAvailable } from './setupChecks.js'
+import { installLaunchdUserService } from './launchdUserAutostart.js'
 import { installSystemdUserService } from './systemdUserAutostart.js'
 
 function normalizeYesNo(input, fallback) {
@@ -136,12 +144,15 @@ export async function runSetupWizard() {
       stdout.write(`[ok] code-server: ${codeServer.version ?? 'installed'}\n`)
     }
 
-    // Autostart (systemd --user)
+    // Autostart
     const systemdUserAvailable = await checkSystemdUserAvailable()
-    if (systemdUserAvailable) {
-      const enableAutostart = await promptYesNo(rl, 'Enable autostart via systemd --user?', { defaultValue: true })
+    const launchdUserAvailable = await checkLaunchdUserAvailable()
+    if (systemdUserAvailable || launchdUserAvailable) {
+      const method = systemdUserAvailable ? 'systemd-user' : 'launchd-user'
+      const label = method === 'systemd-user' ? 'systemd --user' : 'launchd'
+      const enableAutostart = await promptYesNo(rl, `Enable autostart via ${label}?`, { defaultValue: true })
       cfg.autostart.enabled = enableAutostart
-      cfg.autostart.method = enableAutostart ? 'systemd-user' : null
+      cfg.autostart.method = enableAutostart ? method : null
     } else {
       cfg.autostart.enabled = false
       cfg.autostart.method = null
@@ -197,7 +208,14 @@ export async function runSetupWizard() {
     } catch {
     }
 
+    const installedRelease = await installManagedRelease({
+      sourceRoot: getCurrentPackageRoot(),
+      version: ROOTGRID_VERSION,
+      source: 'setup'
+    })
+
     stdout.write(`\nWrote config to: ${configPath}\n`)
+    stdout.write(`Managed runtime installed at: ${installedRelease.releaseDir}\n`)
 
     if (validated.host.enabled) {
       const url = `http://${validated.host.listen.host}:${validated.host.listen.port}/`
@@ -211,41 +229,39 @@ export async function runSetupWizard() {
       stdout.write('\nRunner is configured to connect upstream. Start rootgrid to register.\n')
     }
 
-    if (validated.autostart.enabled && validated.autostart.method === 'systemd-user') {
-      stdout.write('\nSetting up autostart (systemd --user)…\n')
-      const cliPath = fileURLToPath(new URL('../cli.js', import.meta.url))
-
-      // If setup was run via npx, the on-disk package path may be in a cache
-      // location that can be evicted. Prefer `npx rootgrid@<version>` so the
-      // unit can always re-fetch if needed.
-      let selfVersion = null
-      try {
-        const pkgPath = fileURLToPath(new URL('../../package.json', import.meta.url))
-        selfVersion = JSON.parse(await readFile(pkgPath, 'utf-8'))?.version ?? null
-      } catch {
-        selfVersion = null
-      }
-
-      const isNpxPath = cliPath.includes('/_npx/') || cliPath.includes('/.npm/_npx/')
-      const execStart = isNpxPath
-        ? ['npx', '--yes', selfVersion ? `rootgrid@${selfVersion}` : 'rootgrid']
-        : [process.execPath, cliPath]
-      const res = await installSystemdUserService({
-        serviceName: 'rootgrid',
+    if (validated.autostart.enabled && validated.autostart.method) {
+      const execStart = [process.execPath, join(getCurrentReleaseLinkPath(), 'src', 'cli.js')]
+      const installOpts = {
         execStart,
-        description: validated.host.enabled ? 'Rootgrid (Codex web UI + runner)' : 'Rootgrid (runner)',
-        workingDirectory: process.env.HOME ?? null,
+        workingDirectory: getCurrentReleaseLinkPath(),
         environment: {
           ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
           ...(process.env.CODEX_HOME ? { CODEX_HOME: process.env.CODEX_HOME } : {})
         }
-      })
-      if (res.ok) {
-        stdout.write(`[ok] Autostart enabled: ${res.unitPath}\n`)
-      } else {
-        stdout.write(`[!] Autostart setup failed (${res.step}).\n`)
-        stdout.write(`    Unit path: ${res.unitPath}\n`)
-        stdout.write(`    Error: ${res.error}\n`)
+      }
+
+      if (validated.autostart.method === 'systemd-user') {
+        stdout.write('\nSetting up autostart (systemd --user)…\n')
+        const res = await installSystemdUserService({
+          serviceName: ROOTGRID_USER_SERVICE_NAME,
+          description: validated.host.enabled ? 'Rootgrid (Codex web UI + runner)' : 'Rootgrid (runner)',
+          ...installOpts
+        })
+        if (res.ok) stdout.write(`[ok] Autostart enabled: ${res.unitPath}\n`)
+        else {
+          stdout.write(`[!] Autostart setup failed (${res.step}).\n`)
+          stdout.write(`    Unit path: ${res.unitPath}\n`)
+          stdout.write(`    Error: ${res.error}\n`)
+        }
+      } else if (validated.autostart.method === 'launchd-user') {
+        stdout.write('\nSetting up autostart (launchd)…\n')
+        const res = await installLaunchdUserService(installOpts)
+        if (res.ok) stdout.write(`[ok] Autostart enabled: ${res.unitPath}\n`)
+        else {
+          stdout.write(`[!] Autostart setup failed (${res.step}).\n`)
+          stdout.write(`    Unit path: ${res.unitPath}\n`)
+          stdout.write(`    Error: ${res.error}\n`)
+        }
       }
     }
 

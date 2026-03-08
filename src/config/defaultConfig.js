@@ -27,7 +27,11 @@ export function buildDefaultConfig() {
     runner: {
       enabled: true,
       machineId: crypto.randomUUID(),
-      machineName: hostname()
+      machineName: hostname(),
+      upgrade: {
+        enabled: true,
+        keepReleases: 3
+      }
     },
     host: {
       enabled: true,

@@ -28,7 +28,7 @@ More detail
   ])
 })
 
-test('parseUnifiedDiff memoizes parsed files and keeps basic hunk counts', () => {
+test('parseUnifiedDiff memoizes parsed files and keeps basic hunk structure', () => {
   const diff = [
     'diff --git a/src/a.txt b/src/a.txt',
     '--- a/src/a.txt',
@@ -44,12 +44,10 @@ test('parseUnifiedDiff memoizes parsed files and keeps basic hunk counts', () =>
   assert.strictEqual(second, first)
   assert.equal(first.length, 1)
   assert.equal(first[0].path, 'src/a.txt')
-  assert.equal(first[0].added, 1)
-  assert.equal(first[0].removed, 1)
   assert.deepEqual(first[0].lines.map((line) => line.kind), ['meta', 'meta', 'meta', 'hunk', 'del', 'add'])
 })
 
-test('summarizeUnifiedDiff counts files and line deltas without full render state', () => {
+test('summarizeUnifiedDiff counts changed files and line deltas without full render state', () => {
   const diff = [
     'diff --git a/src/a.txt b/src/a.txt',
     '--- a/src/a.txt',

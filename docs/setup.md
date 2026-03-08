@@ -26,7 +26,17 @@ If prerequisites are missing, offer to install them using the **official** insta
 - Codex (required for v0)
 - `code-server` (optional; required only for VS Code web viewer)
 
-### 3) Autostart (systemd if available)
+### 3) Managed runtime + autostart
+
+During setup, Rootgrid stages a managed runtime under:
+
+- `~/.rootgrid/releases/<release-id>/`
+- `~/.rootgrid/current -> ~/.rootgrid/releases/<release-id>/`
+
+That managed runtime becomes the stable target for:
+- autostart services
+- manual `rootgrid` launches after setup
+- remote web-triggered runner upgrades
 
 If `systemd --user` is available, ask:
 - “Do you want Rootgrid to autostart on login?”
@@ -34,6 +44,8 @@ If `systemd --user` is available, ask:
 If yes:
 - create a user service (e.g. `~/.config/systemd/user/rootgrid.service`)
 - enable + start it
+
+On macOS, use a user `launchd` agent instead (for example `~/Library/LaunchAgents/dev.rootgrid.rootgrid.plist`).
 
 ### 4) Runner setup (agent execution on this machine)
 
@@ -87,7 +99,11 @@ This is a **proposed** starting point; adjust as implementation realities land. 
   "runner": {
     "enabled": true,
     "machineId": "replace-with-uuid",
-    "machineName": "my-hostname"
+    "machineName": "my-hostname",
+    "upgrade": {
+      "enabled": true,
+      "keepReleases": 3
+    }
   },
   "host": {
     "enabled": true,
@@ -109,6 +125,10 @@ This is a **proposed** starting point; adjust as implementation realities land. 
 
 Notes:
 - `runner.machineId` should be a stable UUID generated once (so renaming the machine doesn’t create a “new machine”).
+- `runner.upgrade.enabled` defaults to `true`.
+- `runner.upgrade.keepReleases` controls how many old managed releases Rootgrid keeps under `~/.rootgrid/releases/` after a successful remote upgrade.
+- Remote runner upgrades ship a **prebuilt release bundle** from the host to the runner; the runner does **not** need `git`, `npm`, or a local build toolchain for upgrades.
+- `autostart.method` can be `systemd-user` (Linux/WSL) or `launchd-user` (macOS).
 - `retentionDays` defaults to `30` and applies to **all** persisted data (sessions, logs, artifacts) unless explicitly exempted later.
 - `notifications.sseToasts` controls toast/desktop notifications delivered over SSE:
   - `"if-not-visible"` (default): send only to hidden tabs
@@ -153,7 +173,7 @@ Common setup prompts that become painful later if you skip them:
      - disable response buffering for SSE (`/api/events`)
 
 5) **macOS autostart**
-   - if not implementing launchd in v0, print clear manual instructions
+   - ensure the LaunchAgent points at `~/.rootgrid/current/src/cli.js` so remote upgrades pick up the new managed release after restart
 
 6) **Retention / disk usage**
    - `retentionDays` (default `30`) should prune old sessions/logs/artifacts automatically

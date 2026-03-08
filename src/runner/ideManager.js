@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process'
 import net from 'node:net'
 
+import { buildIdeBasePath } from '../lib/idePaths.js'
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms))
 }
@@ -44,6 +46,52 @@ async function getFreePort() {
   })
 }
 
+let cachedCodeServerCapabilitiesPromise = null
+
+async function readCodeServerCapabilities() {
+  if (!cachedCodeServerCapabilitiesPromise) {
+    cachedCodeServerCapabilitiesPromise = new Promise((resolve) => {
+      const proc = spawn('code-server', ['--help'], {
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+      let text = ''
+      const append = (chunk) => {
+        text += String(chunk ?? '')
+      }
+      proc.stdout?.on('data', append)
+      proc.stderr?.on('data', append)
+      proc.once('error', () => {
+        resolve({
+          supportsAbsProxyBasePath: false,
+          supportsBasePath: false
+        })
+      })
+      proc.once('exit', () => {
+        resolve({
+          supportsAbsProxyBasePath: text.includes('--abs-proxy-base-path'),
+          supportsBasePath: text.includes('--base-path')
+        })
+      })
+    })
+  }
+  return await cachedCodeServerCapabilitiesPromise
+}
+
+function appendOutputTail(current, chunk, maxChars = 4000) {
+  const next = `${current}${String(chunk ?? '')}`
+  return next.length <= maxChars ? next : next.slice(-maxChars)
+}
+
+function summarizeStartupOutput(stdoutText, stderrText) {
+  const pieces = []
+  const stderr = String(stderrText ?? '').trim()
+  const stdout = String(stdoutText ?? '').trim()
+  if (stderr) pieces.push(stderr)
+  else if (stdout) pieces.push(stdout)
+  return pieces.join('\n').trim()
+}
+
 export class RunnerIdeManager {
   /**
    * @param {{
@@ -66,32 +114,62 @@ export class RunnerIdeManager {
     const port = await getFreePort()
     if (!port) throw new Error('failed to allocate port')
 
-    const basePath = `/vscode/${ideId}`
+    const basePath = buildIdeBasePath(ideId)
+    const capabilities = await readCodeServerCapabilities()
 
     const args = [
       '--auth', 'none',
       '--bind-addr', `127.0.0.1:${port}`,
       '--disable-telemetry',
-      '--disable-update-check',
-      '--base-path', basePath,
-      cwd
+      '--disable-update-check'
     ]
+    if (capabilities.supportsAbsProxyBasePath) {
+      args.push('--abs-proxy-base-path', basePath)
+    } else if (capabilities.supportsBasePath) {
+      args.push('--base-path', basePath)
+    }
+    args.push(cwd)
 
     const proc = spawn('code-server', args, {
       cwd,
       env: process.env,
-      stdio: ['ignore', 'ignore', 'ignore']
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+
+    let startupStdout = ''
+    let startupStderr = ''
+    proc.stdout?.on('data', (chunk) => {
+      startupStdout = appendOutputTail(startupStdout, chunk)
+    })
+    proc.stderr?.on('data', (chunk) => {
+      startupStderr = appendOutputTail(startupStderr, chunk)
     })
 
     this.ideSessions.set(ideId, { proc, port, cwd })
+    let started = false
+    let failedDuringStartup = false
 
     proc.once('error', (err) => {
       this.ideSessions.delete(ideId)
+      failedDuringStartup = true
       this.emit('ide.failed', { ideId, error: String(err?.message ?? err) })
     })
 
     proc.once('exit', (code, signal) => {
       this.ideSessions.delete(ideId)
+      if (!started && !failedDuringStartup) {
+        failedDuringStartup = true
+        const detail = summarizeStartupOutput(startupStdout, startupStderr)
+        const status = [`code-server exited before startup`]
+        if (Number.isFinite(Number(code))) status.push(`(exit ${Number(code)})`)
+        else if (signal) status.push(`(${String(signal)})`)
+        this.emit('ide.failed', {
+          ideId,
+          error: detail ? `${status.join(' ')}: ${detail}` : status.join(' ')
+        })
+        return
+      }
+      if (!started) return
       this.emit('ide.stopped', { ideId, code, signal })
     })
 
@@ -99,10 +177,16 @@ export class RunnerIdeManager {
     if (!ready) {
       try { proc.kill('SIGKILL') } catch { }
       this.ideSessions.delete(ideId)
-      this.emit('ide.failed', { ideId, error: 'code-server failed to start (timeout)' })
+      failedDuringStartup = true
+      const detail = summarizeStartupOutput(startupStdout, startupStderr)
+      this.emit('ide.failed', {
+        ideId,
+        error: detail ? `code-server failed to start: ${detail}` : 'code-server failed to start (timeout)'
+      })
       return
     }
 
+    started = true
     this.emit('ide.started', { ideId, cwd, port, basePath })
   }
 

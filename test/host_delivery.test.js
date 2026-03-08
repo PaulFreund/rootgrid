@@ -54,7 +54,7 @@ async function startHostProcess({ cwd }) {
 
   const child = spawn(process.execPath, ['src/cli.js'], {
     cwd,
-    env: { ...process.env, HOME: home },
+    env: { ...process.env, HOME: home, ROOTGRID_DISABLE_AUTO_MANAGED_RUNTIME: '1' },
     stdio: ['ignore', 'pipe', 'pipe']
   })
 
@@ -124,7 +124,7 @@ async function apiJson({ port, path, method = 'GET', cookie = null, body = null 
   return { res, data }
 }
 
-async function connectRunner({ port, token, machineId }) {
+async function connectRunner({ port, token, machineId, capabilities = {} }) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/runner/ws`)
   await new Promise((resolve, reject) => {
     ws.once('open', resolve)
@@ -143,7 +143,7 @@ async function connectRunner({ port, token, machineId }) {
         id: machineId,
         name: 'fake-runner',
         platform: 'linux',
-        capabilities: {}
+        capabilities
       }
     }
   }))
@@ -923,6 +923,233 @@ test('IDE session routes start and stop a runner-backed IDE session', async (t) 
   assert.equal(stopAgain.res.status, 404)
 })
 
+test('workspace helper routes proxy fs, git, and terminal requests to the runner', async (t) => {
+  const svc = await startHostProcess({ cwd: process.cwd() })
+  t.after(async () => {
+    await svc.stop()
+  })
+
+  const port = svc.config.host.listen.port
+  const cookie = await login({ port, token: svc.config.host.auth.clientToken })
+  const machineId = 'machine-workspace-tools-1'
+  const runner = await connectRunner({
+    port,
+    token: svc.config.host.auth.runnerToken,
+    machineId
+  })
+  t.after(() => {
+    try { runner.close() } catch {}
+  })
+
+  runner.on('message', (buf) => {
+    let msg
+    try {
+      msg = JSON.parse(String(buf))
+    } catch {
+      return
+    }
+
+    if (msg.type === 'fs.list') {
+      runner.send(JSON.stringify({
+        v: 1,
+        type: 'fs.list.result',
+        ts: Date.now(),
+        id: crypto.randomUUID(),
+        scope: { machineId },
+        payload: {
+          requestId: msg.payload.requestId,
+          ok: true,
+          path: '/repo',
+          parent: '/',
+          entries: [
+            { name: 'src', path: '/repo/src', kind: 'dir' },
+            { name: 'README.md', path: '/repo/README.md', kind: 'file', sizeBytes: 12 }
+          ]
+        }
+      }))
+      return
+    }
+
+    if (msg.type === 'fs.read') {
+      runner.send(JSON.stringify({
+        v: 1,
+        type: 'fs.read.result',
+        ts: Date.now(),
+        id: crypto.randomUUID(),
+        scope: { machineId },
+        payload: {
+          requestId: msg.payload.requestId,
+          ok: true,
+          path: msg.payload.path,
+          sizeBytes: 12,
+          truncated: false,
+          binary: false,
+          text: 'hello world\n'
+        }
+      }))
+      return
+    }
+
+    if (msg.type === 'git.status') {
+      runner.send(JSON.stringify({
+        v: 1,
+        type: 'git.status.result',
+        ts: Date.now(),
+        id: crypto.randomUUID(),
+        scope: { machineId },
+        payload: {
+          requestId: msg.payload.requestId,
+          ok: true,
+          cwd: '/repo',
+          rootPath: '/repo',
+          branch: 'main',
+          upstream: 'origin/main',
+          ahead: 1,
+          behind: 0,
+          notRepo: false,
+          entries: [
+            { path: 'src/app.js', x: 'M', y: ' ', label: 'M' }
+          ]
+        }
+      }))
+      return
+    }
+
+    if (msg.type === 'terminal.exec') {
+      runner.send(JSON.stringify({
+        v: 1,
+        type: 'terminal.exec.result',
+        ts: Date.now(),
+        id: crypto.randomUUID(),
+        scope: { machineId },
+        payload: {
+          requestId: msg.payload.requestId,
+          ok: true,
+          cwd: '/repo',
+          command: msg.payload.command,
+          exitCode: 0,
+          signal: null,
+          stdout: 'terminal output\n',
+          stderr: '',
+          timedOut: false,
+          durationMs: 9
+        }
+      }))
+    }
+  })
+
+  const listRes = await fetch(`http://127.0.0.1:${port}/api/fs/list?machineId=${encodeURIComponent(machineId)}&path=${encodeURIComponent('/repo')}&includeFiles=1`, {
+    headers: { cookie }
+  })
+  assert.equal(listRes.status, 200)
+  const listData = await listRes.json()
+  assert.deepEqual(listData.entries.map((entry) => entry.kind), ['dir', 'file'])
+
+  const readRes = await fetch(`http://127.0.0.1:${port}/api/fs/read?machineId=${encodeURIComponent(machineId)}&path=${encodeURIComponent('/repo/README.md')}`, {
+    headers: { cookie }
+  })
+  assert.equal(readRes.status, 200)
+  const readData = await readRes.json()
+  assert.equal(readData.text, 'hello world\n')
+
+  const gitRes = await fetch(`http://127.0.0.1:${port}/api/git/status?machineId=${encodeURIComponent(machineId)}&cwd=${encodeURIComponent('/repo')}`, {
+    headers: { cookie }
+  })
+  assert.equal(gitRes.status, 200)
+  const gitData = await gitRes.json()
+  assert.equal(gitData.branch, 'main')
+  assert.equal(gitData.entries[0]?.path, 'src/app.js')
+
+  const term = await apiJson({
+    port,
+    path: '/api/terminal/exec',
+    method: 'POST',
+    cookie,
+    body: {
+      machineId,
+      cwd: '/repo',
+      command: 'pwd'
+    }
+  })
+  assert.equal(term.res.status, 200)
+  assert.equal(term.data?.stdout, 'terminal output\n')
+})
+
+test('machine upgrade route waits for runner acceptance', async (t) => {
+  const svc = await startHostProcess({ cwd: process.cwd() })
+  t.after(async () => {
+    await svc.stop()
+  })
+
+  const port = svc.config.host.listen.port
+  const cookie = await login({ port, token: svc.config.host.auth.clientToken })
+  const machineId = 'machine-upgrade-1'
+  const runner = await connectRunner({
+    port,
+    token: svc.config.host.auth.runnerToken,
+    machineId,
+    capabilities: {
+      rootgridVersion: '0.0.0-old',
+      upgrade: { enabled: true }
+    }
+  })
+  t.after(() => {
+    try { runner.close() } catch {}
+  })
+
+  runner.on('message', (buf) => {
+    let msg
+    try {
+      msg = JSON.parse(String(buf))
+    } catch {
+      return
+    }
+    if (msg.type === 'machine.upgrade.start') {
+      runner.send(JSON.stringify({
+        v: 1,
+        type: 'machine.upgrade.accepted',
+        ts: Date.now(),
+        id: crypto.randomUUID(),
+        scope: { machineId },
+        payload: {
+          requestId: msg.payload.requestId,
+          machineId
+        }
+      }))
+      return
+    }
+
+    if (msg.type === 'machine.upgrade.end') {
+      runner.send(JSON.stringify({
+        v: 1,
+        type: 'machine.upgrade.bundle.received',
+        ts: Date.now(),
+        id: crypto.randomUUID(),
+        scope: { machineId },
+        payload: {
+          requestId: msg.payload.requestId,
+          machineId,
+          releaseId: 'release-test-1',
+          version: '0.0.0'
+        }
+      }))
+    }
+  })
+
+  const out = await apiJson({
+    port,
+    path: `/api/machines/${machineId}/upgrade`,
+    method: 'POST',
+    cookie,
+    body: { hostVersion: '0.0.0-new' }
+  })
+
+  assert.equal(out.res.status, 200)
+  assert.equal(out.data?.ok, true)
+  assert.equal(out.data?.machineId, machineId)
+  assert.equal(out.data?.accepted, true)
+})
+
 test('system settings and push subscription routes persist config + subscriptions', async (t) => {
   const svc = await startHostProcess({ cwd: process.cwd() })
   t.after(async () => {
@@ -940,6 +1167,7 @@ test('system settings and push subscription routes persist config + subscription
     cookie
   })
   assert.equal(settingsBefore.res.status, 200)
+  assert.ok(typeof settingsBefore.data?.appVersion === 'string')
   assert.equal(settingsBefore.data?.retentionDays, svc.config.retentionDays)
 
   const update = await apiJson({

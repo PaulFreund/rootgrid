@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Archive, ArrowDown, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FolderClosed, Loader2, Mic, MoreHorizontal, Play, Plus, Search, Settings, Square, Trash2, X } from 'lucide-vue-next'
+import { Archive, ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FileText, FolderClosed, GitBranch, Loader2, Mic, MoreHorizontal, Plus, Search, Settings, Square, Terminal, Trash2, X } from 'lucide-vue-next'
 
 import MarkdownView from './components/MarkdownView.vue'
 import {
@@ -11,8 +11,12 @@ import {
   finalizeCompletedPlan,
   indicatorDotClass,
   machineIsOnline as machineIsOnlineAt,
+  machineHasVersionMismatch as machineHasVersionMismatchAt,
+  machineRootgridVersion as machineRootgridVersionAt,
   machineShowLastSeen as machineShowLastSeenAt,
   machineStatusLabel as machineStatusLabelAt,
+  machineSupportsWebUpgrade as machineSupportsWebUpgradeAt,
+  machineUpgradeStatusText as machineUpgradeStatusTextAt,
   planStepIsCompleted,
   statusChipClass,
   toastBorderClass,
@@ -108,6 +112,16 @@ import {
   sessionTooltip as sessionTooltipForRow
 } from './lib/sessionUi.js'
 import {
+  clampSessionSidebarWidth,
+  DEFAULT_SESSION_SIDEBAR_WIDTH,
+  persistSessionSidebarWidth,
+  readStoredSessionSidebarWidth
+} from './lib/sidebarResize.js'
+import {
+  isMobileViewportWidth,
+  preferredMobilePane
+} from './lib/mobileLayout.js'
+import {
   computeVirtualWindowVariable
 } from './lib/virtualList.js'
 
@@ -126,6 +140,7 @@ const sseConnectionId = ref(null)
 let onlineHandler = null
 let offlineHandler = null
 
+const layoutShellEl = ref(null)
 const machines = ref([])
 const sessions = ref([])
 const machineRowsById = reactive(new Map())
@@ -136,6 +151,10 @@ const activeThinkingLabelChars = Array.from('Thinking...')
 const sessionListScrollEl = ref(null)
 const sessionListScrollTop = ref(0)
 const sessionListViewportHeight = ref(720)
+const sessionSidebarWidth = ref(DEFAULT_SESSION_SIDEBAR_WIDTH)
+const sessionSidebarDragging = ref(false)
+const isMobileLayout = ref(false)
+const mobilePane = ref('list')
 const sessionListGroupingMode = ref(readSessionListGroupingMode())
 const sessionListLoading = ref(false)
 const sessionListHasMore = ref(false)
@@ -250,6 +269,7 @@ const retentionDraft = ref('')
 const sseToastsDraft = ref('if-not-visible') // always|never|if-not-visible
 const webPushDraft = ref('if-not-visible') // always|never|if-not-visible
 const appSettings = reactive({
+  appVersion: null,
   retentionDays: 30,
   notifications: { sseToasts: 'if-not-visible', webPush: 'if-not-visible' },
   host: null,
@@ -268,6 +288,26 @@ const sendError = ref('')
 const ideError = ref('')
 const sending = ref(false)
 const ideStarting = ref(false)
+const activeIdeSession = ref(null)
+const ideFrameLoading = ref(false)
+const workspacePaneOpen = ref(false)
+const workspacePaneTab = ref('code')
+const workspaceFilesPath = ref('')
+const workspaceFilesParent = ref(null)
+const workspaceFileEntries = ref([])
+const workspaceFilesLoading = ref(false)
+const workspaceFilesError = ref('')
+const workspaceSelectedFilePath = ref('')
+const workspaceSelectedFile = ref(null)
+const workspaceFileLoading = ref(false)
+const workspaceFileError = ref('')
+const workspaceGitStatus = ref(null)
+const workspaceGitLoading = ref(false)
+const workspaceGitError = ref('')
+const workspaceTerminalCommand = ref('')
+const workspaceTerminalRunning = ref(false)
+const workspaceTerminalError = ref('')
+const workspaceTerminalRuns = ref([])
 
 const chatScrollEl = ref(null)
 const stickToBottom = ref(true)
@@ -306,6 +346,8 @@ const deleteMachineError = ref('')
 
 const machineDisconnectWorkingId = ref(null)
 const machineDisconnectError = ref('')
+const machineUpgradeWorkingId = ref(null)
+const machineUpgradeError = ref('')
 
 let markReadTimer = null
 const sessionLoading = ref(false)
@@ -313,6 +355,9 @@ const loadSessionNonce = ref(0)
 let keydownHandler = null
 let visibilityHandler = null
 let swMessageHandler = null
+let windowResizeHandler = null
+let sidebarDragMoveHandler = null
+let sidebarDragUpHandler = null
 let sessionListResizeObserver = null
 let sessionMenuOutsideHandler = null
 
@@ -425,6 +470,84 @@ function persistSessionListGroupingMode(value) {
   }
 }
 
+function readSessionSidebarWidth() {
+  const viewportWidth = Number(layoutShellEl.value?.clientWidth ?? window.innerWidth ?? 0)
+  return readStoredSessionSidebarWidth(globalThis.localStorage, viewportWidth)
+}
+
+function applySessionSidebarWidth(value) {
+  const viewportWidth = Number(layoutShellEl.value?.clientWidth ?? window.innerWidth ?? 0)
+  sessionSidebarWidth.value = clampSessionSidebarWidth(value, viewportWidth)
+  return sessionSidebarWidth.value
+}
+
+function persistSidebarWidth() {
+  persistSessionSidebarWidth(sessionSidebarWidth.value)
+}
+
+function refreshMobileLayout() {
+  const viewportWidth = Number(layoutShellEl.value?.clientWidth ?? window.innerWidth ?? 0)
+  isMobileLayout.value = isMobileViewportWidth(viewportWidth)
+}
+
+function stopSessionSidebarDrag() {
+  sessionSidebarDragging.value = false
+  if (sidebarDragMoveHandler) {
+    try { window.removeEventListener('pointermove', sidebarDragMoveHandler) } catch {}
+    sidebarDragMoveHandler = null
+  }
+  if (sidebarDragUpHandler) {
+    try { window.removeEventListener('pointerup', sidebarDragUpHandler) } catch {}
+    try { window.removeEventListener('pointercancel', sidebarDragUpHandler) } catch {}
+    sidebarDragUpHandler = null
+  }
+  try { document.body.classList.remove('rootgrid-col-resize-active') } catch {}
+  persistSidebarWidth()
+}
+
+function updateSessionSidebarWidthFromClientX(clientX) {
+  const rect = layoutShellEl.value?.getBoundingClientRect?.()
+  const left = Number(rect?.left ?? 0)
+  const width = clientX - left
+  applySessionSidebarWidth(width)
+}
+
+function beginSessionSidebarDrag(ev) {
+  if (isMobileLayout.value) return
+  const clientX = Number(ev?.clientX)
+  if (!Number.isFinite(clientX)) return
+  stopSessionSidebarDrag()
+  sessionSidebarDragging.value = true
+  try { document.body.classList.add('rootgrid-col-resize-active') } catch {}
+  updateSessionSidebarWidthFromClientX(clientX)
+
+  const onMove = (moveEv) => {
+    updateSessionSidebarWidthFromClientX(Number(moveEv?.clientX))
+  }
+  const onUp = () => {
+    stopSessionSidebarDrag()
+  }
+
+  sidebarDragMoveHandler = onMove
+  sidebarDragUpHandler = onUp
+  try { window.addEventListener('pointermove', onMove) } catch {}
+  try { window.addEventListener('pointerup', onUp, { once: true }) } catch {}
+  try { window.addEventListener('pointercancel', onUp, { once: true }) } catch {}
+}
+
+function showMobileSessionList() {
+  if (!isMobileLayout.value) return
+  workspacePaneOpen.value = false
+  mobilePane.value = 'list'
+}
+
+function openSession(sessionId) {
+  const sid = String(sessionId ?? '').trim()
+  if (!sid) return
+  selectedSessionId.value = sid
+  if (isMobileLayout.value) mobilePane.value = 'session'
+}
+
 const {
   applySessionPageInfo,
   loadMoreSessions,
@@ -499,7 +622,7 @@ function showBrowserToast(toast) {
     toast,
     focusWindow: () => window.focus(),
     onSessionSelected: (sessionId) => {
-      selectedSessionId.value = sessionId
+      openSession(sessionId)
     }
   })
 }
@@ -526,6 +649,22 @@ function machineShowLastSeen(m) {
 
 function machineStatusLabel(m) {
   return machineStatusLabelAt(nowMs.value, m)
+}
+
+function machineRootgridVersion(m) {
+  return machineRootgridVersionAt(m)
+}
+
+function machineHasVersionMismatch(m) {
+  return machineHasVersionMismatchAt(m, appSettings.appVersion)
+}
+
+function machineSupportsWebUpgrade(m) {
+  return machineSupportsWebUpgradeAt(m)
+}
+
+function machineUpgradeStatusText(m) {
+  return machineUpgradeStatusTextAt(m)
 }
 
 async function markSessionRead(sessionId) {
@@ -916,6 +1055,26 @@ watch(settingsTab, (t) => {
   if (t === 'system') refreshPushSubscription().catch(() => {})
 })
 
+watch(selectedSessionId, (sid, prevSid) => {
+  if (!isMobileLayout.value) return
+  if (!String(sid ?? '').trim()) {
+    mobilePane.value = 'list'
+    return
+  }
+  if (sid !== prevSid && mobilePane.value !== 'workspace') {
+    mobilePane.value = 'session'
+  }
+})
+
+watch(isMobileLayout, (mobile) => {
+  if (mobile) {
+    mobilePane.value = preferredMobilePane(selectedSessionId.value)
+    nextTick(() => updateSessionListMetrics())
+    return
+  }
+  mobilePane.value = 'session'
+})
+
 watch(sessionListGroupingMode, (value) => {
   persistSessionListGroupingMode(value)
 })
@@ -939,6 +1098,17 @@ const visibleSessionWindow = computed(() => computeVirtualWindowVariable(session
   overscanPx: 280,
   getItemHeight: (entry) => entry?.kind === 'group' ? 28 : 56
 }))
+const layoutTrackStyle = computed(() => {
+  if (!isMobileLayout.value) return null
+  return {
+    width: '200%',
+    transform: mobilePane.value === 'list' ? 'translateX(0%)' : 'translateX(-50%)'
+  }
+})
+const sessionSidebarStyle = computed(() => {
+  if (isMobileLayout.value) return null
+  return { width: `${sessionSidebarWidth.value}px` }
+})
 const sidebarProjectLabel = computed(() => {
   if (selectedSession.value) return sessionProject(selectedSession.value)
   const cwd = String(defaults.cwd ?? '').trim()
@@ -964,6 +1134,18 @@ const composerProjectLabel = computed(() => {
   const cwd = String(defaults.cwd ?? '').trim()
   return cwd ? sessionProject({ cwd }) : 'No workspace'
 })
+const currentWorkspaceContext = computed(() => {
+  const cwd = String(selectedSession.value?.cwd ?? defaults.cwd ?? '').trim()
+  const machineId = String(selectedSession.value?.machineId ?? defaults.machineId ?? '').trim()
+  return {
+    cwd,
+    machineId
+  }
+})
+const showWorkspacePane = computed(() => {
+  if (isMobileLayout.value) return false
+  return workspacePaneOpen.value
+})
 const composerTokenSummary = computed(() => {
   const usage = selectedTokenUsage.value
   if (!usage) return ''
@@ -971,6 +1153,12 @@ const composerTokenSummary = computed(() => {
   if (usage.lastTotalTokens !== null) parts.push(`last ${formatCompactInt(usage.lastTotalTokens)}`)
   if (usage.totalTotalTokens !== null) parts.push(`total ${formatCompactInt(usage.totalTotalTokens)}`)
   return parts.join(' · ')
+})
+const workspacePaneTitle = computed(() => {
+  if (workspacePaneTab.value === 'terminal') return 'Terminal'
+  if (workspacePaneTab.value === 'files') return 'Files'
+  if (workspacePaneTab.value === 'git') return 'Git'
+  return 'Workspace'
 })
 
 const pinnedPlanSteps = computed(() => {
@@ -1246,7 +1434,9 @@ async function archiveFromSessionMenu(sessionId) {
 
 const {
   disconnectMachine,
-  openVSCode
+  upgradeMachine,
+  openVSCode,
+  stopVSCode
 } = createMachineControlActions({
   apiFetch,
   defaults,
@@ -1254,9 +1444,275 @@ const {
   selectedSession,
   machineDisconnectWorkingId,
   machineDisconnectError,
+  machineUpgradeWorkingId,
+  machineUpgradeError,
+  appSettings,
   ideError,
-  ideStarting
+  ideStarting,
+  onIdeSessionStarted: (ideSession) => {
+    if (!ideSession?.urlPath) return
+    activeIdeSession.value = {
+      ideId: ideSession.ideId ?? null,
+      urlPath: ideSession.urlPath,
+      cwd: ideSession.cwd ?? '',
+      machineId: ideSession.machineId ?? null
+    }
+    workspacePaneOpen.value = true
+    workspacePaneTab.value = 'code'
+    ideFrameLoading.value = true
+    if (isMobileLayout.value) mobilePane.value = 'workspace'
+  }
 })
+
+function activateWorkspacePane(tab) {
+  workspacePaneOpen.value = true
+  workspacePaneTab.value = tab
+  if (isMobileLayout.value) mobilePane.value = 'workspace'
+}
+
+function restoreMobileSessionPane() {
+  if (!isMobileLayout.value) return
+  workspacePaneOpen.value = false
+  mobilePane.value = preferredMobilePane(selectedSessionId.value)
+}
+
+function buildWorkspaceQuery(pathname, { cwd = '', machineId = '', path = '', maxBytes = null } = {}) {
+  const params = new URLSearchParams()
+  const safeCwd = String(cwd ?? '').trim()
+  const safeMachineId = String(machineId ?? '').trim()
+  const safePath = String(path ?? '').trim()
+  if (safeMachineId) params.set('machineId', safeMachineId)
+  if (safeCwd) params.set('cwd', safeCwd)
+  if (safePath) params.set('path', safePath)
+  if (Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0) params.set('maxBytes', String(Number(maxBytes)))
+  return `${pathname}?${params.toString()}`
+}
+
+function resolveWorkspaceContext() {
+  const ctx = currentWorkspaceContext.value
+  const cwd = String(ctx?.cwd ?? '').trim()
+  if (!cwd) {
+    ideError.value = 'Workspace (cwd) is required.'
+    openSettings('defaults')
+    return null
+  }
+  return {
+    cwd,
+    machineId: String(ctx?.machineId ?? '').trim()
+  }
+}
+
+async function loadWorkspaceFiles(path = null) {
+  const ctx = resolveWorkspaceContext()
+  if (!ctx) return false
+  workspaceFilesError.value = ''
+  workspaceFilesLoading.value = true
+  activateWorkspacePane('files')
+  const targetPath = String(path ?? workspaceFilesPath.value ?? ctx.cwd).trim() || ctx.cwd
+  try {
+    const res = await apiFetch(buildWorkspaceQuery('/api/fs/list', {
+      machineId: ctx.machineId,
+      path: targetPath
+    }) + '&includeFiles=1')
+    const data = await res.json().catch(() => null)
+    if (!res.ok) {
+      workspaceFilesError.value = data?.error ?? `HTTP ${res.status}`
+      return false
+    }
+    workspaceFilesPath.value = String(data?.path ?? targetPath)
+    workspaceFilesParent.value = data?.parent ?? null
+    workspaceFileEntries.value = Array.isArray(data?.entries) ? data.entries : []
+    return true
+  } catch (err) {
+    workspaceFilesError.value = String(err?.message ?? err)
+    return false
+  } finally {
+    workspaceFilesLoading.value = false
+  }
+}
+
+async function loadWorkspaceFile(path) {
+  const ctx = resolveWorkspaceContext()
+  if (!ctx) return false
+  const targetPath = String(path ?? '').trim()
+  if (!targetPath) return false
+  workspaceFileError.value = ''
+  workspaceFileLoading.value = true
+  workspaceSelectedFilePath.value = targetPath
+  try {
+    const res = await apiFetch(buildWorkspaceQuery('/api/fs/read', {
+      machineId: ctx.machineId,
+      path: targetPath,
+      maxBytes: 200_000
+    }))
+    const data = await res.json().catch(() => null)
+    if (!res.ok) {
+      workspaceFileError.value = data?.error ?? `HTTP ${res.status}`
+      workspaceSelectedFile.value = null
+      return false
+    }
+    workspaceSelectedFile.value = data
+    return true
+  } catch (err) {
+    workspaceFileError.value = String(err?.message ?? err)
+    workspaceSelectedFile.value = null
+    return false
+  } finally {
+    workspaceFileLoading.value = false
+  }
+}
+
+async function openWorkspaceEntry(entry) {
+  if (!entry) return
+  if (entry.kind === 'dir') {
+    await loadWorkspaceFiles(entry.path)
+    return
+  }
+  await loadWorkspaceFile(entry.path)
+}
+
+async function refreshWorkspaceGit() {
+  const ctx = resolveWorkspaceContext()
+  if (!ctx) return false
+  workspaceGitError.value = ''
+  workspaceGitLoading.value = true
+  activateWorkspacePane('git')
+  try {
+    const res = await apiFetch(buildWorkspaceQuery('/api/git/status', {
+      machineId: ctx.machineId,
+      cwd: ctx.cwd
+    }))
+    const data = await res.json().catch(() => null)
+    if (!res.ok) {
+      workspaceGitError.value = data?.error ?? `HTTP ${res.status}`
+      return false
+    }
+    workspaceGitStatus.value = data
+    return true
+  } catch (err) {
+    workspaceGitError.value = String(err?.message ?? err)
+    return false
+  } finally {
+    workspaceGitLoading.value = false
+  }
+}
+
+function openGitFile(entry) {
+  const ctx = resolveWorkspaceContext()
+  const relPath = String(entry?.path ?? '').trim()
+  if (!ctx || !relPath) return
+  activateWorkspacePane('files')
+  const absolutePath = relPath.startsWith('/') ? relPath : `${ctx.cwd.replace(/\/+$/, '')}/${relPath}`
+  loadWorkspaceFiles(ctx.cwd).then(() => loadWorkspaceFile(absolutePath)).catch(() => {})
+}
+
+async function runWorkspaceTerminalCommand() {
+  const ctx = resolveWorkspaceContext()
+  if (!ctx) return false
+  const command = String(workspaceTerminalCommand.value ?? '').trim()
+  if (!command) return false
+  workspaceTerminalError.value = ''
+  workspaceTerminalRunning.value = true
+  activateWorkspacePane('terminal')
+  const run = {
+    id: crypto.randomUUID(),
+    cwd: ctx.cwd,
+    command,
+    stdout: '',
+    stderr: '',
+    exitCode: null,
+    signal: null,
+    timedOut: false,
+    durationMs: null
+  }
+  workspaceTerminalRuns.value = [run, ...workspaceTerminalRuns.value].slice(0, 30)
+  workspaceTerminalCommand.value = ''
+  try {
+    const res = await apiFetch('/api/terminal/exec', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...(ctx.machineId ? { machineId: ctx.machineId } : {}),
+        cwd: ctx.cwd,
+        command
+      })
+    })
+    const data = await res.json().catch(() => null)
+    if (!res.ok) {
+      workspaceTerminalError.value = data?.error ?? `HTTP ${res.status}`
+      run.stderr = workspaceTerminalError.value
+      run.exitCode = -1
+      return false
+    }
+    run.stdout = String(data?.stdout ?? '')
+    run.stderr = String(data?.stderr ?? '')
+    run.exitCode = Number.isFinite(Number(data?.exitCode)) ? Number(data.exitCode) : null
+    run.signal = data?.signal ?? null
+    run.timedOut = Boolean(data?.timedOut)
+    run.durationMs = Number.isFinite(Number(data?.durationMs)) ? Number(data.durationMs) : null
+    return true
+  } catch (err) {
+    const message = String(err?.message ?? err)
+    workspaceTerminalError.value = message
+    run.stderr = message
+    run.exitCode = -1
+    return false
+  } finally {
+    workspaceTerminalRunning.value = false
+  }
+}
+
+async function openWorkspaceTool(tab) {
+  if (tab === 'files') {
+    await loadWorkspaceFiles()
+    return
+  }
+  if (tab === 'git') {
+    await refreshWorkspaceGit()
+    return
+  }
+  if (tab === 'terminal') {
+    workspaceTerminalError.value = ''
+    activateWorkspacePane('terminal')
+    return
+  }
+  await openWorkspace()
+}
+
+async function openWorkspace() {
+  ideError.value = ''
+  activateWorkspacePane('code')
+  const ctx = resolveWorkspaceContext()
+  if (!ctx) return false
+  if (
+    activeIdeSession.value
+    && String(activeIdeSession.value.cwd ?? '') === ctx.cwd
+    && String(activeIdeSession.value.machineId ?? '') === ctx.machineId
+  ) {
+    ideFrameLoading.value = false
+    return true
+  }
+  const existingIdeId = String(activeIdeSession.value?.ideId ?? '').trim()
+  if (existingIdeId) {
+    await stopVSCode(existingIdeId)
+    activeIdeSession.value = null
+    ideFrameLoading.value = false
+  }
+  return await openVSCode()
+}
+
+async function closeWorkspacePane() {
+  ideError.value = ''
+  const existingIdeId = String(activeIdeSession.value?.ideId ?? '').trim()
+  workspacePaneOpen.value = false
+  activeIdeSession.value = null
+  ideFrameLoading.value = false
+  if (isMobileLayout.value) restoreMobileSessionPane()
+  if (existingIdeId) await stopVSCode(existingIdeId)
+}
+
+function onIdeFrameLoad() {
+  ideFrameLoading.value = false
+}
 
 const {
   openRenameSession,
@@ -1310,7 +1766,7 @@ onMounted(async () => {
       if (data.type !== 'navigate') return
       const sid = data.sessionId
       if (typeof sid === 'string' && sid) {
-        selectedSessionId.value = sid
+        openSession(sid)
       } else if (typeof data.url === 'string' && data.url) {
         try { window.location.href = data.url } catch { }
       }
@@ -1324,6 +1780,8 @@ onMounted(async () => {
     if (raw) Object.assign(defaults, JSON.parse(raw))
   } catch {
   }
+  refreshMobileLayout()
+  sessionSidebarWidth.value = readSessionSidebarWidth()
 
   watch(defaults, () => {
     try {
@@ -1348,9 +1806,18 @@ onMounted(async () => {
   offlineHandler = onOffline
   try { window.addEventListener('online', onOnline) } catch {}
   try { window.addEventListener('offline', onOffline) } catch {}
+  const onResize = () => {
+    refreshMobileLayout()
+    applySessionSidebarWidth(sessionSidebarWidth.value)
+    updateSessionListMetrics()
+  }
+  windowResizeHandler = onResize
+  try { window.addEventListener('resize', onResize) } catch {}
 
   const onKeyDown = (ev) => {
     if (ev.key === 'Escape') {
+      if (sessionSidebarDragging.value) stopSessionSidebarDrag()
+      else if (workspacePaneOpen.value) closeWorkspacePane()
       if (sessionMenuId.value) closeSessionMenu()
       else if (renameOpen.value) renameOpen.value = false
       else if (defaultsOpen.value) defaultsOpen.value = false
@@ -1406,7 +1873,7 @@ onMounted(async () => {
   if (authed.value) {
     connectSse()
     if (deepLinkSessionId.value) {
-      selectedSessionId.value = deepLinkSessionId.value
+      openSession(deepLinkSessionId.value)
       deepLinkSessionId.value = null
     }
   }
@@ -1415,6 +1882,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   clearComposerAttachments()
   disposeSse()
+  stopSessionSidebarDrag()
   try { sessionListResizeObserver?.disconnect?.() } catch {}
   sessionListResizeObserver = null
   if (nowTimer) {
@@ -1437,6 +1905,10 @@ onBeforeUnmount(() => {
   if (offlineHandler) {
     try { window.removeEventListener('offline', offlineHandler) } catch {}
     offlineHandler = null
+  }
+  if (windowResizeHandler) {
+    try { window.removeEventListener('resize', windowResizeHandler) } catch {}
+    windowResizeHandler = null
   }
 
   if (visibilityHandler) {
@@ -1512,9 +1984,18 @@ watch(
         </div>
       </div>
 
-      <div class="flex flex-1 min-h-0">
+      <div ref="layoutShellEl" class="flex flex-1 min-h-0 overflow-hidden">
+        <div
+          class="flex min-h-0 flex-1"
+          :class="isMobileLayout ? 'shrink-0 transition-transform duration-300 ease-out' : ''"
+          :style="layoutTrackStyle"
+        >
         <!-- Sidebar -->
-        <aside class="shrink-0 flex w-[228px] flex-col bg-[#efefec]">
+        <aside
+          class="flex flex-col bg-[#efefec]"
+          :class="isMobileLayout ? 'min-h-0 w-full shrink-0' : 'shrink-0'"
+          :style="sessionSidebarStyle"
+        >
           <div class="shrink-0 px-3 pb-2 pt-3">
             <div class="flex items-center justify-between gap-3">
               <button
@@ -1609,7 +2090,7 @@ watch(
                     class="group w-full rounded-lg px-2.5 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-slate-400/30"
                     :class="selectedSessionId === entry.session.sessionId ? 'bg-[#ecece8]' : 'hover:bg-black/[0.035]'"
                     :title="sessionTooltip(entry.session)"
-                    @click="selectedSessionId = entry.session.sessionId"
+                    @click="openSession(entry.session.sessionId)"
                   >
                     <div class="flex items-start gap-2.5">
                       <span
@@ -1705,13 +2186,43 @@ watch(
           </div>
         </aside>
 
+        <div
+          v-if="!isMobileLayout"
+          class="group relative shrink-0 w-3 cursor-col-resize touch-none"
+          title="Drag to resize the thread sidebar"
+          @pointerdown.prevent="beginSessionSidebarDrag"
+        >
+          <div
+            class="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 rounded-full transition-colors"
+            :class="sessionSidebarDragging ? 'bg-slate-400/70' : 'bg-transparent group-hover:bg-slate-300/70'"
+          />
+        </div>
+
       <!-- Main -->
-      <main class="flex-1 min-h-0 bg-white p-1.5">
-        <section class="flex h-full min-w-0 flex-col overflow-hidden rounded-[16px] bg-white shadow-[0_1px_2px_rgba(0,0,0,0.03)]">
+      <div
+        class="flex min-h-0 bg-white"
+        :class="isMobileLayout ? 'w-full shrink-0 p-0' : 'flex-1 gap-1.5 p-1.5'"
+      >
+      <main
+        class="min-h-0"
+        :class="showWorkspacePane ? 'min-w-0 basis-[44%] shrink-0 grow-0' : 'min-w-0 flex-1'"
+      >
+        <section
+          v-if="!(isMobileLayout && mobilePane === 'workspace')"
+          class="flex h-full min-w-0 flex-col overflow-hidden rounded-[16px] bg-white shadow-[0_1px_2px_rgba(0,0,0,0.03)]"
+        >
           <header class="bg-white px-4 py-2.5">
             <div class="flex items-start justify-between gap-4">
               <div class="min-w-0">
                 <div class="flex min-w-0 items-center gap-2">
+                  <button
+                    v-if="isMobileLayout"
+                    class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                    title="Back to threads"
+                  @click="showMobileSessionList"
+                  >
+                    <ArrowLeft class="h-4 w-4" />
+                  </button>
                   <div v-if="selectedSession" class="min-w-0 flex items-center gap-2">
                     <button
                       class="truncate rounded text-[13px] font-semibold text-slate-800 transition-colors hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
@@ -1734,30 +2245,39 @@ watch(
 
               <div class="flex shrink-0 items-center gap-1.5">
                 <button
-                  class="inline-flex h-7 w-7 items-center justify-center rounded-full border border-black/[0.06] bg-white text-slate-500 transition-colors hover:bg-black/[0.03] hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                  :title="selectedSessionId ? 'Jump to latest' : 'Start a thread'"
-                  @click="selectedSessionId ? scrollToBottom() : openNewThreadDialog()"
-                >
-                  <Play class="h-3 w-3 fill-current" />
-                </button>
-                <button
                   class="inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white px-2.5 py-1 text-[11px] text-slate-700 transition-colors hover:bg-black/[0.03] disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                  @click="openVSCode"
+                  @click="openWorkspace"
                   title="Open VS Code web (code-server)"
                   :disabled="ideStarting"
                 >
                   <Loader2 v-if="ideStarting" class="h-3 w-3 animate-spin" />
                   <Code v-else class="h-3 w-3" />
                   Open
-                  <ChevronDown class="h-3 w-3 text-slate-400" />
                 </button>
-                <div
-                  v-if="selectedTokenUsage"
-                  class="ml-1 hidden items-center gap-2 text-[11px] tabular-nums text-slate-400 lg:flex"
+                <button
+                  class="inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white px-2.5 py-1 text-[11px] text-slate-700 transition-colors hover:bg-black/[0.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  @click="openWorkspaceTool('terminal')"
+                  title="Open terminal"
                 >
-                  <span v-if="selectedTokenUsage.lastTotalTokens !== null" class="text-emerald-600">+{{ formatCompactInt(selectedTokenUsage.lastTotalTokens) }}</span>
-                  <span v-if="selectedTokenUsage.totalTotalTokens !== null" class="text-rose-500">-{{ formatCompactInt(selectedTokenUsage.totalTotalTokens) }}</span>
-                </div>
+                  <Terminal class="h-3 w-3" />
+                  <span class="hidden sm:inline">Terminal</span>
+                </button>
+                <button
+                  class="inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white px-2.5 py-1 text-[11px] text-slate-700 transition-colors hover:bg-black/[0.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  @click="openWorkspaceTool('files')"
+                  title="Open file viewer"
+                >
+                  <FileText class="h-3 w-3" />
+                  <span class="hidden sm:inline">Files</span>
+                </button>
+                <button
+                  class="inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white px-2.5 py-1 text-[11px] text-slate-700 transition-colors hover:bg-black/[0.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  @click="openWorkspaceTool('git')"
+                  title="Open git viewer"
+                >
+                  <GitBranch class="h-3 w-3" />
+                  <span class="hidden sm:inline">Git</span>
+                </button>
               </div>
             </div>
           </header>
@@ -1928,7 +2448,10 @@ watch(
                                       {{ diffStepSummary(it).detail }}
                                     </span>
                                   </div>
-                                  <div class="shrink-0 text-xs font-mono">
+                                  <div
+                                    v-if="diffStepSummary(it).added || diffStepSummary(it).removed"
+                                    class="shrink-0 text-xs font-mono tabular-nums"
+                                  >
                                     <span class="text-emerald-700">+{{ diffStepSummary(it).added }}</span>
                                     <span class="ml-2 text-rose-700">-{{ diffStepSummary(it).removed }}</span>
                                   </div>
@@ -1963,13 +2486,9 @@ watch(
                                 </div>
 
                                 <template v-else>
-                                  <div class="flex items-center justify-between gap-3 border-b border-black/[0.05] px-3 py-2">
+                                  <div class="border-b border-black/[0.05] px-3 py-2">
                                     <div class="min-w-0 truncate text-xs font-mono text-slate-800">
                                       {{ diffStepSelectedFile(it.id, diffStepFiles(it))?.path ?? '' }}
-                                    </div>
-                                    <div class="shrink-0 text-xs font-mono">
-                                      <span class="text-emerald-700">+{{ diffStepSelectedFile(it.id, diffStepFiles(it))?.added ?? 0 }}</span>
-                                      <span class="ml-2 text-rose-700">-{{ diffStepSelectedFile(it.id, diffStepFiles(it))?.removed ?? 0 }}</span>
                                     </div>
                                   </div>
 
@@ -2052,13 +2571,18 @@ watch(
                       :open="m.expanded"
                       @toggle="onDiffDetailsToggle(m.id, $event)"
                     >
-                      <summary class="cursor-pointer select-none flex items-center justify-between gap-4 py-0.5">
-                        <div class="min-w-0 truncate text-sm text-slate-800" :title="diffStepSummary(m).label">
-                          {{ diffStepSummary(m).label }}
-                        </div>
-                        <div class="shrink-0 text-xs font-mono">
-                          <span class="text-emerald-700">+{{ diffStepSummary(m).added }}</span>
-                          <span class="ml-2 text-rose-700">-{{ diffStepSummary(m).removed }}</span>
+                      <summary class="cursor-pointer select-none py-0.5">
+                        <div class="flex items-center justify-between gap-4" :title="diffStepSummary(m).label">
+                          <div class="min-w-0 truncate text-sm text-slate-800">
+                            {{ diffStepSummary(m).label }}
+                          </div>
+                          <div
+                            v-if="diffStepSummary(m).added || diffStepSummary(m).removed"
+                            class="shrink-0 text-xs font-mono tabular-nums"
+                          >
+                            <span class="text-emerald-700">+{{ diffStepSummary(m).added }}</span>
+                            <span class="ml-2 text-rose-700">-{{ diffStepSummary(m).removed }}</span>
+                          </div>
                         </div>
                       </summary>
 
@@ -2090,13 +2614,9 @@ watch(
                         </div>
 
                         <template v-else>
-                          <div class="flex items-center justify-between gap-3 border-b border-black/[0.05] px-3 py-2">
+                          <div class="border-b border-black/[0.05] px-3 py-2">
                             <div class="min-w-0 truncate text-xs font-mono text-slate-800">
                               {{ diffStepSelectedFile(m.id, diffStepFiles(m))?.path ?? '' }}
-                            </div>
-                            <div class="shrink-0 text-xs font-mono">
-                              <span class="text-emerald-700">+{{ diffStepSelectedFile(m.id, diffStepFiles(m))?.added ?? 0 }}</span>
-                              <span class="ml-2 text-rose-700">-{{ diffStepSelectedFile(m.id, diffStepFiles(m))?.removed ?? 0 }}</span>
                             </div>
                           </div>
 
@@ -2471,8 +2991,405 @@ watch(
             </div>
           </footer>
         </section>
+        <section
+          v-else
+          class="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-[16px] bg-white shadow-[0_1px_2px_rgba(0,0,0,0.03)]"
+        >
+          <div class="flex items-center justify-between gap-3 px-4 py-2.5">
+            <div class="flex items-center gap-2">
+              <button
+                class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                title="Back to chat"
+                @click="restoreMobileSessionPane"
+              >
+                <ArrowLeft class="h-4 w-4" />
+              </button>
+              <div>
+                <div class="text-[13px] font-semibold text-slate-800">{{ workspacePaneTitle }}</div>
+                <div class="truncate text-[11px] text-slate-500" :title="currentWorkspaceContext.cwd">{{ currentWorkspaceContext.cwd }}</div>
+              </div>
+            </div>
+          </div>
+          <div class="border-t border-black/[0.04] px-4 py-2">
+            <div class="flex flex-wrap gap-2">
+              <button
+                class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
+                :class="workspacePaneTab === 'code' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
+                @click="openWorkspaceTool('code')"
+              >Code</button>
+              <button
+                class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
+                :class="workspacePaneTab === 'terminal' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
+                @click="openWorkspaceTool('terminal')"
+              >Terminal</button>
+              <button
+                class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
+                :class="workspacePaneTab === 'files' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
+                @click="openWorkspaceTool('files')"
+              >Files</button>
+              <button
+                class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
+                :class="workspacePaneTab === 'git' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
+                @click="openWorkspaceTool('git')"
+              >Git</button>
+            </div>
+          </div>
+          <div class="min-h-0 flex-1">
+            <div v-if="workspacePaneTab === 'code'" class="relative h-full bg-[#f7f7f4]">
+              <div
+                v-if="ideFrameLoading"
+                class="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-white/75 text-sm text-slate-500"
+              >
+                Opening workspace…
+              </div>
+              <iframe
+                v-if="activeIdeSession?.urlPath"
+                :src="activeIdeSession.urlPath"
+                class="h-full w-full border-0 bg-white"
+                title="Workspace"
+                @load="onIdeFrameLoad"
+              />
+              <div v-else class="flex h-full items-center justify-center px-6 text-center text-sm text-slate-500">
+                Open the code workspace to view it here.
+              </div>
+            </div>
+
+            <div v-else-if="workspacePaneTab === 'terminal'" class="flex h-full min-h-0 flex-col">
+              <div class="border-b border-black/[0.04] px-4 py-3">
+                <div class="flex gap-2">
+                  <input
+                    v-model="workspaceTerminalCommand"
+                    type="text"
+                    class="min-w-0 flex-1 rounded-xl border border-black/[0.06] bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20"
+                    placeholder="Run a shell command…"
+                    @keydown.enter.prevent="runWorkspaceTerminalCommand"
+                  />
+                  <button
+                    class="rounded-xl bg-slate-800 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-slate-900 disabled:opacity-40"
+                    :disabled="workspaceTerminalRunning || !workspaceTerminalCommand.trim()"
+                    @click="runWorkspaceTerminalCommand"
+                  >
+                    {{ workspaceTerminalRunning ? 'Running…' : 'Run' }}
+                  </button>
+                </div>
+                <div v-if="workspaceTerminalError" class="mt-2 text-xs text-red-600">{{ workspaceTerminalError }}</div>
+              </div>
+              <div class="min-h-0 flex-1 overflow-auto px-4 py-3">
+                <div v-if="!workspaceTerminalRuns.length" class="text-sm text-slate-500">Run a command to inspect the workspace.</div>
+                <div v-else class="space-y-3">
+                  <div
+                    v-for="run in workspaceTerminalRuns"
+                    :key="run.id"
+                    class="overflow-hidden rounded-2xl border border-black/[0.06] bg-[#f7f7f4]"
+                  >
+                    <div class="flex items-center justify-between gap-3 border-b border-black/[0.05] px-3 py-2 text-xs">
+                      <div class="truncate font-mono text-slate-800">{{ run.command }}</div>
+                      <div class="shrink-0 text-slate-500">
+                        <span v-if="run.exitCode !== null">exit {{ run.exitCode }}</span>
+                      </div>
+                    </div>
+                    <div class="space-y-2 px-3 py-3">
+                      <pre v-if="run.stdout" class="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs font-mono text-slate-800">{{ run.stdout }}</pre>
+                      <pre v-if="run.stderr" class="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs font-mono text-rose-700">{{ run.stderr }}</pre>
+                      <div v-if="!run.stdout && !run.stderr" class="text-xs text-slate-500">(no output)</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div v-else-if="workspacePaneTab === 'files'" class="flex h-full min-h-0 flex-col">
+              <div class="border-b border-black/[0.04] px-4 py-3">
+                <div class="flex items-center gap-2">
+                  <button
+                    class="rounded-lg border border-black/[0.06] px-2.5 py-1.5 text-xs text-slate-700 transition-colors hover:bg-black/[0.04] disabled:opacity-40"
+                    :disabled="!workspaceFilesParent || workspaceFilesLoading"
+                    @click="loadWorkspaceFiles(workspaceFilesParent)"
+                  >
+                    Up
+                  </button>
+                  <div class="min-w-0 flex-1 truncate text-xs text-slate-500" :title="workspaceFilesPath">{{ workspaceFilesPath || currentWorkspaceContext.cwd }}</div>
+                </div>
+                <div v-if="workspaceFilesError" class="mt-2 text-xs text-red-600">{{ workspaceFilesError }}</div>
+                <div v-if="workspaceFileError" class="mt-2 text-xs text-red-600">{{ workspaceFileError }}</div>
+              </div>
+              <div class="grid min-h-0 flex-1 grid-cols-1">
+                <div class="min-h-0 overflow-auto border-b border-black/[0.04]">
+                  <div v-if="workspaceFilesLoading" class="px-4 py-3 text-sm text-slate-500">Loading files…</div>
+                  <div v-else-if="!workspaceFileEntries.length" class="px-4 py-3 text-sm text-slate-500">No files found.</div>
+                  <div v-else class="p-2">
+                    <button
+                      v-for="entry in workspaceFileEntries"
+                      :key="entry.path"
+                      class="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm transition-colors hover:bg-black/[0.035]"
+                      :class="workspaceSelectedFilePath === entry.path ? 'bg-black/[0.05]' : ''"
+                      @click="openWorkspaceEntry(entry)"
+                    >
+                      <FolderClosed v-if="entry.kind === 'dir'" class="h-4 w-4 shrink-0 text-slate-400" />
+                      <FileText v-else class="h-4 w-4 shrink-0 text-slate-400" />
+                      <span class="min-w-0 flex-1 truncate text-slate-700">{{ entry.name }}</span>
+                    </button>
+                  </div>
+                </div>
+                <div class="min-h-0 overflow-auto bg-[#fbfbfa] px-4 py-3">
+                  <div v-if="workspaceFileLoading" class="text-sm text-slate-500">Loading file…</div>
+                  <div v-else-if="workspaceSelectedFile?.binary" class="text-sm text-slate-500">Binary file preview is not supported.</div>
+                  <div v-else-if="workspaceSelectedFile?.text">
+                    <div class="mb-2 truncate text-xs text-slate-500" :title="workspaceSelectedFile.path">{{ workspaceSelectedFile.path }}</div>
+                    <pre class="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs font-mono text-slate-800">{{ workspaceSelectedFile.text }}</pre>
+                  </div>
+                  <div v-else class="text-sm text-slate-500">Select a file to preview it.</div>
+                </div>
+              </div>
+            </div>
+
+            <div v-else class="flex h-full min-h-0 flex-col">
+              <div class="border-b border-black/[0.04] px-4 py-3">
+                <div class="flex items-center justify-between gap-2">
+                  <div class="text-xs text-slate-500" :title="workspaceGitStatus?.rootPath || currentWorkspaceContext.cwd">
+                    {{ workspaceGitStatus?.rootPath || currentWorkspaceContext.cwd }}
+                  </div>
+                  <button
+                    class="rounded-lg border border-black/[0.06] px-2.5 py-1.5 text-xs text-slate-700 transition-colors hover:bg-black/[0.04]"
+                    @click="refreshWorkspaceGit"
+                  >
+                    Refresh
+                  </button>
+                </div>
+                <div v-if="workspaceGitError" class="mt-2 text-xs text-red-600">{{ workspaceGitError }}</div>
+              </div>
+              <div class="min-h-0 flex-1 overflow-auto px-4 py-3">
+                <div v-if="workspaceGitLoading" class="text-sm text-slate-500">Loading git status…</div>
+                <div v-else-if="workspaceGitStatus?.notRepo" class="text-sm text-slate-500">This workspace is not a git repository.</div>
+                <div v-else-if="workspaceGitStatus">
+                  <div class="mb-3 rounded-2xl border border-black/[0.06] bg-[#f7f7f4] px-3 py-2">
+                    <div class="text-sm font-medium text-slate-800">{{ workspaceGitStatus.branch || 'Detached HEAD' }}</div>
+                    <div class="mt-1 text-xs text-slate-500">
+                      <span v-if="workspaceGitStatus.upstream">{{ workspaceGitStatus.upstream }}</span>
+                      <span v-if="workspaceGitStatus.ahead"> · ahead {{ workspaceGitStatus.ahead }}</span>
+                      <span v-if="workspaceGitStatus.behind"> · behind {{ workspaceGitStatus.behind }}</span>
+                    </div>
+                  </div>
+                  <div v-if="!workspaceGitStatus.entries?.length" class="text-sm text-slate-500">Working tree clean.</div>
+                  <div v-else class="space-y-2">
+                    <button
+                      v-for="entry in workspaceGitStatus.entries"
+                      :key="`${entry.path}:${entry.label}`"
+                      class="flex w-full items-center gap-3 rounded-xl border border-black/[0.06] bg-white px-3 py-2 text-left transition-colors hover:bg-black/[0.02]"
+                      @click="openGitFile(entry)"
+                    >
+                      <span class="w-8 shrink-0 font-mono text-xs text-slate-500">{{ entry.label }}</span>
+                      <span class="min-w-0 flex-1 truncate text-sm text-slate-800">{{ entry.path }}</span>
+                    </button>
+                  </div>
+                </div>
+                <div v-else class="text-sm text-slate-500">Load git status for this workspace.</div>
+              </div>
+            </div>
+          </div>
+        </section>
       </main>
 
+      <aside
+        v-if="showWorkspacePane"
+        class="min-w-0 flex flex-1 flex-col overflow-hidden rounded-[16px] bg-white shadow-[0_1px_2px_rgba(0,0,0,0.03)]"
+      >
+        <div class="flex items-center justify-between gap-3 px-4 py-2.5">
+          <div class="min-w-0">
+            <div class="text-[13px] font-semibold text-slate-800">{{ workspacePaneTitle }}</div>
+            <div class="truncate text-[11px] text-slate-500" :title="activeIdeSession?.cwd || currentWorkspaceContext.cwd || ''">
+              {{ activeIdeSession?.cwd || currentWorkspaceContext.cwd || 'Current workspace' }}
+            </div>
+          </div>
+          <button
+            class="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+            title="Close workspace"
+            @click="closeWorkspacePane"
+          >
+            <X class="h-4 w-4" />
+          </button>
+        </div>
+
+        <div class="border-t border-black/[0.04] px-4 py-2">
+          <div class="flex flex-wrap gap-2">
+            <button
+              class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
+              :class="workspacePaneTab === 'code' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
+              @click="openWorkspaceTool('code')"
+            >Code</button>
+            <button
+              class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
+              :class="workspacePaneTab === 'terminal' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
+              @click="openWorkspaceTool('terminal')"
+            >Terminal</button>
+            <button
+              class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
+              :class="workspacePaneTab === 'files' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
+              @click="openWorkspaceTool('files')"
+            >Files</button>
+            <button
+              class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
+              :class="workspacePaneTab === 'git' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
+              @click="openWorkspaceTool('git')"
+            >Git</button>
+          </div>
+        </div>
+
+        <div v-if="workspacePaneTab === 'code'" class="relative min-h-0 flex-1 bg-[#f7f7f4]">
+          <div
+            v-if="ideFrameLoading"
+            class="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-white/75 text-sm text-slate-500"
+          >
+            Opening workspace…
+          </div>
+          <iframe
+            v-if="activeIdeSession?.urlPath"
+            :src="activeIdeSession.urlPath"
+            class="h-full w-full border-0 bg-white"
+            title="Workspace"
+            @load="onIdeFrameLoad"
+          />
+          <div v-else class="flex h-full items-center justify-center px-6 text-center text-sm text-slate-500">
+            Open the code workspace to view it here.
+          </div>
+        </div>
+
+        <div v-else-if="workspacePaneTab === 'terminal'" class="flex min-h-0 flex-1 flex-col">
+          <div class="border-t border-black/[0.04] px-4 py-3">
+            <div class="flex gap-2">
+              <input
+                v-model="workspaceTerminalCommand"
+                type="text"
+                class="min-w-0 flex-1 rounded-xl border border-black/[0.06] bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20"
+                placeholder="Run a shell command…"
+                @keydown.enter.prevent="runWorkspaceTerminalCommand"
+              />
+              <button
+                class="rounded-xl bg-slate-800 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-slate-900 disabled:opacity-40"
+                :disabled="workspaceTerminalRunning || !workspaceTerminalCommand.trim()"
+                @click="runWorkspaceTerminalCommand"
+              >
+                {{ workspaceTerminalRunning ? 'Running…' : 'Run' }}
+              </button>
+            </div>
+            <div v-if="workspaceTerminalError" class="mt-2 text-xs text-red-600">{{ workspaceTerminalError }}</div>
+          </div>
+          <div class="min-h-0 flex-1 overflow-auto px-4 py-3">
+            <div v-if="!workspaceTerminalRuns.length" class="text-sm text-slate-500">Run a command to inspect the workspace.</div>
+            <div v-else class="space-y-3">
+              <div
+                v-for="run in workspaceTerminalRuns"
+                :key="run.id"
+                class="overflow-hidden rounded-2xl border border-black/[0.06] bg-[#f7f7f4]"
+              >
+                <div class="flex items-center justify-between gap-3 border-b border-black/[0.05] px-3 py-2 text-xs">
+                  <div class="truncate font-mono text-slate-800">{{ run.command }}</div>
+                  <div class="shrink-0 text-slate-500">
+                    <span v-if="run.exitCode !== null">exit {{ run.exitCode }}</span>
+                  </div>
+                </div>
+                <div class="space-y-2 px-3 py-3">
+                  <pre v-if="run.stdout" class="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs font-mono text-slate-800">{{ run.stdout }}</pre>
+                  <pre v-if="run.stderr" class="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs font-mono text-rose-700">{{ run.stderr }}</pre>
+                  <div v-if="!run.stdout && !run.stderr" class="text-xs text-slate-500">(no output)</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div v-else-if="workspacePaneTab === 'files'" class="flex min-h-0 flex-1 flex-col">
+          <div class="border-t border-black/[0.04] px-4 py-3">
+            <div class="flex items-center gap-2">
+              <button
+                class="rounded-lg border border-black/[0.06] px-2.5 py-1.5 text-xs text-slate-700 transition-colors hover:bg-black/[0.04] disabled:opacity-40"
+                :disabled="!workspaceFilesParent || workspaceFilesLoading"
+                @click="loadWorkspaceFiles(workspaceFilesParent)"
+              >
+                Up
+              </button>
+              <div class="min-w-0 flex-1 truncate text-xs text-slate-500" :title="workspaceFilesPath">{{ workspaceFilesPath || currentWorkspaceContext.cwd }}</div>
+            </div>
+            <div v-if="workspaceFilesError" class="mt-2 text-xs text-red-600">{{ workspaceFilesError }}</div>
+            <div v-if="workspaceFileError" class="mt-2 text-xs text-red-600">{{ workspaceFileError }}</div>
+          </div>
+          <div class="grid min-h-0 flex-1 grid-cols-[260px_minmax(0,1fr)]">
+            <div class="min-h-0 overflow-auto border-r border-black/[0.04]">
+              <div v-if="workspaceFilesLoading" class="px-4 py-3 text-sm text-slate-500">Loading files…</div>
+              <div v-else-if="!workspaceFileEntries.length" class="px-4 py-3 text-sm text-slate-500">No files found.</div>
+              <div v-else class="p-2">
+                <button
+                  v-for="entry in workspaceFileEntries"
+                  :key="entry.path"
+                  class="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm transition-colors hover:bg-black/[0.035]"
+                  :class="workspaceSelectedFilePath === entry.path ? 'bg-black/[0.05]' : ''"
+                  @click="openWorkspaceEntry(entry)"
+                >
+                  <FolderClosed v-if="entry.kind === 'dir'" class="h-4 w-4 shrink-0 text-slate-400" />
+                  <FileText v-else class="h-4 w-4 shrink-0 text-slate-400" />
+                  <span class="min-w-0 flex-1 truncate text-slate-700">{{ entry.name }}</span>
+                </button>
+              </div>
+            </div>
+            <div class="min-h-0 overflow-auto bg-[#fbfbfa] px-4 py-3">
+              <div v-if="workspaceFileLoading" class="text-sm text-slate-500">Loading file…</div>
+              <div v-else-if="workspaceSelectedFile?.binary" class="text-sm text-slate-500">Binary file preview is not supported.</div>
+              <div v-else-if="workspaceSelectedFile?.text">
+                <div class="mb-2 truncate text-xs text-slate-500" :title="workspaceSelectedFile.path">{{ workspaceSelectedFile.path }}</div>
+                <pre class="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs font-mono text-slate-800">{{ workspaceSelectedFile.text }}</pre>
+              </div>
+              <div v-else class="text-sm text-slate-500">Select a file to preview it.</div>
+            </div>
+          </div>
+        </div>
+
+        <div v-else class="flex min-h-0 flex-1 flex-col">
+          <div class="border-t border-black/[0.04] px-4 py-3">
+            <div class="flex items-center justify-between gap-2">
+              <div class="text-xs text-slate-500" :title="workspaceGitStatus?.rootPath || currentWorkspaceContext.cwd">
+                {{ workspaceGitStatus?.rootPath || currentWorkspaceContext.cwd }}
+              </div>
+              <button
+                class="rounded-lg border border-black/[0.06] px-2.5 py-1.5 text-xs text-slate-700 transition-colors hover:bg-black/[0.04]"
+                @click="refreshWorkspaceGit"
+              >
+                Refresh
+              </button>
+            </div>
+            <div v-if="workspaceGitError" class="mt-2 text-xs text-red-600">{{ workspaceGitError }}</div>
+          </div>
+          <div class="min-h-0 flex-1 overflow-auto px-4 py-3">
+            <div v-if="workspaceGitLoading" class="text-sm text-slate-500">Loading git status…</div>
+            <div v-else-if="workspaceGitStatus?.notRepo" class="text-sm text-slate-500">This workspace is not a git repository.</div>
+            <div v-else-if="workspaceGitStatus">
+              <div class="mb-3 rounded-2xl border border-black/[0.06] bg-[#f7f7f4] px-3 py-2">
+                <div class="text-sm font-medium text-slate-800">{{ workspaceGitStatus.branch || 'Detached HEAD' }}</div>
+                <div class="mt-1 text-xs text-slate-500">
+                  <span v-if="workspaceGitStatus.upstream">{{ workspaceGitStatus.upstream }}</span>
+                  <span v-if="workspaceGitStatus.ahead"> · ahead {{ workspaceGitStatus.ahead }}</span>
+                  <span v-if="workspaceGitStatus.behind"> · behind {{ workspaceGitStatus.behind }}</span>
+                </div>
+              </div>
+              <div v-if="!workspaceGitStatus.entries?.length" class="text-sm text-slate-500">Working tree clean.</div>
+              <div v-else class="space-y-2">
+                <button
+                  v-for="entry in workspaceGitStatus.entries"
+                  :key="`${entry.path}:${entry.label}`"
+                  class="flex w-full items-center gap-3 rounded-xl border border-black/[0.06] bg-white px-3 py-2 text-left transition-colors hover:bg-black/[0.02]"
+                  @click="openGitFile(entry)"
+                >
+                  <span class="w-8 shrink-0 font-mono text-xs text-slate-500">{{ entry.label }}</span>
+                  <span class="min-w-0 flex-1 truncate text-sm text-slate-800">{{ entry.path }}</span>
+                </button>
+              </div>
+            </div>
+            <div v-else class="text-sm text-slate-500">Load git status for this workspace.</div>
+          </div>
+        </div>
+      </aside>
+      </div>
+
+      </div>
       </div>
 	
 	      <!-- New thread modal -->
@@ -2736,6 +3653,7 @@ watch(
 
 		              <div v-else class="space-y-2">
 		                <div v-if="machineDisconnectError" class="text-sm text-red-600">{{ machineDisconnectError }}</div>
+		                <div v-if="machineUpgradeError" class="text-sm text-red-600">{{ machineUpgradeError }}</div>
 		                <div
 		                  v-for="m in machinesForSelect"
 		                  :key="m.machineId"
@@ -2750,6 +3668,16 @@ watch(
 		                      </div>
 		                    </div>
 		                    <div class="shrink-0 flex items-center gap-2">
+		                      <button
+		                        v-if="machineIsOnline(m) && machineHasVersionMismatch(m) && machineSupportsWebUpgrade(m)"
+		                        class="inline-flex items-center gap-2 rounded-md bg-indigo-50 px-2.5 py-1.5 text-xs text-indigo-700 transition-colors hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+		                        @click="upgradeMachine(m.machineId)"
+		                        :disabled="machineUpgradeWorkingId === m.machineId || ['starting', 'updating', 'restarting'].includes(String(m.upgrade?.state ?? ''))"
+		                        title="Pull, rebuild, and restart this runner using its configured upgrade commands."
+		                      >
+		                        <Loader2 v-if="machineUpgradeWorkingId === m.machineId" class="h-3.5 w-3.5 animate-spin" />
+		                        Upgrade
+		                      </button>
 		                      <button
 		                        v-if="machineIsOnline(m)"
 		                        class="inline-flex items-center gap-2 rounded-md bg-slate-100 px-2.5 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
@@ -2776,6 +3704,22 @@ watch(
 		                    <div class="shrink-0 text-[11px]" :class="machineIsOnline(m) ? 'text-emerald-600' : 'text-slate-500'">
 		                      {{ machineStatusLabel(m) }}
 		                    </div>
+		                  </div>
+		                  <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+		                    <div>
+		                      Runner:
+		                      <span class="font-mono text-slate-700">{{ machineRootgridVersion(m) ?? 'unknown' }}</span>
+		                    </div>
+		                    <div v-if="appSettings.appVersion">
+		                      Host:
+		                      <span class="font-mono text-slate-700">{{ appSettings.appVersion }}</span>
+		                    </div>
+		                    <div v-if="machineHasVersionMismatch(m)" class="text-amber-700">
+		                      Version mismatch
+		                    </div>
+		                  </div>
+		                  <div v-if="machineUpgradeStatusText(m)" class="mt-2 text-xs" :class="m.upgrade?.state === 'failed' ? 'text-red-600' : 'text-slate-500'">
+		                    {{ machineUpgradeStatusText(m) }}
 		                  </div>
 		                </div>
 		              </div>
@@ -2936,7 +3880,7 @@ watch(
 	                  v-for="s in archivedSessions"
 	                  :key="s.sessionId"
 	                  class="group w-full rounded-xl border border-slate-200 bg-white p-3 text-left transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-	                  @click="selectedSessionId = s.sessionId; archiveOpen = false"
+	                  @click="openSession(s.sessionId); archiveOpen = false"
 	                  :title="sessionTooltip(s)"
 	                >
 	                  <div class="flex items-start justify-between gap-3">
@@ -3314,7 +4258,7 @@ watch(
 	            :key="t.id"
 	            class="pointer-events-auto rounded-xl border p-3 shadow-lg"
 	            :class="toastBorderClass(t.level)"
-	            @click="t.sessionId ? (selectedSessionId = t.sessionId) : null"
+	            @click="t.sessionId ? openSession(t.sessionId) : null"
 	          >
 	            <div class="flex items-start justify-between gap-3">
 	              <div class="min-w-0">

@@ -22,7 +22,9 @@ export async function startRunner({ config }) {
       token: config.host.auth.runnerToken,
       machineId: config.runner.machineId,
       machineName: config.runner.machineName,
-      debug: config.debug ?? null
+      debug: config.debug ?? null,
+      upgrade: config.runner?.upgrade ?? null,
+      autostart: config.autostart ?? null
     })
     await startTunnelClient({
       url: baseUrl,
@@ -39,7 +41,9 @@ export async function startRunner({ config }) {
       token: config.upstream.runnerToken,
       machineId: config.runner.machineId,
       machineName: config.runner.machineName,
-      debug: config.debug ?? null
+      debug: config.debug ?? null,
+      upgrade: config.runner?.upgrade ?? null,
+      autostart: config.autostart ?? null
     })
     await startTunnelClient({
       url: config.upstream.url,

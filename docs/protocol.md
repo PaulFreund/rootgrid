@@ -75,6 +75,12 @@ Rootgrid uses the same envelope shape for:
   - `name`: string (human-friendly; defaults to hostname)
   - `platform`: `"linux" | "darwin" | "wsl"`
   - `capabilities?`: object
+    - `rootgridVersion?`: string
+    - `upgrade?`: object
+      - `enabled`: boolean
+      - `mode?`: `"managed-release"`
+      - `managedRuntime?`: boolean
+      - `autostartMethod?`: `"systemd-user" | "launchd-user" | null`
 - `resume?`: object (optional, for reconnect)
 
 Notes:
@@ -94,6 +100,46 @@ Notes:
 Auth rule (v0):
 - If `token` is missing/invalid, the host must close the connection (after a short `error` response if possible).
 - Host must keep **separate tokens** for UI clients and runners (see `docs/setup.md`).
+
+---
+
+### Machine upgrade control messages
+
+Host → runner:
+- `machine.upgrade.start`
+  - `payload.requestId`: string
+  - `payload.releaseId`: string
+  - `payload.version`: string
+  - `payload.filename`: string
+  - `payload.sizeBytes`: number
+  - `payload.sha256`: string
+- `machine.upgrade.chunk`
+  - `payload.requestId`: string
+  - `payload.chunkBase64`: string
+- `machine.upgrade.end`
+  - `payload.requestId`: string
+- `machine.upgrade.abort`
+  - `payload.requestId`: string
+
+Runner → host:
+- `machine.upgrade.accepted`
+  - `payload.requestId`: string
+- `machine.upgrade.rejected`
+  - `payload.requestId`: string
+  - `payload.error`: string
+- `machine.upgrade.state`
+  - `payload.machineId`: string
+  - `payload.state`: `"starting" | "receiving" | "installing" | "restarting" | "failed"`
+  - `payload.message?`: string
+- `machine.upgrade.bundle.received`
+  - `payload.requestId`: string
+  - `payload.releaseId`: string
+  - `payload.version`: string
+- `machine.upgrade.bundle.failed`
+  - `payload.requestId`: string
+  - `payload.error`: string
+
+The host builds a prebuilt Rootgrid release bundle from its own managed/runtime install, streams it to the runner, and the runner installs it under `~/.rootgrid/releases/<release-id>/`, flips `~/.rootgrid/current`, and restarts its user service. The host surfaces upgrade state to browsers as `registry.machine.upsert` SSE payload patches.
 
 ---
 

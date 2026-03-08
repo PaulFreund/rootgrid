@@ -18,7 +18,11 @@
   "runner": {
     "enabled": true,
     "machineId": "11111111-2222-4333-8444-555555555555",
-    "machineName": "wsl-devbox"
+    "machineName": "wsl-devbox",
+    "upgrade": {
+      "enabled": true,
+      "keepReleases": 3
+    }
   },
   "host": {
     "enabled": true,

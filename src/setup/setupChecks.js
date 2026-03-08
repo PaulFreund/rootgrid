@@ -85,3 +85,9 @@ export async function checkSystemdUserAvailable() {
   const res = await runCommand('systemctl', ['--user', 'is-system-running'], { timeoutMs: 3_000 })
   return res.ok
 }
+
+export async function checkLaunchdUserAvailable() {
+  if (process.platform !== 'darwin') return false
+  const res = await runCommand('launchctl', ['help'], { timeoutMs: 3_000 })
+  return res.ok
+}
