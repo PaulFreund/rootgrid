@@ -33,10 +33,11 @@ During setup, Rootgrid stages a managed runtime under:
 - `~/.rootgrid/releases/<release-id>/`
 - `~/.rootgrid/current -> ~/.rootgrid/releases/<release-id>/`
 
-That managed runtime becomes the stable target for:
-- autostart services
-- manual `rootgrid` launches after setup
+That managed runtime is used for:
+- runner-only installs
 - remote web-triggered runner upgrades
+
+Host-mode installs instead run directly from the current package checkout/install so local host updates can use the normal package path (`git pull`/npm upgrade + restart).
 
 If `systemd --user` is available, ask:
 - “Do you want Rootgrid to autostart on login?”

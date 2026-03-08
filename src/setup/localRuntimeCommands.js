@@ -33,6 +33,10 @@ export function chooseUserServiceMethod({
   return preferred || null
 }
 
+export function usesManagedRuntimeForConfig(config) {
+  return !Boolean(config?.host?.enabled)
+}
+
 export async function resolveInstallUserServiceMethod(preferredMethod = null) {
   const [systemdAvailable, launchdAvailable] = await Promise.all([
     checkSystemdUserAvailable(),
@@ -58,12 +62,14 @@ export async function resolveRemoveUserServiceMethod(preferredMethod = null) {
 export function buildUserServiceInstallOptions(config, {
   execPath = process.execPath,
   env = process.env,
+  packageRoot = getCurrentPackageRoot(),
   currentReleasePath = getCurrentReleaseLinkPath()
 } = {}) {
+  const runtimeRoot = usesManagedRuntimeForConfig(config) ? currentReleasePath : packageRoot
   return {
     description: config?.host?.enabled ? 'Rootgrid (Codex web UI + runner)' : 'Rootgrid (runner)',
-    execStart: [execPath, join(currentReleasePath, 'src', 'cli.js')],
-    workingDirectory: currentReleasePath,
+    execStart: [execPath, join(runtimeRoot, 'src', 'cli.js')],
+    workingDirectory: runtimeRoot,
     environment: {
       ...(env.PATH ? { PATH: env.PATH } : {}),
       ...(env.CODEX_HOME ? { CODEX_HOME: env.CODEX_HOME } : {})

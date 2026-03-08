@@ -13,7 +13,8 @@ import {
   loadConfigIfPresent,
   resolveRemoveUserServiceMethod,
   removeUserService,
-  saveConfig
+  saveConfig,
+  usesManagedRuntimeForConfig
 } from './setup/localRuntimeCommands.js'
 import { runSetupWizard } from './setup/runSetupWizard.js'
 
@@ -74,10 +75,14 @@ async function main() {
   }
 
   if (cmd === 'update-local') {
-    const release = await installLocalManagedReleaseFromCurrentPackage()
-    console.log(`Installed managed release: ${release.releaseDir}`)
-
     const config = await loadConfigIfPresent()
+    if (!config || usesManagedRuntimeForConfig(config)) {
+      const release = await installLocalManagedReleaseFromCurrentPackage()
+      console.log(`Installed managed release: ${release.releaseDir}`)
+    } else {
+      console.log('Host mode uses the current package install directly; skipped managed release staging.')
+    }
+
     if (config?.autostart?.enabled) {
       const service = await installUserServiceForConfig(config)
       const nextConfig = applyAutostartConfig(config, { enabled: true, method: service.method })
@@ -92,7 +97,9 @@ async function main() {
 
   if (cmd === 'install-service') {
     const config = await loadConfig()
-    await installLocalManagedReleaseFromCurrentPackage({ source: 'install-service' })
+    if (usesManagedRuntimeForConfig(config)) {
+      await installLocalManagedReleaseFromCurrentPackage({ source: 'install-service' })
+    }
     const service = await installUserServiceForConfig(config)
     const nextConfig = applyAutostartConfig(config, { enabled: true, method: service.method })
     await saveConfig(nextConfig)
@@ -130,12 +137,13 @@ async function main() {
     return
   }
 
-  await ensureManagedRuntimeInstalled()
-  if (await maybeRedirectToManagedRelease()) return
+  const config = await loadConfig()
+  if (usesManagedRuntimeForConfig(config)) {
+    await ensureManagedRuntimeInstalled()
+    if (await maybeRedirectToManagedRelease()) return
+  }
 
   const { startRootgrid } = await import('./runtime/startRootgrid.js')
-
-  const config = await loadConfig()
   await startRootgrid({ config })
 }
 

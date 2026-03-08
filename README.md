@@ -56,7 +56,7 @@ Setup also installs a managed runtime under:
 - `~/.rootgrid/releases/<release-id>/`
 - `~/.rootgrid/current -> ~/.rootgrid/releases/<release-id>/`
 
-That managed runtime is what autostart services and remote upgrades use on both Linux and macOS.
+That managed runtime is used for **runner-only installs** and remote runner upgrades. Host-mode installs run directly from the current package checkout/install so a normal `git pull` + restart picks up the new UI/code.
 
 ---
 

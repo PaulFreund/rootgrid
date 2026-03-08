@@ -1,15 +1,13 @@
 import { spawn } from 'node:child_process'
 import { access, chmod, mkdir } from 'node:fs/promises'
 import { createInterface } from 'node:readline/promises'
-import process from 'node:process'
 import { stdin, stdout } from 'node:process'
-import { join } from 'node:path'
+import process from 'node:process'
 
 import { buildDefaultConfig } from '../config/defaultConfig.js'
 import { RootgridConfigSchema } from '../config/schema.js'
 import {
   getCurrentPackageRoot,
-  getCurrentReleaseLinkPath,
   installManagedRelease,
   ROOTGRID_USER_SERVICE_NAME
 } from '../lib/managedRelease.js'
@@ -18,6 +16,7 @@ import { getConfigPath, getRootgridDir } from '../lib/paths.js'
 import { ROOTGRID_VERSION } from '../lib/rootgridVersion.js'
 import { checkCodeServerInstalled, checkCodexInstalled, checkGitInstalled, checkLaunchdUserAvailable, checkSystemdUserAvailable } from './setupChecks.js'
 import { installLaunchdUserService } from './launchdUserAutostart.js'
+import { buildUserServiceInstallOptions, usesManagedRuntimeForConfig } from './localRuntimeCommands.js'
 import { installSystemdUserService } from './systemdUserAutostart.js'
 
 function normalizeYesNo(input, fallback) {
@@ -208,14 +207,18 @@ export async function runSetupWizard() {
     } catch {
     }
 
-    const installedRelease = await installManagedRelease({
-      sourceRoot: getCurrentPackageRoot(),
-      version: ROOTGRID_VERSION,
-      source: 'setup'
-    })
-
     stdout.write(`\nWrote config to: ${configPath}\n`)
-    stdout.write(`Managed runtime installed at: ${installedRelease.releaseDir}\n`)
+    let installedRelease = null
+    if (usesManagedRuntimeForConfig(validated)) {
+      installedRelease = await installManagedRelease({
+        sourceRoot: getCurrentPackageRoot(),
+        version: ROOTGRID_VERSION,
+        source: 'setup'
+      })
+      stdout.write(`Managed runtime installed at: ${installedRelease.releaseDir}\n`)
+    } else {
+      stdout.write(`Using current package install directly for host mode.\n`)
+    }
 
     if (validated.host.enabled) {
       const url = `http://${validated.host.listen.host}:${validated.host.listen.port}/`
@@ -230,15 +233,7 @@ export async function runSetupWizard() {
     }
 
     if (validated.autostart.enabled && validated.autostart.method) {
-      const execStart = [process.execPath, join(getCurrentReleaseLinkPath(), 'src', 'cli.js')]
-      const installOpts = {
-        execStart,
-        workingDirectory: getCurrentReleaseLinkPath(),
-        environment: {
-          ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
-          ...(process.env.CODEX_HOME ? { CODEX_HOME: process.env.CODEX_HOME } : {})
-        }
-      }
+      const installOpts = buildUserServiceInstallOptions(validated)
 
       if (validated.autostart.method === 'systemd-user') {
         stdout.write('\nSetting up autostart (systemd --user)…\n')

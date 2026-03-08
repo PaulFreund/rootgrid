@@ -4,7 +4,8 @@ import assert from 'node:assert/strict'
 import {
   applyAutostartConfig,
   buildUserServiceInstallOptions,
-  chooseUserServiceMethod
+  chooseUserServiceMethod,
+  usesManagedRuntimeForConfig
 } from '../src/setup/localRuntimeCommands.js'
 import { buildDefaultConfig } from '../src/config/defaultConfig.js'
 
@@ -29,20 +30,46 @@ test('chooseUserServiceMethod prefers the configured method only when available'
 })
 
 test('buildUserServiceInstallOptions targets the managed current release', () => {
-  const config = buildDefaultConfig()
-  const options = buildUserServiceInstallOptions(config, {
+  const runnerOnlyConfig = buildDefaultConfig()
+  runnerOnlyConfig.host.enabled = false
+  runnerOnlyConfig.upstream.enabled = true
+
+  const runnerOptions = buildUserServiceInstallOptions(runnerOnlyConfig, {
     execPath: '/usr/bin/node',
     env: { PATH: '/usr/bin', CODEX_HOME: '/tmp/codex-home' },
+    packageRoot: '/src/rootgrid',
     currentReleasePath: '/home/test/.rootgrid/current'
   })
 
-  assert.equal(options.description, 'Rootgrid (Codex web UI + runner)')
-  assert.deepEqual(options.execStart, ['/usr/bin/node', '/home/test/.rootgrid/current/src/cli.js'])
-  assert.equal(options.workingDirectory, '/home/test/.rootgrid/current')
-  assert.deepEqual(options.environment, {
+  assert.equal(runnerOptions.description, 'Rootgrid (runner)')
+  assert.deepEqual(runnerOptions.execStart, ['/usr/bin/node', '/home/test/.rootgrid/current/src/cli.js'])
+  assert.equal(runnerOptions.workingDirectory, '/home/test/.rootgrid/current')
+  assert.deepEqual(runnerOptions.environment, {
     PATH: '/usr/bin',
     CODEX_HOME: '/tmp/codex-home'
   })
+
+  const hostConfig = buildDefaultConfig()
+  const hostOptions = buildUserServiceInstallOptions(hostConfig, {
+    execPath: '/usr/bin/node',
+    env: { PATH: '/usr/bin' },
+    packageRoot: '/src/rootgrid',
+    currentReleasePath: '/home/test/.rootgrid/current'
+  })
+
+  assert.equal(hostOptions.description, 'Rootgrid (Codex web UI + runner)')
+  assert.deepEqual(hostOptions.execStart, ['/usr/bin/node', '/src/rootgrid/src/cli.js'])
+  assert.equal(hostOptions.workingDirectory, '/src/rootgrid')
+})
+
+test('usesManagedRuntimeForConfig is runner-only', () => {
+  const hostConfig = buildDefaultConfig()
+  assert.equal(usesManagedRuntimeForConfig(hostConfig), false)
+
+  const runnerOnlyConfig = buildDefaultConfig()
+  runnerOnlyConfig.host.enabled = false
+  runnerOnlyConfig.upstream.enabled = true
+  assert.equal(usesManagedRuntimeForConfig(runnerOnlyConfig), true)
 })
 
 test('applyAutostartConfig toggles autostart state safely', () => {
