@@ -1,6 +1,6 @@
 {
   "name": "rootgrid",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "type": "module",
   "description": "Rootgrid - local-first web UI for driving Codex via codex app-server",
   "license": "UNLICENSED",
