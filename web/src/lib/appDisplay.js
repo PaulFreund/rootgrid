@@ -132,6 +132,34 @@ export function updateTokenUsageMap(map, sessionId, payload) {
   return true
 }
 
+export function buildContextUsageSummary(usage) {
+  if (!usage || typeof usage !== 'object') return null
+  const usedRaw = Number(usage?.totalTotalTokens ?? usage?.lastTotalTokens ?? NaN)
+  const lastRaw = Number(usage?.lastTotalTokens ?? NaN)
+  const windowRaw = Number(usage?.modelContextWindow ?? NaN)
+  const usedTokens = Number.isFinite(usedRaw) && usedRaw >= 0 ? usedRaw : null
+  const lastTokens = Number.isFinite(lastRaw) && lastRaw >= 0 ? lastRaw : null
+  const modelContextWindow = Number.isFinite(windowRaw) && windowRaw > 0 ? windowRaw : null
+  if (usedTokens === null && lastTokens === null) return null
+  const primaryTokens = usedTokens ?? lastTokens
+  const percent = (primaryTokens !== null && modelContextWindow)
+    ? Math.max(0, Math.min(100, (primaryTokens / modelContextWindow) * 100))
+    : null
+  return {
+    usedTokens: primaryTokens,
+    usedLabel: formatCompactInt(primaryTokens),
+    lastTokens,
+    lastLabel: lastTokens !== null ? formatCompactInt(lastTokens) : null,
+    modelContextWindow,
+    windowLabel: modelContextWindow !== null ? formatCompactInt(modelContextWindow) : null,
+    percent,
+    percentLabel: percent !== null ? `${Math.round(percent)}% full` : '',
+    usageLabel: modelContextWindow !== null
+      ? `${formatCompactInt(primaryTokens)} / ${formatCompactInt(modelContextWindow)} tokens used`
+      : `${formatCompactInt(primaryTokens)} tokens used`
+  }
+}
+
 export function machineIsOnline(nowMs, machine) {
   if (typeof machine?.connected === 'boolean') return machine.connected
   const last = Number(machine?.lastSeenMs ?? 0)

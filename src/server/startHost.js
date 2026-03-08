@@ -46,12 +46,14 @@ export async function startHost({ config }) {
 
   const approvals = new Map() // approvalId -> { machineId, sessionId }
   const ideSessions = new Map() // ideId -> { machineId, cwd, port, basePath }
+  const terminalSessions = new Map() // terminalId -> { terminalId, machineId, cwd, shell, cols, rows, createdAtMs }
   const pendingIdeStarts = createPendingRequestBook()
   const pendingMachineUpgrades = createPendingRequestBook()
   const pendingMachineUpgradeTransfers = createPendingRequestBook()
   const pendingFsLists = createPendingRequestBook()
   const pendingFsReads = createPendingRequestBook()
   const pendingGitStatuses = createPendingRequestBook()
+  const pendingTerminalStarts = createPendingRequestBook()
   const pendingTerminalExecs = createPendingRequestBook()
   const pendingModelLists = createPendingRequestBook()
   const pendingRunnerCommands = createPendingRequestBook()
@@ -109,9 +111,11 @@ export async function startHost({ config }) {
     pendingFsLists,
     pendingFsReads,
     pendingGitStatuses,
+    pendingTerminalStarts,
     pendingTerminalExecs,
     pendingModelLists,
     pendingIdeStarts,
+    terminalSessions,
     httpError
   })
   const runnerWs = createRunnerWsServer({
@@ -275,6 +279,33 @@ export async function startHost({ config }) {
     return await resultP
   }
 
+  async function terminalPtyStartOnRunner({ machineId, cwd, cols = 80, rows = 24 }) {
+    const requestId = crypto.randomUUID()
+    const terminalId = crypto.randomUUID()
+    const resultP = pendingTerminalStarts.create(requestId, {
+      machineId,
+      timeoutMs: 10_000,
+      onTimeout: () => httpError(504, 'timeout starting terminal')
+    })
+
+    const ok = runnerWs.sendToMachine(machineId, makeEnvelope({
+      type: 'terminal.pty.start',
+      scope: { machineId },
+      payload: {
+        requestId,
+        terminalId,
+        cwd: String(cwd ?? ''),
+        cols: Number(cols) || 80,
+        rows: Number(rows) || 24
+      }
+    }))
+    if (!ok) {
+      pendingTerminalStarts.cancel(requestId)
+      throw httpError(503, 'runner not connected')
+    }
+    return await resultP
+  }
+
   async function requestMachineUpgrade({ machineId, hostVersion = null, timeoutMs = 10_000 }) {
     const requestId = releaseBundles.nextRequestId()
     try {
@@ -393,6 +424,8 @@ export async function startHost({ config }) {
     fsListOnRunner,
     fsReadOnRunner,
     gitStatusOnRunner,
+    terminalSessions,
+    terminalPtyStartOnRunner,
     terminalExecOnRunner,
     codexModelListOnRunner: modelCatalogCache.list,
     pendingIdeStarts,

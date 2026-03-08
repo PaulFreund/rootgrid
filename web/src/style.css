@@ -46,6 +46,8 @@ body {
 @layer components {
   .rg-prose {
     @apply prose prose-slate max-w-none text-[15px] leading-7;
+    overflow-wrap: anywhere;
+    word-break: break-word;
   }
 
   .rg-prose :where(pre):not(:where(.not-prose *)) {
@@ -54,6 +56,11 @@ body {
 
   .rg-prose :where(p):not(:where(.not-prose *)) {
     @apply my-3;
+  }
+
+  .rg-prose :where(a, li, blockquote, code, strong, em, span):not(:where(.not-prose *)) {
+    overflow-wrap: anywhere;
+    word-break: break-word;
   }
 
   .rg-codeblock {

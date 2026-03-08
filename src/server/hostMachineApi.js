@@ -15,6 +15,8 @@ export function createHostMachineApi({
   fsListOnRunner,
   fsReadOnRunner,
   gitStatusOnRunner,
+  terminalSessions,
+  terminalPtyStartOnRunner,
   terminalExecOnRunner,
   codexModelListOnRunner,
   pendingIdeStarts,
@@ -76,6 +78,10 @@ export function createHostMachineApi({
         for (const ideId of ideIds) {
           ideSessions.delete(ideId)
           try { store.deleteIdeSession(ideId) } catch {}
+        }
+        for (const [terminalId, terminal] of terminalSessions.entries()) {
+          if (terminal?.machineId !== machineId) continue
+          terminalSessions.delete(terminalId)
         }
 
         for (const sessionId of sessionIds) {
@@ -258,6 +264,115 @@ export function createHostMachineApi({
           const code = Number(err?.statusCode) || 500
           json(res, code, { error: String(err?.message ?? err) })
         }
+        return true
+      }
+
+      if (url.pathname === '/api/terminal/sessions' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        const body = await readJsonBody(req)
+        const preferredMachineId = body?.machineId ?? null
+        const cwd = body?.cwd
+        if (!cwd || typeof cwd !== 'string') {
+          json(res, 400, { error: 'cwd is required' })
+          return true
+        }
+        const machineId = pickMachineId(preferredMachineId)
+        if (!machineId) {
+          json(res, 503, { error: 'no runner connected' })
+          return true
+        }
+        try {
+          const out = await terminalPtyStartOnRunner({
+            machineId,
+            cwd,
+            cols: Number(body?.cols) || 80,
+            rows: Number(body?.rows) || 24
+          })
+          json(res, 200, { machineId, ...out })
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          json(res, code, { error: String(err?.message ?? err) })
+        }
+        return true
+      }
+
+      if (parts[0] === 'api' && parts[1] === 'terminal' && parts[2] === 'sessions' && parts[3] && parts.length === 5 && parts[4] === 'input' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        const terminalId = String(parts[3] ?? '').trim()
+        const terminal = terminalSessions.get(terminalId)
+        if (!terminal) {
+          json(res, 404, { error: 'terminal not found' })
+          return true
+        }
+        if (!runnerWs.listConnectedMachineIds().includes(terminal.machineId)) {
+          json(res, 503, { error: 'runner not connected' })
+          return true
+        }
+        const body = await readJsonBody(req)
+        const data = String(body?.data ?? '')
+        const ok = runnerWs.sendToMachine(terminal.machineId, makeEnvelope({
+          type: 'terminal.pty.input',
+          scope: { machineId: terminal.machineId },
+          payload: { terminalId, data }
+        }))
+        if (!ok) {
+          json(res, 503, { error: 'runner not connected' })
+          return true
+        }
+        json(res, 202, { ok: true, terminalId })
+        return true
+      }
+
+      if (parts[0] === 'api' && parts[1] === 'terminal' && parts[2] === 'sessions' && parts[3] && parts.length === 5 && parts[4] === 'resize' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        const terminalId = String(parts[3] ?? '').trim()
+        const terminal = terminalSessions.get(terminalId)
+        if (!terminal) {
+          json(res, 404, { error: 'terminal not found' })
+          return true
+        }
+        if (!runnerWs.listConnectedMachineIds().includes(terminal.machineId)) {
+          json(res, 503, { error: 'runner not connected' })
+          return true
+        }
+        const body = await readJsonBody(req)
+        const ok = runnerWs.sendToMachine(terminal.machineId, makeEnvelope({
+          type: 'terminal.pty.resize',
+          scope: { machineId: terminal.machineId },
+          payload: {
+            terminalId,
+            cols: Number(body?.cols) || terminal.cols || 80,
+            rows: Number(body?.rows) || terminal.rows || 24
+          }
+        }))
+        if (!ok) {
+          json(res, 503, { error: 'runner not connected' })
+          return true
+        }
+        terminal.cols = Number(body?.cols) || terminal.cols || 80
+        terminal.rows = Number(body?.rows) || terminal.rows || 24
+        json(res, 202, { ok: true, terminalId })
+        return true
+      }
+
+      if (parts[0] === 'api' && parts[1] === 'terminal' && parts[2] === 'sessions' && parts[3] && parts.length === 4 && req.method === 'DELETE') {
+        if (!auth.requireAuth(req, res)) return true
+        const terminalId = String(parts[3] ?? '').trim()
+        const terminal = terminalSessions.get(terminalId)
+        if (!terminal) {
+          json(res, 404, { error: 'terminal not found' })
+          return true
+        }
+        terminalSessions.delete(terminalId)
+        try {
+          runnerWs.sendToMachine(terminal.machineId, makeEnvelope({
+            type: 'terminal.pty.close',
+            scope: { machineId: terminal.machineId },
+            payload: { terminalId }
+          }))
+        } catch {
+        }
+        json(res, 202, { ok: true, terminalId })
         return true
       }
 

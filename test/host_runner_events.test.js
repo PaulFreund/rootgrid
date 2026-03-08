@@ -103,6 +103,7 @@ test('runner upgrade replies resolve pending requests and broadcast machine upgr
   const transferResolved = []
   const transferRejected = []
   const sseEvents = []
+  const terminalSessions = new Map()
   const handlers = createHostRunnerEventHandlers({
     config: { notifications: { sseToasts: 'never', webPush: 'never' } },
     store: {
@@ -146,9 +147,11 @@ test('runner upgrade replies resolve pending requests and broadcast machine upgr
     pendingFsLists: { resolve() {}, reject() {}, rejectByMachine() {} },
     pendingFsReads: { resolve() {}, reject() {}, rejectByMachine() {} },
     pendingGitStatuses: { resolve() {}, reject() {}, rejectByMachine() {} },
+    pendingTerminalStarts: { resolve() {}, reject() {}, rejectByMachine() {} },
     pendingTerminalExecs: { resolve() {}, reject() {}, rejectByMachine() {} },
     pendingModelLists: { resolve() {}, reject() {}, rejectByMachine() {} },
     pendingIdeStarts: { resolve() {}, reject() {}, rejectByMachine() {} },
+    terminalSessions,
     httpError(status, message) {
       const err = new Error(message)
       err.statusCode = status
@@ -191,4 +194,104 @@ test('runner upgrade replies resolve pending requests and broadcast machine upgr
   assert.equal(sseEvents[0]?.payload?.machineId, 'machine-1')
   assert.equal(sseEvents[0]?.payload?.upgrade?.state, 'updating')
   assert.equal(typeof sseEvents[0]?.payload?.upgrade?.updatedAtMs, 'number')
+})
+
+test('terminal PTY replies resolve start requests and forward output and exit over SSE', () => {
+  const started = []
+  const sseEvents = []
+  const terminalSessions = new Map()
+  const handlers = createHostRunnerEventHandlers({
+    config: { notifications: { sseToasts: 'never', webPush: 'never' } },
+    store: {
+      getSession() {
+        return null
+      }
+    },
+    sse: {
+      send(envelope) {
+        sseEvents.push(envelope)
+      },
+      sendToast() {},
+      isSessionVisible() {
+        return false
+      }
+    },
+    push: null,
+    approvals: new Map(),
+    ideSessions: new Map(),
+    makeEnvelope: ({ type, scope = null, payload = null }) => ({ type, scope, payload }),
+    getUploadService: () => ({ handleRunnerMessage() { return false }, handleRunnerDisconnect() {} }),
+    pendingRunnerCommands: { resolve() {}, reject() {}, rejectByMachine() {} },
+    pendingMachineUpgrades: { resolve() {}, reject() {}, rejectByMachine() {} },
+    pendingMachineUpgradeTransfers: { resolve() {}, reject() {}, rejectByMachine() {} },
+    pendingFsLists: { resolve() {}, reject() {}, rejectByMachine() {} },
+    pendingFsReads: { resolve() {}, reject() {}, rejectByMachine() {} },
+    pendingGitStatuses: { resolve() {}, reject() {}, rejectByMachine() {} },
+    pendingTerminalStarts: {
+      resolve(key, value) {
+        started.push([key, value])
+      },
+      reject() {},
+      rejectByMachine() {}
+    },
+    pendingTerminalExecs: { resolve() {}, reject() {}, rejectByMachine() {} },
+    pendingModelLists: { resolve() {}, reject() {}, rejectByMachine() {} },
+    pendingIdeStarts: { resolve() {}, reject() {}, rejectByMachine() {} },
+    terminalSessions,
+    httpError(status, message) {
+      const err = new Error(message)
+      err.statusCode = status
+      return err
+    }
+  })
+
+  handlers.onRunnerMessage({
+    type: 'terminal.pty.start.result',
+    payload: {
+      requestId: 'term-start-1',
+      ok: true,
+      terminalId: 'terminal-1',
+      cwd: '/tmp/workspace',
+      shell: '/bin/bash',
+      cols: 120,
+      rows: 40
+    }
+  }, { machineId: 'machine-1', inserted: false })
+
+  handlers.onRunnerMessage({
+    type: 'terminal.pty.output',
+    payload: {
+      terminalId: 'terminal-1',
+      data: 'hello\n'
+    }
+  }, { machineId: 'machine-1', inserted: false })
+
+  handlers.onRunnerMessage({
+    type: 'terminal.pty.exit',
+    payload: {
+      terminalId: 'terminal-1',
+      exitCode: 0,
+      signal: null
+    }
+  }, { machineId: 'machine-1', inserted: false })
+
+  assert.deepEqual(started, [[
+    'term-start-1',
+    {
+      requestId: 'term-start-1',
+      ok: true,
+      terminalId: 'terminal-1',
+      cwd: '/tmp/workspace',
+      shell: '/bin/bash',
+      cols: 120,
+      rows: 40
+    }
+  ]])
+  assert.equal(terminalSessions.has('terminal-1'), false)
+  assert.equal(sseEvents.length, 2)
+  assert.equal(sseEvents[0]?.type, 'terminal.pty.output')
+  assert.deepEqual(sseEvents[0]?.scope, { machineId: 'machine-1', terminalId: 'terminal-1' })
+  assert.equal(sseEvents[0]?.payload?.data, 'hello\n')
+  assert.equal(sseEvents[1]?.type, 'terminal.pty.exit')
+  assert.equal(sseEvents[1]?.payload?.exitCode, 0)
 })

@@ -1,9 +1,11 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Archive, ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FileText, FolderClosed, GitBranch, Loader2, Mic, MoreHorizontal, Plus, Search, Settings, Square, Terminal, Trash2, X } from 'lucide-vue-next'
+import { Archive, ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FileText, FolderClosed, GitBranch, Loader2, MoreHorizontal, Plus, Search, Settings, SlidersHorizontal, Square, Terminal, Trash2, X } from 'lucide-vue-next'
 
 import MarkdownView from './components/MarkdownView.vue'
+import WorkspaceTerminalPane from './components/WorkspaceTerminalPane.vue'
 import {
+  buildContextUsageSummary,
   buildRecentWorkspaces,
   formatAgeShort as formatAgeShortValue,
   formatAgo as formatAgoValue,
@@ -118,6 +120,11 @@ import {
   readStoredSessionSidebarWidth
 } from './lib/sidebarResize.js'
 import {
+  appendWorkspaceTerminalOutput,
+  normalizeTerminalGeometry,
+  workspaceTerminalSessionMatchesContext
+} from './lib/workspaceTerminal.js'
+import {
   isMobileViewportWidth,
   preferredMobilePane
 } from './lib/mobileLayout.js'
@@ -185,6 +192,8 @@ const connectionBanner = computed(() => {
   }
   return { tone: 'warning', text: 'Disconnected.' + reasonSuffix }
 })
+const composerContextPopoverOpen = ref(false)
+const composerContextPopoverHover = ref(false)
 
 // sessionId -> { events: [], diff: string, seen: Set<string> }
 const sessionStores = reactive(new Map())
@@ -304,10 +313,13 @@ const workspaceFileError = ref('')
 const workspaceGitStatus = ref(null)
 const workspaceGitLoading = ref(false)
 const workspaceGitError = ref('')
-const workspaceTerminalCommand = ref('')
-const workspaceTerminalRunning = ref(false)
 const workspaceTerminalError = ref('')
-const workspaceTerminalRuns = ref([])
+const workspaceTerminalSession = ref(null)
+const workspaceTerminalStarting = ref(false)
+let workspaceTerminalInputBuffer = ''
+let workspaceTerminalInputFlushTimer = null
+let workspaceTerminalResizeTimer = null
+let workspaceTerminalPendingResize = null
 
 const chatScrollEl = ref(null)
 const stickToBottom = ref(true)
@@ -956,7 +968,7 @@ async function backfillSessionAfter(sessionId, { afterSeq, limit = 500 } = {}) {
 let handleEnvelope = () => {}
 let schedulePostVisibility = () => {}
 
-handleEnvelope = createSessionEnvelopeHandler({
+const baseHandleEnvelope = createSessionEnvelopeHandler({
   currentVisibility,
   notificationPermission,
   showBrowserToast,
@@ -990,6 +1002,64 @@ handleEnvelope = createSessionEnvelopeHandler({
   addSessionEvent
 })
 
+function handleTerminalEnvelope(env) {
+  if (!env || typeof env.type !== 'string') return false
+  if (env.type === 'terminal.pty.output') {
+    const terminalId = String(env.payload?.terminalId ?? env.scope?.terminalId ?? '').trim()
+    if (!terminalId || workspaceTerminalSession.value?.terminalId !== terminalId) return true
+    const next = workspaceTerminalSession.value
+    next.outputText = appendWorkspaceTerminalOutput(next.outputText, env.payload?.data ?? '')
+    next.outputVersion = Number(next.outputVersion ?? 0) + 1
+    return true
+  }
+  if (env.type === 'terminal.pty.exit') {
+    const terminalId = String(env.payload?.terminalId ?? env.scope?.terminalId ?? '').trim()
+    if (!terminalId || workspaceTerminalSession.value?.terminalId !== terminalId) return true
+    const next = workspaceTerminalSession.value
+    next.connected = false
+    next.exitCode = Number.isFinite(Number(env.payload?.exitCode)) ? Number(env.payload.exitCode) : null
+    next.signal = Number.isFinite(Number(env.payload?.signal)) ? Number(env.payload.signal) : null
+    next.outputText = appendWorkspaceTerminalOutput(
+      next.outputText,
+      `\r\n[process exited${next.exitCode !== null ? ` with code ${next.exitCode}` : ''}${next.signal !== null ? ` signal ${next.signal}` : ''}]\r\n`
+    )
+    next.outputVersion = Number(next.outputVersion ?? 0) + 1
+    return true
+  }
+  return false
+}
+
+handleEnvelope = (env) => {
+  if (handleTerminalEnvelope(env)) return
+  baseHandleEnvelope(env)
+}
+
+const selectedSession = computed(() => {
+  const sid = String(selectedSessionId.value ?? '').trim()
+  if (!sid) return null
+  return sessionRowsById.get(sid) ?? null
+})
+const selectedStore = computed(() => selectedSessionId.value ? sessionStores.get(selectedSessionId.value) : null)
+const selectedTokenUsage = computed(() => selectedSessionId.value ? (tokenUsageBySessionId.get(selectedSessionId.value) ?? null) : null)
+
+const currentWorkspaceContext = computed(() => {
+  const cwd = String(selectedSession.value?.cwd ?? defaults.cwd ?? '').trim()
+  const machineId = String(selectedSession.value?.machineId ?? defaults.machineId ?? '').trim()
+  return {
+    cwd,
+    machineId
+  }
+})
+
+const selectedMachineIdForSse = computed(() => {
+  if (workspacePaneOpen.value && workspacePaneTab.value === 'terminal') {
+    const terminalMachineId = String(workspaceTerminalSession.value?.machineId ?? '').trim()
+    if (terminalMachineId) return terminalMachineId
+  }
+  const workspaceMachineId = String(currentWorkspaceContext.value?.machineId ?? '').trim()
+  return workspaceMachineId || null
+})
+
 const {
   connectSse,
   schedulePostVisibility: schedulePostVisibilityImpl,
@@ -1001,6 +1071,7 @@ const {
   persistLastEventId: (value) => writeStoredSseEventId(value),
   hasSnapshot,
   selectedSessionId,
+  selectedMachineId: selectedMachineIdForSse,
   stickToBottom,
   scheduleMarkRead,
   clearScheduledMarkRead,
@@ -1024,6 +1095,8 @@ onLoginConnect = () => connectSse()
 
 watch(selectedSessionId, async (sid) => {
   closeSessionMenu()
+  composerContextPopoverOpen.value = false
+  composerContextPopoverHover.value = false
   if (!sid) {
     replaceUrlSessionParam(null)
     if (authed.value) schedulePostVisibility()
@@ -1079,13 +1152,6 @@ watch(sessionListGroupingMode, (value) => {
   persistSessionListGroupingMode(value)
 })
 
-const selectedSession = computed(() => {
-  const sid = String(selectedSessionId.value ?? '').trim()
-  if (!sid) return null
-  return sessionRowsById.get(sid) ?? null
-})
-const selectedStore = computed(() => selectedSessionId.value ? sessionStores.get(selectedSessionId.value) : null)
-const selectedTokenUsage = computed(() => selectedSessionId.value ? (tokenUsageBySessionId.get(selectedSessionId.value) ?? null) : null)
 const sessionListEntries = computed(() => buildSessionListEntries(visibleSessions.value, {
   groupingMode: sessionListGroupingMode.value,
   getHostName: (session) => sessionHostName(session),
@@ -1134,25 +1200,22 @@ const composerProjectLabel = computed(() => {
   const cwd = String(defaults.cwd ?? '').trim()
   return cwd ? sessionProject({ cwd }) : 'No workspace'
 })
-const currentWorkspaceContext = computed(() => {
-  const cwd = String(selectedSession.value?.cwd ?? defaults.cwd ?? '').trim()
-  const machineId = String(selectedSession.value?.machineId ?? defaults.machineId ?? '').trim()
-  return {
-    cwd,
-    machineId
-  }
-})
 const showWorkspacePane = computed(() => {
   if (isMobileLayout.value) return false
   return workspacePaneOpen.value
 })
-const composerTokenSummary = computed(() => {
-  const usage = selectedTokenUsage.value
-  if (!usage) return ''
-  const parts = []
-  if (usage.lastTotalTokens !== null) parts.push(`last ${formatCompactInt(usage.lastTotalTokens)}`)
-  if (usage.totalTotalTokens !== null) parts.push(`total ${formatCompactInt(usage.totalTotalTokens)}`)
-  return parts.join(' · ')
+const composerContextUsage = computed(() => buildContextUsageSummary(selectedTokenUsage.value))
+const composerContextPopoverVisible = computed(() => (
+  Boolean(composerContextUsage.value) && (composerContextPopoverOpen.value || composerContextPopoverHover.value)
+))
+const composerContextRingStyle = computed(() => {
+  const percent = Number(composerContextUsage.value?.percent ?? 0)
+  const clamped = Math.max(0, Math.min(100, percent))
+  const active = '#94a3b8'
+  const inactive = 'rgba(15, 23, 42, 0.1)'
+  return {
+    background: `conic-gradient(${active} 0deg ${clamped * 3.6}deg, ${inactive} ${clamped * 3.6}deg 360deg)`
+  }
 })
 const workspacePaneTitle = computed(() => {
   if (workspacePaneTab.value === 'terminal') return 'Terminal'
@@ -1160,6 +1223,12 @@ const workspacePaneTitle = computed(() => {
   if (workspacePaneTab.value === 'git') return 'Git'
   return 'Workspace'
 })
+const workspaceTerminalOpening = computed(() => (
+  workspacePaneTab.value === 'terminal'
+  && workspacePaneOpen.value
+  && !workspaceTerminalError.value
+  && (workspaceTerminalStarting.value || !workspaceTerminalSession.value?.terminalId)
+))
 
 const pinnedPlanSteps = computed(() => {
   const plan = selectedStore.value?.plan
@@ -1606,59 +1675,156 @@ function openGitFile(entry) {
   loadWorkspaceFiles(ctx.cwd).then(() => loadWorkspaceFile(absolutePath)).catch(() => {})
 }
 
-async function runWorkspaceTerminalCommand() {
+async function closeWorkspaceTerminalSession() {
+  const terminalId = String(workspaceTerminalSession.value?.terminalId ?? '').trim()
+  if (!terminalId) {
+    workspaceTerminalSession.value = null
+    return
+  }
+  const closing = terminalId
+  workspaceTerminalSession.value = null
+  workspaceTerminalInputBuffer = ''
+  if (workspaceTerminalInputFlushTimer) {
+    try { clearTimeout(workspaceTerminalInputFlushTimer) } catch {}
+    workspaceTerminalInputFlushTimer = null
+  }
+  if (workspaceTerminalResizeTimer) {
+    try { clearTimeout(workspaceTerminalResizeTimer) } catch {}
+    workspaceTerminalResizeTimer = null
+  }
+  workspaceTerminalPendingResize = null
+  try {
+    await apiFetch(`/api/terminal/sessions/${encodeURIComponent(closing)}`, {
+      method: 'DELETE'
+    })
+  } catch {
+  }
+}
+
+async function ensureWorkspaceTerminal({ cols = 80, rows = 24 } = {}) {
+  if (workspaceTerminalStarting.value) return false
   const ctx = resolveWorkspaceContext()
   if (!ctx) return false
-  const command = String(workspaceTerminalCommand.value ?? '').trim()
-  if (!command) return false
   workspaceTerminalError.value = ''
-  workspaceTerminalRunning.value = true
   activateWorkspacePane('terminal')
-  const run = {
-    id: crypto.randomUUID(),
-    cwd: ctx.cwd,
-    command,
-    stdout: '',
-    stderr: '',
-    exitCode: null,
-    signal: null,
-    timedOut: false,
-    durationMs: null
+
+  if (
+    workspaceTerminalSessionMatchesContext(workspaceTerminalSession.value, ctx)
+    && workspaceTerminalSession.value?.connected
+  ) {
+    queueWorkspaceTerminalResize({ cols, rows })
+    return true
   }
-  workspaceTerminalRuns.value = [run, ...workspaceTerminalRuns.value].slice(0, 30)
-  workspaceTerminalCommand.value = ''
+
+  await closeWorkspaceTerminalSession()
+
+  const size = normalizeTerminalGeometry(cols, rows)
+  const session = {
+    terminalId: '',
+    machineId: ctx.machineId,
+    cwd: ctx.cwd,
+    shell: '',
+    cols: size.cols,
+    rows: size.rows,
+    outputText: '',
+    outputVersion: 0,
+    connected: false,
+    exitCode: null,
+    signal: null
+  }
+  workspaceTerminalStarting.value = true
+  workspaceTerminalSession.value = session
   try {
-    const res = await apiFetch('/api/terminal/exec', {
+    const res = await apiFetch('/api/terminal/sessions', {
       method: 'POST',
       body: JSON.stringify({
         ...(ctx.machineId ? { machineId: ctx.machineId } : {}),
         cwd: ctx.cwd,
-        command
+        cols: size.cols,
+        rows: size.rows
       })
     })
     const data = await res.json().catch(() => null)
     if (!res.ok) {
       workspaceTerminalError.value = data?.error ?? `HTTP ${res.status}`
-      run.stderr = workspaceTerminalError.value
-      run.exitCode = -1
+      workspaceTerminalSession.value = null
       return false
     }
-    run.stdout = String(data?.stdout ?? '')
-    run.stderr = String(data?.stderr ?? '')
-    run.exitCode = Number.isFinite(Number(data?.exitCode)) ? Number(data.exitCode) : null
-    run.signal = data?.signal ?? null
-    run.timedOut = Boolean(data?.timedOut)
-    run.durationMs = Number.isFinite(Number(data?.durationMs)) ? Number(data.durationMs) : null
+    session.terminalId = String(data?.terminalId ?? '').trim()
+    session.machineId = String(data?.machineId ?? ctx.machineId).trim()
+    session.cwd = String(data?.cwd ?? ctx.cwd).trim()
+    session.shell = String(data?.shell ?? '').trim()
+    session.cols = Number(data?.cols) || size.cols
+    session.rows = Number(data?.rows) || size.rows
+    session.connected = true
+    session.outputVersion += 1
     return true
   } catch (err) {
-    const message = String(err?.message ?? err)
-    workspaceTerminalError.value = message
-    run.stderr = message
-    run.exitCode = -1
+    workspaceTerminalError.value = String(err?.message ?? err)
+    workspaceTerminalSession.value = null
     return false
   } finally {
-    workspaceTerminalRunning.value = false
+    workspaceTerminalStarting.value = false
   }
+}
+
+function scheduleWorkspaceTerminalInputFlush() {
+  if (workspaceTerminalInputFlushTimer) return
+  workspaceTerminalInputFlushTimer = setTimeout(async () => {
+    workspaceTerminalInputFlushTimer = null
+    const terminalId = String(workspaceTerminalSession.value?.terminalId ?? '').trim()
+    const data = workspaceTerminalInputBuffer
+    workspaceTerminalInputBuffer = ''
+    if (!terminalId || !data) return
+    try {
+      await apiFetch(`/api/terminal/sessions/${encodeURIComponent(terminalId)}/input`, {
+        method: 'POST',
+        body: JSON.stringify({ data })
+      })
+    } catch {
+    }
+  }, 16)
+}
+
+function sendWorkspaceTerminalInput(data) {
+  const text = String(data ?? '')
+  if (!text || !workspaceTerminalSession.value?.connected) return
+  workspaceTerminalInputBuffer += text
+  scheduleWorkspaceTerminalInputFlush()
+}
+
+function queueWorkspaceTerminalResize({ cols, rows }) {
+  if (!workspaceTerminalSession.value?.terminalId) return
+  workspaceTerminalPendingResize = normalizeTerminalGeometry(cols, rows)
+  if (workspaceTerminalResizeTimer) return
+  workspaceTerminalResizeTimer = setTimeout(async () => {
+    workspaceTerminalResizeTimer = null
+    const terminalId = String(workspaceTerminalSession.value?.terminalId ?? '').trim()
+    const nextSize = workspaceTerminalPendingResize
+    workspaceTerminalPendingResize = null
+    if (!terminalId || !nextSize) return
+    workspaceTerminalSession.value.cols = nextSize.cols
+    workspaceTerminalSession.value.rows = nextSize.rows
+    try {
+      await apiFetch(`/api/terminal/sessions/${encodeURIComponent(terminalId)}/resize`, {
+        method: 'POST',
+        body: JSON.stringify(nextSize)
+      })
+    } catch {
+    }
+  }, 80)
+}
+
+async function onWorkspaceTerminalReady(size) {
+  await ensureWorkspaceTerminal(size)
+}
+
+async function reopenWorkspaceTerminal() {
+  const size = normalizeTerminalGeometry(
+    workspaceTerminalSession.value?.cols,
+    workspaceTerminalSession.value?.rows
+  )
+  await ensureWorkspaceTerminal(size)
 }
 
 async function openWorkspaceTool(tab) {
@@ -1673,6 +1839,11 @@ async function openWorkspaceTool(tab) {
   if (tab === 'terminal') {
     workspaceTerminalError.value = ''
     activateWorkspacePane('terminal')
+    if (workspaceTerminalSession.value?.terminalId && workspaceTerminalSession.value?.connected) return
+    if (workspaceTerminalSession.value?.terminalId && !workspaceTerminalSession.value?.connected) {
+      await reopenWorkspaceTerminal()
+      return
+    }
     return
   }
   await openWorkspace()
@@ -1703,6 +1874,7 @@ async function openWorkspace() {
 async function closeWorkspacePane() {
   ideError.value = ''
   const existingIdeId = String(activeIdeSession.value?.ideId ?? '').trim()
+  await closeWorkspaceTerminalSession()
   workspacePaneOpen.value = false
   activeIdeSession.value = null
   ideFrameLoading.value = false
@@ -1816,6 +1988,8 @@ onMounted(async () => {
 
   const onKeyDown = (ev) => {
     if (ev.key === 'Escape') {
+      composerContextPopoverOpen.value = false
+      composerContextPopoverHover.value = false
       if (sessionSidebarDragging.value) stopSessionSidebarDrag()
       else if (workspacePaneOpen.value) closeWorkspacePane()
       if (sessionMenuId.value) closeSessionMenu()
@@ -1831,8 +2005,13 @@ onMounted(async () => {
 
   const onSessionMenuOutside = (ev) => {
     const target = ev?.target
-    if (target?.closest?.('[data-session-menu-root="true"]')) return
-    closeSessionMenu()
+    const inSessionMenu = Boolean(target?.closest?.('[data-session-menu-root="true"]'))
+    const inContextPopover = Boolean(target?.closest?.('[data-context-usage-root="true"]'))
+    if (!inSessionMenu) closeSessionMenu()
+    if (!inContextPopover) {
+      composerContextPopoverOpen.value = false
+      composerContextPopoverHover.value = false
+    }
   }
   sessionMenuOutsideHandler = onSessionMenuOutside
   try { document.addEventListener('pointerdown', onSessionMenuOutside) } catch {}
@@ -1883,6 +2062,14 @@ onBeforeUnmount(() => {
   clearComposerAttachments()
   disposeSse()
   stopSessionSidebarDrag()
+  if (workspaceTerminalInputFlushTimer) {
+    try { clearTimeout(workspaceTerminalInputFlushTimer) } catch {}
+    workspaceTerminalInputFlushTimer = null
+  }
+  if (workspaceTerminalResizeTimer) {
+    try { clearTimeout(workspaceTerminalResizeTimer) } catch {}
+    workspaceTerminalResizeTimer = null
+  }
   try { sessionListResizeObserver?.disconnect?.() } catch {}
   sessionListResizeObserver = null
   if (nowTimer) {
@@ -1933,6 +2120,22 @@ watch(
   async () => {
     await nextTick()
     updateSessionListMetrics()
+  }
+)
+
+watch(
+  () => [currentWorkspaceContext.value.machineId, currentWorkspaceContext.value.cwd],
+  ([machineId, cwd], [prevMachineId, prevCwd]) => {
+    if (machineId === prevMachineId && cwd === prevCwd) return
+    const terminalSession = workspaceTerminalSession.value
+    if (!terminalSession) return
+    if (workspaceTerminalSessionMatchesContext(terminalSession, { machineId, cwd })) return
+    const size = normalizeTerminalGeometry(terminalSession.cols, terminalSession.rows)
+    closeWorkspaceTerminalSession().then(() => {
+      if (workspacePaneOpen.value && workspacePaneTab.value === 'terminal' && String(cwd ?? '').trim()) {
+        ensureWorkspaceTerminal(size).catch(() => {})
+      }
+    }).catch(() => {})
   }
 )
 </script>
@@ -1987,13 +2190,13 @@ watch(
       <div ref="layoutShellEl" class="flex flex-1 min-h-0 overflow-hidden">
         <div
           class="flex min-h-0 flex-1"
-          :class="isMobileLayout ? 'shrink-0 transition-transform duration-300 ease-out' : ''"
+          :class="isMobileLayout ? 'h-full w-full flex-none shrink-0 overflow-hidden transition-transform duration-300 ease-out' : ''"
           :style="layoutTrackStyle"
         >
         <!-- Sidebar -->
         <aside
           class="flex flex-col bg-[#efefec]"
-          :class="isMobileLayout ? 'min-h-0 w-full shrink-0' : 'shrink-0'"
+          :class="isMobileLayout ? 'min-h-0 h-full w-1/2 min-w-0 shrink-0 basis-1/2 overflow-hidden' : 'shrink-0'"
           :style="sessionSidebarStyle"
         >
           <div class="shrink-0 px-3 pb-2 pt-3">
@@ -2201,15 +2404,18 @@ watch(
       <!-- Main -->
       <div
         class="flex min-h-0 bg-white"
-        :class="isMobileLayout ? 'w-full shrink-0 p-0' : 'flex-1 gap-1.5 p-1.5'"
+        :class="isMobileLayout ? 'min-h-0 h-full w-1/2 min-w-0 shrink-0 basis-1/2 overflow-hidden p-0' : 'flex-1 gap-1.5 p-1.5'"
       >
       <main
         class="min-h-0"
-        :class="showWorkspacePane ? 'min-w-0 basis-[44%] shrink-0 grow-0' : 'min-w-0 flex-1'"
+        :class="isMobileLayout
+          ? 'h-full w-full min-w-0 max-w-full flex-1 overflow-hidden'
+          : (showWorkspacePane ? 'min-w-0 basis-[44%] shrink-0 grow-0' : 'min-w-0 flex-1')"
       >
         <section
           v-if="!(isMobileLayout && mobilePane === 'workspace')"
-          class="flex h-full min-w-0 flex-col overflow-hidden rounded-[16px] bg-white shadow-[0_1px_2px_rgba(0,0,0,0.03)]"
+          class="flex h-full min-w-0 flex-col overflow-hidden bg-white"
+          :class="isMobileLayout ? 'w-full rounded-none shadow-none' : 'rounded-[16px] shadow-[0_1px_2px_rgba(0,0,0,0.03)]'"
         >
           <header class="bg-white px-4 py-2.5">
             <div class="flex items-start justify-between gap-4">
@@ -2283,7 +2489,11 @@ watch(
           </header>
 
           <div class="relative flex-1 min-h-0">
-            <div ref="chatScrollEl" class="absolute inset-0 overflow-auto px-6 py-8" @scroll="onChatScroll">
+            <div
+              ref="chatScrollEl"
+              class="absolute inset-0 overflow-auto px-4 py-6 sm:px-6 sm:py-8"
+              @scroll="onChatScroll"
+            >
               <div class="mx-auto w-full max-w-[700px]">
               <div v-if="selectedSessionId && sessionLoading" class="py-10">
                 <div class="space-y-3 animate-pulse">
@@ -2333,7 +2543,7 @@ watch(
                           <template v-for="it in m.timeline" :key="it.id">
                             <div
                               v-if="it.kind === 'reasoningText' || it.kind === 'commentaryText'"
-                              class="whitespace-pre-wrap text-sm leading-7 text-slate-700"
+                              class="whitespace-pre-wrap break-words text-sm leading-7 text-slate-700"
                             >
                               {{ it.text }}
                             </div>
@@ -2823,7 +3033,7 @@ watch(
           </div>
 
           <footer
-            class="relative bg-white px-6 pb-4 pt-2"
+            class="relative bg-white px-4 pb-3 pt-2 sm:px-6 sm:pb-4"
             @dragenter.prevent="onComposerDragEnter"
             @dragleave.prevent="onComposerDragLeave"
             @dragover.prevent
@@ -2845,7 +3055,7 @@ watch(
                 <textarea
                   v-model="messageDraft"
                   rows="2"
-                  class="w-full resize-none bg-transparent px-2 text-[14px] leading-6 text-slate-800 outline-none placeholder:text-slate-400"
+                  class="w-full resize-none bg-transparent px-1.5 text-[14px] leading-6 text-slate-800 outline-none placeholder:text-slate-400"
                   placeholder="Ask for follow-up changes…"
                   @keydown.enter.exact.prevent="submit"
                   @paste="onComposerPaste"
@@ -2878,7 +3088,7 @@ watch(
                 </div>
 
                 <div class="mt-2 flex items-center justify-between gap-2">
-                  <div class="flex min-w-0 items-center gap-1.5 overflow-x-auto pb-1">
+                  <div class="flex min-w-0 items-center gap-1 overflow-x-auto pb-1 sm:gap-1.5">
                     <input
                       ref="fileInputEl"
                       type="file"
@@ -2887,16 +3097,16 @@ watch(
                       @change="onFilesPicked"
                     />
                     <button
-                      class="inline-flex h-8 w-8 items-center justify-center rounded-full bg-transparent text-slate-600 transition-colors hover:bg-black/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/40 active:scale-[0.99]"
+                      class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-transparent text-slate-600 transition-colors hover:bg-black/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/40 active:scale-[0.99] sm:h-8 sm:w-8"
                       @click="openFilePicker"
                       title="Upload files/images"
                     >
-                      <Plus class="h-4 w-4" />
+                      <Plus class="h-3.5 w-3.5 sm:h-4 sm:w-4" />
                     </button>
 
                     <select
                       v-model="composerModel"
-                      class="h-8 max-w-[170px] rounded-full border border-black/[0.06] bg-transparent px-3 pr-8 text-[12px] text-slate-700 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20 sm:max-w-[220px]"
+                      class="h-7 max-w-[132px] rounded-full border border-black/[0.06] bg-transparent px-2.5 pr-7 text-[11px] text-slate-700 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20 sm:h-8 sm:max-w-[220px] sm:px-3 sm:pr-8 sm:text-[12px]"
                       title="Model"
                       :disabled="modelCatalogLoading && !composerModelOptions.length"
                     >
@@ -2910,7 +3120,7 @@ watch(
 
                     <select
                       v-model="composerReasoningEffort"
-                      class="h-8 rounded-full border border-black/[0.06] bg-transparent px-3 pr-8 text-[12px] text-slate-700 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20"
+                      class="h-7 max-w-[112px] rounded-full border border-black/[0.06] bg-transparent px-2.5 pr-7 text-[11px] text-slate-700 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20 sm:h-8 sm:max-w-none sm:px-3 sm:pr-8 sm:text-[12px]"
                       title="Reasoning effort"
                     >
                       <option value="">
@@ -2925,32 +3135,25 @@ watch(
                       </option>
                     </select>
 
-                    <button
-                      class="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                      type="button"
-                      title="Voice input coming soon"
-                    >
-                      <Mic class="h-3.5 w-3.5" />
-                    </button>
                   </div>
 
                   <button
-                    class="inline-flex h-8 w-8 items-center justify-center rounded-full bg-slate-700 text-white transition-colors hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/50 active:scale-[0.99]"
+                    class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-slate-700 text-white transition-colors hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/50 active:scale-[0.99] sm:h-8 sm:w-8"
                     @click="submit"
                     :disabled="sending || (selectedSession?.turnState !== 'running' && !messageDraft.trim() && !attachments.length)"
                     :title="selectedSession?.turnState === 'running' ? 'Stop' : 'Send'"
                   >
-                    <Loader2 v-if="sending" class="h-4 w-4 animate-spin" />
-                    <Square v-else-if="selectedSession?.turnState === 'running'" class="h-4 w-4" />
-                    <ArrowUp v-else class="h-4 w-4" />
+                    <Loader2 v-if="sending" class="h-3.5 w-3.5 animate-spin sm:h-4 sm:w-4" />
+                    <Square v-else-if="selectedSession?.turnState === 'running'" class="h-3.5 w-3.5 sm:h-4 sm:w-4" />
+                    <ArrowUp v-else class="h-3.5 w-3.5 sm:h-4 sm:w-4" />
                   </button>
                 </div>
               </div>
 
               <div class="mt-2 flex flex-wrap items-center justify-between gap-2 px-1 text-[11px] text-slate-400">
-                <div class="flex min-w-0 flex-wrap items-center gap-2">
+                <div class="flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
                   <div
-                    class="inline-flex max-w-full items-center gap-1.5 rounded-full border border-black/[0.06] px-2.5 py-1 text-slate-500"
+                    class="inline-flex max-w-full items-center gap-1.5 rounded-full border border-black/[0.06] px-2 py-0.5 text-[10px] text-slate-500 sm:px-2.5 sm:py-1 sm:text-[11px]"
                     :title="composerMachineLabel"
                   >
                     <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="composerMachineOnline ? 'bg-emerald-500' : 'bg-slate-400'" />
@@ -2959,7 +3162,7 @@ watch(
 
                   <select
                     v-model="composerApprovalPolicy"
-                    class="h-7 rounded-full border border-black/[0.06] bg-transparent px-2.5 pr-8 text-[11px] text-slate-600 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20"
+                    class="h-6 rounded-full border border-black/[0.06] bg-transparent px-2 pr-7 text-[10px] text-slate-600 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20 sm:h-7 sm:px-2.5 sm:pr-8 sm:text-[11px]"
                     :title="selectedSession ? 'Session approval policy' : 'Default approval policy'"
                   >
                     <option value="untrusted">untrusted</option>
@@ -2970,7 +3173,7 @@ watch(
 
                   <select
                     v-model="composerSandbox"
-                    class="h-7 rounded-full border border-black/[0.06] bg-transparent px-2.5 pr-8 text-[11px] text-slate-600 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20"
+                    class="h-6 rounded-full border border-black/[0.06] bg-transparent px-2 pr-7 text-[10px] text-slate-600 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20 sm:h-7 sm:px-2.5 sm:pr-8 sm:text-[11px]"
                     :title="selectedSession ? 'Session sandbox' : 'Default sandbox'"
                   >
                     <option value="read-only">read-only</option>
@@ -2978,15 +3181,47 @@ watch(
                     <option value="danger-full-access">danger-full-access</option>
                   </select>
                 </div>
-                <div class="hidden max-w-[240px] truncate sm:block" :title="selectedSession?.cwd ?? defaults.cwd">
-                  {{ composerProjectLabel }}
+                <div class="flex items-center gap-2">
+                  <div class="hidden max-w-[240px] truncate sm:block" :title="selectedSession?.cwd ?? defaults.cwd">
+                    {{ composerProjectLabel }}
+                  </div>
+                  <div
+                    v-if="composerContextUsage"
+                    class="relative shrink-0"
+                    data-context-usage-root="true"
+                    @mouseenter="composerContextPopoverHover = true"
+                    @mouseleave="composerContextPopoverHover = false"
+                  >
+                    <button
+                      class="relative inline-flex h-6 w-6 items-center justify-center rounded-full transition-transform hover:scale-[1.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                      type="button"
+                      :title="composerContextUsage.usageLabel"
+                      @click.stop="composerContextPopoverOpen = !composerContextPopoverOpen"
+                    >
+                      <span class="absolute inset-0 rounded-full" :style="composerContextRingStyle" />
+                      <span class="absolute inset-[2px] rounded-full bg-white ring-1 ring-black/[0.06]" />
+                      <span class="relative h-1.5 w-1.5 rounded-full bg-slate-400" />
+                    </button>
+                    <div
+                      v-if="composerContextPopoverVisible"
+                      class="absolute bottom-8 right-0 z-20 w-44 rounded-2xl border border-black/[0.06] bg-white px-3 py-2 text-center shadow-lg shadow-black/10"
+                    >
+                      <div class="text-[11px] text-slate-500">Context window:</div>
+                      <div v-if="composerContextUsage.percentLabel" class="text-[11px] text-slate-500">
+                        {{ composerContextUsage.percentLabel }}
+                      </div>
+                      <div class="mt-1 text-xs font-medium text-slate-900">
+                        {{ composerContextUsage.usageLabel }}
+                      </div>
+                      <div v-if="composerContextUsage.lastLabel" class="mt-1 text-[11px] text-slate-500">
+                        Last turn {{ composerContextUsage.lastLabel }}
+                      </div>
+                      <div class="mt-1 text-[11px] text-slate-800">
+                        Codex automatically compacts its context
+                      </div>
+                    </div>
+                  </div>
                 </div>
-              </div>
-              <div
-                v-if="composerTokenSummary"
-                class="mt-1 px-1 text-[11px] text-slate-400"
-              >
-                {{ composerTokenSummary }}
               </div>
             </div>
           </footer>
@@ -3054,48 +3289,16 @@ watch(
               </div>
             </div>
 
-            <div v-else-if="workspacePaneTab === 'terminal'" class="flex h-full min-h-0 flex-col">
-              <div class="border-b border-black/[0.04] px-4 py-3">
-                <div class="flex gap-2">
-                  <input
-                    v-model="workspaceTerminalCommand"
-                    type="text"
-                    class="min-w-0 flex-1 rounded-xl border border-black/[0.06] bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20"
-                    placeholder="Run a shell command…"
-                    @keydown.enter.prevent="runWorkspaceTerminalCommand"
-                  />
-                  <button
-                    class="rounded-xl bg-slate-800 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-slate-900 disabled:opacity-40"
-                    :disabled="workspaceTerminalRunning || !workspaceTerminalCommand.trim()"
-                    @click="runWorkspaceTerminalCommand"
-                  >
-                    {{ workspaceTerminalRunning ? 'Running…' : 'Run' }}
-                  </button>
-                </div>
-                <div v-if="workspaceTerminalError" class="mt-2 text-xs text-red-600">{{ workspaceTerminalError }}</div>
-              </div>
-              <div class="min-h-0 flex-1 overflow-auto px-4 py-3">
-                <div v-if="!workspaceTerminalRuns.length" class="text-sm text-slate-500">Run a command to inspect the workspace.</div>
-                <div v-else class="space-y-3">
-                  <div
-                    v-for="run in workspaceTerminalRuns"
-                    :key="run.id"
-                    class="overflow-hidden rounded-2xl border border-black/[0.06] bg-[#f7f7f4]"
-                  >
-                    <div class="flex items-center justify-between gap-3 border-b border-black/[0.05] px-3 py-2 text-xs">
-                      <div class="truncate font-mono text-slate-800">{{ run.command }}</div>
-                      <div class="shrink-0 text-slate-500">
-                        <span v-if="run.exitCode !== null">exit {{ run.exitCode }}</span>
-                      </div>
-                    </div>
-                    <div class="space-y-2 px-3 py-3">
-                      <pre v-if="run.stdout" class="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs font-mono text-slate-800">{{ run.stdout }}</pre>
-                      <pre v-if="run.stderr" class="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs font-mono text-rose-700">{{ run.stderr }}</pre>
-                      <div v-if="!run.stdout && !run.stderr" class="text-xs text-slate-500">(no output)</div>
-                    </div>
-                  </div>
-                </div>
-              </div>
+            <div v-else-if="workspacePaneTab === 'terminal'" class="min-h-0 h-full">
+              <WorkspaceTerminalPane
+                :session="workspaceTerminalSession"
+                :error="workspaceTerminalError"
+                :opening="workspaceTerminalOpening"
+                @ready="onWorkspaceTerminalReady"
+                @input="sendWorkspaceTerminalInput"
+                @resize="queueWorkspaceTerminalResize"
+                @open="reopenWorkspaceTerminal"
+              />
             </div>
 
             <div v-else-if="workspacePaneTab === 'files'" class="flex h-full min-h-0 flex-col">
@@ -3254,48 +3457,16 @@ watch(
           </div>
         </div>
 
-        <div v-else-if="workspacePaneTab === 'terminal'" class="flex min-h-0 flex-1 flex-col">
-          <div class="border-t border-black/[0.04] px-4 py-3">
-            <div class="flex gap-2">
-              <input
-                v-model="workspaceTerminalCommand"
-                type="text"
-                class="min-w-0 flex-1 rounded-xl border border-black/[0.06] bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20"
-                placeholder="Run a shell command…"
-                @keydown.enter.prevent="runWorkspaceTerminalCommand"
-              />
-              <button
-                class="rounded-xl bg-slate-800 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-slate-900 disabled:opacity-40"
-                :disabled="workspaceTerminalRunning || !workspaceTerminalCommand.trim()"
-                @click="runWorkspaceTerminalCommand"
-              >
-                {{ workspaceTerminalRunning ? 'Running…' : 'Run' }}
-              </button>
-            </div>
-            <div v-if="workspaceTerminalError" class="mt-2 text-xs text-red-600">{{ workspaceTerminalError }}</div>
-          </div>
-          <div class="min-h-0 flex-1 overflow-auto px-4 py-3">
-            <div v-if="!workspaceTerminalRuns.length" class="text-sm text-slate-500">Run a command to inspect the workspace.</div>
-            <div v-else class="space-y-3">
-              <div
-                v-for="run in workspaceTerminalRuns"
-                :key="run.id"
-                class="overflow-hidden rounded-2xl border border-black/[0.06] bg-[#f7f7f4]"
-              >
-                <div class="flex items-center justify-between gap-3 border-b border-black/[0.05] px-3 py-2 text-xs">
-                  <div class="truncate font-mono text-slate-800">{{ run.command }}</div>
-                  <div class="shrink-0 text-slate-500">
-                    <span v-if="run.exitCode !== null">exit {{ run.exitCode }}</span>
-                  </div>
-                </div>
-                <div class="space-y-2 px-3 py-3">
-                  <pre v-if="run.stdout" class="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs font-mono text-slate-800">{{ run.stdout }}</pre>
-                  <pre v-if="run.stderr" class="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs font-mono text-rose-700">{{ run.stderr }}</pre>
-                  <div v-if="!run.stdout && !run.stderr" class="text-xs text-slate-500">(no output)</div>
-                </div>
-              </div>
-            </div>
-          </div>
+        <div v-else-if="workspacePaneTab === 'terminal'" class="min-h-0 flex-1">
+          <WorkspaceTerminalPane
+            :session="workspaceTerminalSession"
+            :error="workspaceTerminalError"
+            :opening="workspaceTerminalOpening"
+            @ready="onWorkspaceTerminalReady"
+            @input="sendWorkspaceTerminalInput"
+            @resize="queueWorkspaceTerminalResize"
+            @open="reopenWorkspaceTerminal"
+          />
         </div>
 
         <div v-else-if="workspacePaneTab === 'files'" class="flex min-h-0 flex-1 flex-col">

@@ -36,10 +36,11 @@ export function writeStoredSseEventId(eventId, {
   }
 }
 
-export function buildEventsStreamPath({ visibility = 'visible', sessionId = null, lastEventId = null, resume = false } = {}) {
+export function buildEventsStreamPath({ visibility = 'visible', sessionId = null, machineId = null, lastEventId = null, resume = false } = {}) {
   const params = new URLSearchParams()
   params.set('visibility', String(visibility ?? 'visible'))
   if (sessionId) params.set('sessionId', String(sessionId))
+  if (machineId) params.set('machineId', String(machineId))
   if (Number.isFinite(Number(lastEventId)) && Number(lastEventId) > 0) {
     params.set('lastEventId', String(Number(lastEventId)))
   }
@@ -68,6 +69,7 @@ export function createSessionSseActions({
   flushBatchSize = 64,
   hasSnapshot = null,
   selectedSessionId,
+  selectedMachineId = null,
   stickToBottom,
   scheduleMarkRead,
   clearScheduledMarkRead,
@@ -130,7 +132,8 @@ export function createSessionSseActions({
       body: JSON.stringify({
         connectionId,
         visibility: currentVisibility(),
-        sessionId: selectedSessionId.value ?? null
+        sessionId: selectedSessionId.value ?? null,
+        machineId: selectedMachineId?.value ?? null
       })
     }).catch(() => {})
   }
@@ -170,6 +173,7 @@ export function createSessionSseActions({
     const next = new EventSource(buildEventsStreamPath({
       visibility: currentVisibility(),
       sessionId: selectedSessionId.value || null,
+      machineId: selectedMachineId?.value || null,
       lastEventId: lastSseEventId?.value ?? null,
       resume: Boolean(hasSnapshot?.value) && Number(lastSseEventId?.value ?? 0) > 0
     }))

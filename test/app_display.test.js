@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  buildContextUsageSummary,
   buildRecentWorkspaces,
   finalizeCompletedPlan,
   formatAgeShort,
@@ -69,6 +70,18 @@ test('token usage helpers normalize payloads and update the reactive map', () =>
     lastTotalTokens: 7,
     totalTotalTokens: 21,
     modelContextWindow: 64000
+  })
+
+  assert.deepEqual(buildContextUsageSummary(map.get('session-1')), {
+    usedTokens: 21,
+    usedLabel: '21',
+    lastTokens: 7,
+    lastLabel: '7',
+    modelContextWindow: 64000,
+    windowLabel: '64k',
+    percent: 0.0328125,
+    percentLabel: '0% full',
+    usageLabel: '21 / 64k tokens used'
   })
 })
 

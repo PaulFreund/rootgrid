@@ -82,8 +82,8 @@ export class SSEManager {
     return this.#writeOrDrop(id ?? null, { res }, this.#formatData(prepared.sseId, prepared.envelope))
   }
 
-  send(envelope) {
-    const prepared = this.#prepareEnvelope(envelope, { recordHistory: true })
+  send(envelope, { recordHistory = true } = {}) {
+    const prepared = this.#prepareEnvelope(envelope, { recordHistory })
     if (!prepared) return
     const data = this.#formatData(prepared.sseId, prepared.envelope)
     for (const [id, c] of this.clients.entries()) {
@@ -222,6 +222,10 @@ export class SSEManager {
 
     const machineId = envelope?.scope?.machineId ?? envelope?.payload?.machineId ?? null
     if (machineId && client.machineId && machineId === client.machineId) return true
+
+    if (type.startsWith('terminal.pty.')) {
+      return Boolean(machineId && client.machineId && machineId === client.machineId)
+    }
 
     return false
   }

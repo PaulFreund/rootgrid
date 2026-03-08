@@ -23,8 +23,12 @@ test('buildEventsStreamPath includes visibility and optional session filter', ()
     '/api/events?visibility=visible&sessionId=session-1'
   )
   assert.equal(
-    buildEventsStreamPath({ visibility: 'visible', sessionId: 'session-1', lastEventId: 42 }),
-    '/api/events?visibility=visible&sessionId=session-1&lastEventId=42'
+    buildEventsStreamPath({ visibility: 'visible', machineId: 'machine-1' }),
+    '/api/events?visibility=visible&machineId=machine-1'
+  )
+  assert.equal(
+    buildEventsStreamPath({ visibility: 'visible', sessionId: 'session-1', machineId: 'machine-1', lastEventId: 42 }),
+    '/api/events?visibility=visible&sessionId=session-1&machineId=machine-1&lastEventId=42'
   )
   assert.equal(
     buildEventsStreamPath({ visibility: 'visible', lastEventId: 42, resume: true }),
@@ -79,6 +83,7 @@ test('createSessionSseActions carries forward the last SSE event id across recon
   const sseConnectionId = { value: null }
   const lastSseEventId = { value: 9 }
   const selectedSessionId = { value: 'session-1' }
+  const selectedMachineId = { value: 'machine-1' }
   const stickToBottom = { value: true }
   const sseStatus = { value: 'disconnected' }
   const sseDisconnectReason = { value: null }
@@ -99,6 +104,7 @@ test('createSessionSseActions carries forward the last SSE event id across recon
       flushDelayMs: 0,
       hasSnapshot,
       selectedSessionId,
+      selectedMachineId,
       stickToBottom,
       scheduleMarkRead: () => {},
       clearScheduledMarkRead: () => {},
@@ -114,6 +120,7 @@ test('createSessionSseActions carries forward the last SSE event id across recon
     actions.connectSse()
     assert.match(FakeEventSource.instances[0].url, /lastEventId=9/)
     assert.match(FakeEventSource.instances[0].url, /resume=1/)
+    assert.match(FakeEventSource.instances[0].url, /machineId=machine-1/)
 
     FakeEventSource.instances[0].onmessage({
       lastEventId: '11',
@@ -153,6 +160,7 @@ test('createSessionSseActions batches non-snapshot envelopes briefly before hand
       lastSseEventId: { value: 0 },
       hasSnapshot: { value: false },
       selectedSessionId: { value: null },
+      selectedMachineId: { value: null },
       stickToBottom: { value: true },
       scheduleMarkRead: () => {},
       clearScheduledMarkRead: () => {},

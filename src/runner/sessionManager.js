@@ -3,6 +3,7 @@ import crypto from 'node:crypto'
 import { CodexAppServerSession } from './sessions/CodexAppServerSession.js'
 import { RunnerIdeManager } from './ideManager.js'
 import { RunnerReleaseManager } from './runnerReleaseManager.js'
+import { RunnerTerminalManager } from './runnerTerminalManager.js'
 import { RunnerUploadManager } from './runnerUploadManager.js'
 import { execTerminalCommand, getGitStatus, listCodexModels, listWorkspaceEntries, readWorkspaceFile } from './runnerWorkspaceApi.js'
 
@@ -37,6 +38,10 @@ export class RunnerSessionManager {
       machineId,
       emit: (type, scope, payload, options) => this.#emit(type, scope, payload, options)
     })
+    this.terminals = new RunnerTerminalManager({
+      machineId,
+      emit: (type, payload, options) => this.#emit(type, { machineId: this.machineId }, payload, options)
+    })
     this.upgrade = new RunnerReleaseManager({
       machineId,
       upgrade,
@@ -56,6 +61,10 @@ export class RunnerSessionManager {
     if (type === 'fs.read') return this.#onFsRead(payload)
     if (type === 'git.status') return this.#onGitStatus(payload)
     if (type === 'terminal.exec') return this.#onTerminalExec(payload)
+    if (type === 'terminal.pty.start') return this.#onTerminalPtyStart(payload)
+    if (type === 'terminal.pty.input') return this.#onTerminalPtyInput(payload)
+    if (type === 'terminal.pty.resize') return this.#onTerminalPtyResize(payload)
+    if (type === 'terminal.pty.close') return this.#onTerminalPtyClose(payload)
     if (type === 'codex.model.list') return this.#onCodexModelList(payload)
     if (type === 'session.start') return this.#onSessionStart(payload)
     if (type === 'session.send') return this.#onSessionSend(payload)
@@ -345,6 +354,39 @@ export class RunnerSessionManager {
         ok: false,
         error: String(err?.message ?? err)
       }, { track: false })
+    }
+  }
+
+  async #onTerminalPtyStart(payload) {
+    try {
+      await this.terminals.start(payload)
+    } catch (err) {
+      this.#emit('terminal.pty.start.result', { machineId: this.machineId }, {
+        requestId: payload?.requestId ?? null,
+        ok: false,
+        error: String(err?.message ?? err)
+      }, { track: false })
+    }
+  }
+
+  #onTerminalPtyInput(payload) {
+    try {
+      this.terminals.input(payload)
+    } catch {
+    }
+  }
+
+  #onTerminalPtyResize(payload) {
+    try {
+      this.terminals.resize(payload)
+    } catch {
+    }
+  }
+
+  #onTerminalPtyClose(payload) {
+    try {
+      this.terminals.close(payload)
+    } catch {
     }
   }
 

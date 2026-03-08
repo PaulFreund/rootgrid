@@ -105,9 +105,11 @@ export function createHostRunnerEventHandlers({
   pendingFsLists,
   pendingFsReads,
   pendingGitStatuses,
+  pendingTerminalStarts,
   pendingTerminalExecs,
   pendingModelLists,
   pendingIdeStarts,
+  terminalSessions,
   httpError
 }) {
   return {
@@ -155,6 +157,61 @@ export function createHostRunnerEventHandlers({
         if (!requestId) return
         if (msg.payload?.ok === false) pendingTerminalExecs.reject(requestId, new Error(msg.payload?.error ?? 'terminal command failed'))
         else pendingTerminalExecs.resolve(requestId, msg.payload)
+        return
+      }
+
+      if (msg?.type === 'terminal.pty.start.result') {
+        const requestId = msg.payload?.requestId
+        if (!requestId) return
+        if (msg.payload?.ok === false) {
+          pendingTerminalStarts.reject(requestId, new Error(msg.payload?.error ?? 'terminal failed to start'))
+        } else {
+          const terminalId = String(msg.payload?.terminalId ?? '').trim()
+          if (terminalId) {
+            terminalSessions.set(terminalId, {
+              terminalId,
+              machineId,
+              cwd: String(msg.payload?.cwd ?? '').trim(),
+              shell: String(msg.payload?.shell ?? '').trim(),
+              cols: Number(msg.payload?.cols ?? 0) || 0,
+              rows: Number(msg.payload?.rows ?? 0) || 0,
+              createdAtMs: Date.now()
+            })
+          }
+          pendingTerminalStarts.resolve(requestId, msg.payload)
+        }
+        return
+      }
+
+      if (msg?.type === 'terminal.pty.output') {
+        const terminalId = String(msg.payload?.terminalId ?? '').trim()
+        if (!terminalId || !terminalSessions.has(terminalId)) return
+        sse.send(makeEnvelope({
+          type: 'terminal.pty.output',
+          scope: { machineId, terminalId },
+          payload: {
+            machineId,
+            terminalId,
+            data: String(msg.payload?.data ?? '')
+          }
+        }), { recordHistory: false })
+        return
+      }
+
+      if (msg?.type === 'terminal.pty.exit') {
+        const terminalId = String(msg.payload?.terminalId ?? '').trim()
+        if (!terminalId) return
+        terminalSessions.delete(terminalId)
+        sse.send(makeEnvelope({
+          type: 'terminal.pty.exit',
+          scope: { machineId, terminalId },
+          payload: {
+            machineId,
+            terminalId,
+            exitCode: Number.isFinite(Number(msg.payload?.exitCode)) ? Number(msg.payload.exitCode) : null,
+            signal: Number.isFinite(Number(msg.payload?.signal)) ? Number(msg.payload.signal) : null
+          }
+        }), { recordHistory: false })
         return
       }
 
@@ -335,9 +392,24 @@ export function createHostRunnerEventHandlers({
       pendingFsLists.rejectByMachine(machineId, httpError(503, 'runner disconnected'))
       pendingFsReads.rejectByMachine(machineId, httpError(503, 'runner disconnected'))
       pendingGitStatuses.rejectByMachine(machineId, httpError(503, 'runner disconnected'))
+      pendingTerminalStarts.rejectByMachine(machineId, httpError(503, 'runner disconnected'))
       pendingTerminalExecs.rejectByMachine(machineId, httpError(503, 'runner disconnected'))
       pendingModelLists.rejectByMachine(machineId, httpError(503, 'runner disconnected'))
       pendingIdeStarts.rejectByMachine(machineId, new Error('runner disconnected while starting ide session'))
+      for (const [terminalId, terminal] of terminalSessions.entries()) {
+        if (terminal?.machineId !== machineId) continue
+        terminalSessions.delete(terminalId)
+        sse.send(makeEnvelope({
+          type: 'terminal.pty.exit',
+          scope: { machineId, terminalId },
+          payload: {
+            machineId,
+            terminalId,
+            exitCode: null,
+            signal: null
+          }
+        }), { recordHistory: false })
+      }
       getUploadService?.()?.handleRunnerDisconnect(machineId)
     },
 
