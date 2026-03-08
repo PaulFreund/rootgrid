@@ -187,6 +187,12 @@ export function machineRootgridVersion(machine) {
   return text || null
 }
 
+export function machineHasUnknownVersion(machine, hostVersion) {
+  const runnerVersion = machineRootgridVersion(machine)
+  const host = String(hostVersion ?? '').trim()
+  return Boolean(host && machine && !runnerVersion)
+}
+
 export function machineHasVersionMismatch(machine, hostVersion) {
   const runnerVersion = machineRootgridVersion(machine)
   const host = String(hostVersion ?? '').trim()

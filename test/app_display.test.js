@@ -9,6 +9,7 @@ import {
   formatAgo,
   formatCompactInt,
   machineHasVersionMismatch,
+  machineHasUnknownVersion,
   machineIsOnline,
   machineRootgridVersion,
   machineStatusLabel,
@@ -92,6 +93,7 @@ test('machine status and plan helpers derive labels consistently', () => {
   assert.match(machineStatusLabel(now, { lastSeenMs: now - (10 * 60 * 1000) }), /last seen/)
   assert.equal(machineRootgridVersion({ capabilities: { rootgridVersion: '1.2.3' } }), '1.2.3')
   assert.equal(machineHasVersionMismatch({ capabilities: { rootgridVersion: '1.2.3' } }, '1.2.4'), true)
+  assert.equal(machineHasUnknownVersion({ capabilities: null }, '1.2.4'), true)
   assert.equal(machineSupportsWebUpgrade({ capabilities: { upgrade: { enabled: true } } }), true)
   assert.equal(machineUpgradeStatusText({ upgrade: { state: 'failed', message: 'boom' } }), 'Upgrade failed: boom')
   assert.equal(planStepIsCompleted({ status: 'Completed' }), true)

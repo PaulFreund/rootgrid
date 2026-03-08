@@ -14,6 +14,7 @@ import {
   finalizeCompletedPlan,
   indicatorDotClass,
   machineIsOnline as machineIsOnlineAt,
+  machineHasUnknownVersion as machineHasUnknownVersionAt,
   machineHasVersionMismatch as machineHasVersionMismatchAt,
   machineRootgridVersion as machineRootgridVersionAt,
   machineShowLastSeen as machineShowLastSeenAt,
@@ -677,6 +678,10 @@ function machineHasVersionMismatch(m) {
   return machineHasVersionMismatchAt(m, appSettings.appVersion)
 }
 
+function machineHasUnknownVersion(m) {
+  return machineHasUnknownVersionAt(m, appSettings.appVersion)
+}
+
 function machineSupportsWebUpgrade(m) {
   return machineSupportsWebUpgradeAt(m)
 }
@@ -1228,6 +1233,7 @@ const composerMachineOnline = computed(() => {
   return machineIsOnline(defaultsSelectedMachine.value)
 })
 const composerMachineVersionMismatch = computed(() => machineHasVersionMismatch(composerMachine.value))
+const composerMachineUnknownVersion = computed(() => machineHasUnknownVersion(composerMachine.value))
 const composerMachineRunnerVersion = computed(() => machineRootgridVersion(composerMachine.value) ?? 'unknown')
 const composerMachineUpgradeSupported = computed(() => machineSupportsWebUpgrade(composerMachine.value))
 const composerMachineUpgradeAvailable = computed(() => (
@@ -1241,7 +1247,8 @@ const composerMachineUpgradeWorking = computed(() => {
   return Boolean(machineId && machineUpgradeWorkingId.value === machineId)
 })
 const composerMachineUpgradePopoverVisible = computed(() => (
-  composerMachineVersionMismatch.value && (composerMachinePopoverOpen.value || composerMachinePopoverHover.value)
+  (composerMachineVersionMismatch.value || composerMachineUnknownVersion.value)
+  && (composerMachinePopoverOpen.value || composerMachinePopoverHover.value)
 ))
 const composerMachineUpgradeStatus = computed(() => machineUpgradeStatusText(composerMachine.value))
 const composerProjectLabel = computed(() => {
@@ -1280,19 +1287,19 @@ const workspaceTerminalOpening = computed(() => (
 ))
 
 function handleComposerMachineMouseEnter() {
-  if (!composerMachineVersionMismatch.value) return
+  if (!composerMachineVersionMismatch.value && !composerMachineUnknownVersion.value) return
   composerMachinePopoverHover.value = true
 }
 
 function toggleComposerMachinePopover() {
-  if (!composerMachineVersionMismatch.value) return
+  if (!composerMachineVersionMismatch.value && !composerMachineUnknownVersion.value) return
   composerMachinePopoverOpen.value = !composerMachinePopoverOpen.value
 }
 
 watch(
-  () => [composerMachineVersionMismatch.value, String(composerMachine.value?.machineId ?? '')],
-  ([hasMismatch]) => {
-    if (hasMismatch) return
+  () => [composerMachineVersionMismatch.value, composerMachineUnknownVersion.value, String(composerMachine.value?.machineId ?? '')],
+  ([hasMismatch, hasUnknown]) => {
+    if (hasMismatch || hasUnknown) return
     composerMachinePopoverOpen.value = false
     composerMachinePopoverHover.value = false
   }
@@ -3283,8 +3290,12 @@ watch(
                     <button
                       type="button"
                       class="inline-flex max-w-full items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] transition-colors sm:px-2.5 sm:py-1 sm:text-[11px]"
-                      :class="composerMachineVersionMismatch ? 'border-red-200 bg-red-50 text-red-700 hover:bg-red-100' : 'border-black/[0.06] bg-transparent text-slate-500'"
-                      :title="composerMachineVersionMismatch ? `Version mismatch: runner ${composerMachineRunnerVersion} · host ${appSettings.appVersion || 'unknown'}` : composerMachineLabel"
+                      :class="(composerMachineVersionMismatch || composerMachineUnknownVersion) ? 'border-red-200 bg-red-50 text-red-700 hover:bg-red-100' : 'border-black/[0.06] bg-transparent text-slate-500'"
+                      :title="composerMachineVersionMismatch
+                        ? `Version mismatch: runner ${composerMachineRunnerVersion} · host ${appSettings.appVersion || 'unknown'}`
+                        : (composerMachineUnknownVersion
+                            ? `Runner version unknown · host ${appSettings.appVersion || 'unknown'}`
+                            : composerMachineLabel)"
                       @click.stop="toggleComposerMachinePopover"
                     >
                       <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="composerMachineOnline ? 'bg-emerald-500' : 'bg-slate-400'" />
@@ -3295,7 +3306,9 @@ watch(
                       v-if="composerMachineUpgradePopoverVisible"
                       class="absolute bottom-full left-0 z-30 mb-2 w-[248px] rounded-2xl border border-red-200 bg-white px-3 py-3 text-left shadow-[0_12px_30px_rgba(15,23,42,0.14)]"
                     >
-                      <div class="text-[11px] font-semibold text-red-700">Runner upgrade available</div>
+                      <div class="text-[11px] font-semibold text-red-700">
+                        {{ composerMachineVersionMismatch ? 'Runner upgrade available' : 'Runner may be outdated' }}
+                      </div>
                       <div class="mt-1 text-[11px] text-slate-600">
                         <span class="font-medium text-slate-700">Runner:</span>
                         <span class="font-mono text-slate-700">{{ composerMachineRunnerVersion }}</span>
@@ -3313,6 +3326,9 @@ watch(
                       </div>
                       <div v-else-if="composerMachineUpgradeAvailable" class="mt-2 text-[11px] text-slate-500">
                         Upgrade this runner from the updated host.
+                      </div>
+                      <div v-else-if="composerMachineUnknownVersion" class="mt-2 text-[11px] text-slate-500">
+                        This runner does not report a Rootgrid version. It is likely from an older install and may not support newer features like the current terminal protocol.
                       </div>
                       <div v-else-if="!composerMachineOnline" class="mt-2 text-[11px] text-slate-500">
                         Reconnect this runner to upgrade it from the web UI.
@@ -4009,6 +4025,9 @@ watch(
 		                    </div>
 		                    <div v-if="machineHasVersionMismatch(m)" class="text-amber-700">
 		                      Version mismatch
+		                    </div>
+		                    <div v-else-if="machineHasUnknownVersion(m)" class="text-red-700">
+		                      Runner version unknown
 		                    </div>
 		                  </div>
 		                  <div v-if="machineUpgradeStatusText(m)" class="mt-2 text-xs" :class="m.upgrade?.state === 'failed' ? 'text-red-600' : 'text-slate-500'">
