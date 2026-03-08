@@ -28,8 +28,12 @@ let fitAddon = null
 let resizeObserver = null
 let renderedText = ''
 let suppressResizeEmit = false
+let outputFlushTimer = null
+let pendingOutputText = null
+let pendingReset = false
+let fitTimer = null
 
-function applyOutputText(text, { reset = false } = {}) {
+function applyOutputTextNow(text, { reset = false } = {}) {
   if (!terminal) return
   const nextText = String(text ?? '')
   if (reset || !nextText.startsWith(renderedText)) {
@@ -39,6 +43,33 @@ function applyOutputText(text, { reset = false } = {}) {
   const delta = nextText.slice(renderedText.length)
   if (delta) terminal.write(delta)
   renderedText = nextText
+}
+
+function flushPendingOutput() {
+  if (outputFlushTimer) {
+    try { clearTimeout(outputFlushTimer) } catch {}
+    outputFlushTimer = null
+  }
+  const nextText = pendingOutputText
+  const reset = pendingReset
+  pendingOutputText = null
+  pendingReset = false
+  if (nextText === null) return
+  applyOutputTextNow(nextText, { reset })
+}
+
+function applyOutputText(text, { reset = false, immediate = false } = {}) {
+  pendingOutputText = String(text ?? '')
+  pendingReset = pendingReset || reset
+  if (immediate) {
+    flushPendingOutput()
+    return
+  }
+  if (outputFlushTimer) return
+  outputFlushTimer = setTimeout(() => {
+    outputFlushTimer = null
+    flushPendingOutput()
+  }, 16)
 }
 
 function emitResize() {
@@ -61,6 +92,14 @@ function fitTerminal() {
   emitResize()
 }
 
+function scheduleFitTerminal() {
+  if (fitTimer) return
+  fitTimer = setTimeout(() => {
+    fitTimer = null
+    fitTerminal()
+  }, 40)
+}
+
 async function mountTerminal() {
   if (!terminalEl.value || terminal) return
   terminal = new Terminal({
@@ -71,10 +110,11 @@ async function mountTerminal() {
     lineHeight: 1.4,
     scrollback: 5000,
     theme: {
-      background: '#ffffff',
-      foreground: '#1f2937',
-      cursor: '#111827',
-      selectionBackground: 'rgba(148, 163, 184, 0.22)'
+      background: '#0b0f14',
+      foreground: '#f8fafc',
+      cursor: '#f8fafc',
+      cursorAccent: '#0b0f14',
+      selectionBackground: 'rgba(248, 250, 252, 0.22)'
     }
   })
   fitAddon = new FitAddon()
@@ -87,11 +127,11 @@ async function mountTerminal() {
     cols: terminal.cols,
     rows: terminal.rows
   })
-  applyOutputText(props.outputText, { reset: true })
+  applyOutputText(props.outputText, { reset: true, immediate: true })
 
   if (typeof ResizeObserver !== 'undefined') {
     resizeObserver = new ResizeObserver(() => {
-      fitTerminal()
+      scheduleFitTerminal()
     })
     try { resizeObserver.observe(terminalEl.value) } catch {}
   }
@@ -102,12 +142,22 @@ function disposeTerminal() {
     try { resizeObserver.disconnect() } catch {}
     resizeObserver = null
   }
+  if (fitTimer) {
+    try { clearTimeout(fitTimer) } catch {}
+    fitTimer = null
+  }
+  if (outputFlushTimer) {
+    try { clearTimeout(outputFlushTimer) } catch {}
+    outputFlushTimer = null
+  }
   if (terminal) {
     try { terminal.dispose() } catch {}
     terminal = null
   }
   fitAddon = null
   renderedText = ''
+  pendingOutputText = null
+  pendingReset = false
 }
 
 onMounted(() => {
@@ -123,7 +173,7 @@ watch(() => props.outputText, (value) => {
 })
 
 watch(() => props.sessionKey, () => {
-  applyOutputText(props.outputText, { reset: true })
+  applyOutputText(props.outputText, { reset: true, immediate: true })
   fitTerminal()
 })
 
@@ -134,5 +184,5 @@ watch(() => props.connected, () => {
 </script>
 
 <template>
-  <div ref="terminalEl" class="h-full w-full overflow-hidden rounded-2xl bg-white" />
+  <div ref="terminalEl" class="h-full w-full overflow-hidden rounded-2xl bg-[#0b0f14]" />
 </template>

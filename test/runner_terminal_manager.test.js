@@ -1,51 +1,43 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { tmpdir } from 'node:os'
+import { EventEmitter } from 'node:events'
 
 import {
   RunnerTerminalManager,
   appendTerminalOutput,
+  buildScriptSpawnSpec,
   normalizeTerminalSize
 } from '../src/runner/runnerTerminalManager.js'
 
-class FakePty {
-  constructor(file, args, options) {
-    this.file = file
-    this.args = args
-    this.options = options
-    this.dataHandlers = []
-    this.exitHandlers = []
+class FakeStream extends EventEmitter {
+  constructor() {
+    super()
     this.writes = []
-    this.resizeCalls = []
-    this.killed = false
-  }
-
-  onData(handler) {
-    this.dataHandlers.push(handler)
-  }
-
-  onExit(handler) {
-    this.exitHandlers.push(handler)
   }
 
   write(data) {
     this.writes.push(String(data ?? ''))
+    return true
+  }
+}
+
+class FakeChild extends EventEmitter {
+  constructor(file, args, options) {
+    super()
+    this.file = file
+    this.args = args
+    this.options = options
+    this.stdout = new FakeStream()
+    this.stderr = new FakeStream()
+    this.stdin = new FakeStream()
+    this.killCalls = []
+    queueMicrotask(() => this.emit('spawn'))
   }
 
-  resize(cols, rows) {
-    this.resizeCalls.push([cols, rows])
-  }
-
-  kill() {
-    this.killed = true
-  }
-
-  emitData(data) {
-    for (const handler of this.dataHandlers) handler(String(data ?? ''))
-  }
-
-  emitExit(event) {
-    for (const handler of this.exitHandlers) handler(event ?? {})
+  kill(signal) {
+    this.killCalls.push(signal ?? null)
+    return true
   }
 }
 
@@ -56,7 +48,40 @@ test('normalizeTerminalSize clamps values and appendTerminalOutput keeps capped 
   assert.equal(appendTerminalOutput('abcdef', 'ghij', 8), 'cdefghij')
 })
 
-test('RunnerTerminalManager starts PTYs and proxies input, resize, output, and exit', async () => {
+test('buildScriptSpawnSpec uses util-linux script flags on Linux and BSD-style flags on macOS', () => {
+  const linux = buildScriptSpawnSpec({
+    shell: '/bin/bash',
+    cwd: '/tmp/workspace',
+    cols: 120,
+    rows: 40,
+    platform: 'linux'
+  })
+  assert.deepEqual(linux.args, [
+    '-qefc',
+    "stty cols 120 rows 40 >/dev/null 2>&1 || true; exec '/bin/bash' -i",
+    '/dev/null'
+  ])
+  assert.equal(linux.cwd, '/tmp/workspace')
+  assert.equal(linux.env.COLUMNS, '120')
+  assert.equal(linux.env.LINES, '40')
+
+  const darwin = buildScriptSpawnSpec({
+    shell: '/bin/zsh',
+    cwd: '/tmp/workspace',
+    cols: 90,
+    rows: 30,
+    platform: 'darwin'
+  })
+  assert.deepEqual(darwin.args, [
+    '-q',
+    '/dev/null',
+    '/bin/sh',
+    '-lc',
+    "stty cols 90 rows 30 >/dev/null 2>&1 || true; exec '/bin/zsh' -i"
+  ])
+})
+
+test('RunnerTerminalManager starts script terminals and proxies input, output, and exit', async () => {
   const emitted = []
   let created = null
   const manager = new RunnerTerminalManager({
@@ -64,8 +89,9 @@ test('RunnerTerminalManager starts PTYs and proxies input, resize, output, and e
     emit(type, payload) {
       emitted.push({ type, payload })
     },
-    createPty(file, args, options) {
-      created = new FakePty(file, args, options)
+    platform: 'linux',
+    spawnProcess(file, args, options) {
+      created = new FakeChild(file, args, options)
       return created
     }
   })
@@ -79,39 +105,44 @@ test('RunnerTerminalManager starts PTYs and proxies input, resize, output, and e
   })
 
   assert.ok(created)
+  assert.equal(created.file, 'script')
   assert.equal(created.options.cwd, tmpdir())
-  assert.equal(created.options.cols, 120)
-  assert.equal(created.options.rows, 40)
+  assert.equal(created.options.env.COLUMNS, '120')
   assert.equal(emitted[0]?.type, 'terminal.pty.start.result')
   assert.equal(emitted[0]?.payload?.requestId, 'req-1')
   assert.equal(emitted[0]?.payload?.terminalId, 'terminal-1')
 
   manager.input({ terminalId: 'terminal-1', data: 'ls -la\n' })
-  assert.deepEqual(created.writes, ['ls -la\n'])
+  assert.deepEqual(created.stdin.writes, ['ls -la\n'])
 
   manager.resize({ terminalId: 'terminal-1', cols: 132, rows: 36 })
-  assert.deepEqual(created.resizeCalls, [[132, 36]])
+  assert.equal(manager.terminals.get('terminal-1')?.cols, 132)
+  assert.equal(manager.terminals.get('terminal-1')?.rows, 36)
 
-  created.emitData('hello world\n')
+  created.stdout.emit('data', 'hello world\n')
   assert.equal(emitted[1]?.type, 'terminal.pty.output')
   assert.equal(emitted[1]?.payload?.terminalId, 'terminal-1')
   assert.equal(emitted[1]?.payload?.data, 'hello world\n')
 
-  created.emitExit({ exitCode: 7, signal: 15 })
-  assert.equal(emitted[2]?.type, 'terminal.pty.exit')
-  assert.equal(emitted[2]?.payload?.exitCode, 7)
-  assert.equal(emitted[2]?.payload?.signal, 15)
+  created.stderr.emit('data', 'warning\n')
+  assert.equal(emitted[2]?.type, 'terminal.pty.output')
+  assert.equal(emitted[2]?.payload?.data, 'warning\n')
+
+  created.emit('exit', 7, 15)
+  assert.equal(emitted[3]?.type, 'terminal.pty.exit')
+  assert.equal(emitted[3]?.payload?.exitCode, 7)
+  assert.equal(emitted[3]?.payload?.signal, 15)
 
   assert.equal(manager.close({ terminalId: 'terminal-1' }), false)
 })
 
-test('RunnerTerminalManager close kills the PTY and removes the terminal', async () => {
+test('RunnerTerminalManager close kills the script process and removes the terminal', async () => {
   let created = null
   const manager = new RunnerTerminalManager({
     machineId: 'machine-1',
     emit() {},
-    createPty(file, args, options) {
-      created = new FakePty(file, args, options)
+    spawnProcess(file, args, options) {
+      created = new FakeChild(file, args, options)
       return created
     }
   })
@@ -125,5 +156,5 @@ test('RunnerTerminalManager close kills the PTY and removes the terminal', async
   })
 
   assert.equal(manager.close({ terminalId: 'terminal-2' }), true)
-  assert.equal(created.killed, true)
+  assert.deepEqual(created.killCalls, ['SIGHUP'])
 })

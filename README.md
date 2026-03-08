@@ -45,6 +45,7 @@ Then:
 - Open the printed URL (default `http://127.0.0.1:7337/`)
 - Paste the **client token** from `~/.rootgrid/config.json` into the login screen
 - (Optional) Install `code-server` on the runner machine to enable the **VS Code** button in the UI.
+- The web terminal uses the system `script` command (normally present on Linux/macOS), so no native Node PTY addon is required.
 
 Configuration is written to:
 

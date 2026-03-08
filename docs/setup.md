@@ -18,6 +18,7 @@ Minimum checks:
 Optional checks (recommended):
 - `git` availability (if the UI will show diffs/status)
 - `code-server` availability (only needed for VS Code web viewer)
+- `script` availability (used by the web terminal on Linux/macOS; typically already installed)
 - filesystem permissions for `~/.rootgrid`
 
 ### 2) Offer to install missing prerequisites

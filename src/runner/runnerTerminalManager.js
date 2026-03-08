@@ -1,6 +1,5 @@
 import process from 'node:process'
-
-import * as nodePty from 'node-pty'
+import { spawn } from 'node:child_process'
 
 import { resolveWorkspaceListPath } from './runnerWorkspaceApi.js'
 
@@ -9,6 +8,11 @@ function pickShell() {
   if (fromEnv) return fromEnv
   if (process.platform === 'darwin') return '/bin/zsh'
   return '/bin/bash'
+}
+
+function shellQuotePosix(value) {
+  const text = String(value ?? '')
+  return `'${text.replaceAll("'", `'\"'\"'`)}'`
 }
 
 export function normalizeTerminalSize(cols, rows, {
@@ -30,15 +34,84 @@ export function appendTerminalOutput(current, chunk, maxChars = 400_000) {
   return next.length <= maxChars ? next : next.slice(-maxChars)
 }
 
+export function buildScriptSpawnSpec({
+  shell,
+  cwd,
+  cols,
+  rows,
+  platform = process.platform
+}) {
+  const safeShell = String(shell ?? '').trim() || pickShell()
+  const safeCwd = resolveWorkspaceListPath(cwd)
+  const size = normalizeTerminalSize(cols, rows)
+  const command = `stty cols ${size.cols} rows ${size.rows} >/dev/null 2>&1 || true; exec ${shellQuotePosix(safeShell)} -i`
+  if (platform === 'darwin') {
+    return {
+      file: 'script',
+      args: ['-q', '/dev/null', '/bin/sh', '-lc', command],
+      cwd: safeCwd,
+      env: {
+        ...process.env,
+        TERM: 'xterm-256color',
+        COLUMNS: String(size.cols),
+        LINES: String(size.rows)
+      },
+      shell: safeShell,
+      cols: size.cols,
+      rows: size.rows
+    }
+  }
+  return {
+    file: 'script',
+    args: ['-qefc', command, '/dev/null'],
+    cwd: safeCwd,
+    env: {
+      ...process.env,
+      TERM: 'xterm-256color',
+      COLUMNS: String(size.cols),
+      LINES: String(size.rows)
+    },
+    shell: safeShell,
+    cols: size.cols,
+    rows: size.rows
+  }
+}
+
+function waitForChildSpawn(child) {
+  return new Promise((resolve, reject) => {
+    let done = false
+    const onSpawn = () => {
+      if (done) return
+      done = true
+      cleanup()
+      resolve()
+    }
+    const onError = (err) => {
+      if (done) return
+      done = true
+      cleanup()
+      reject(err)
+    }
+    const cleanup = () => {
+      child.off?.('spawn', onSpawn)
+      child.off?.('error', onError)
+    }
+    child.once?.('spawn', onSpawn)
+    child.once?.('error', onError)
+  })
+}
+
 export class RunnerTerminalManager {
   constructor({
     machineId,
     emit,
-    createPty = (file, args, options) => nodePty.spawn(file, args, options)
+    spawnProcess = (file, args, options) => spawn(file, args, options),
+    platform = process.platform
   }) {
     this.machineId = machineId
     this.emit = emit
-    this.createPty = createPty
+    this.spawnProcess = spawnProcess
+    this.platform = platform
     this.terminals = new Map()
   }
 
@@ -51,49 +124,68 @@ export class RunnerTerminalManager {
 
   async start({ requestId, terminalId, cwd, cols, rows }) {
     const id = String(terminalId ?? '').trim()
-    const resolvedCwd = resolveWorkspaceListPath(cwd)
     if (!id) throw new Error('terminalId is required')
     if (this.terminals.has(id)) throw new Error('terminal already exists')
 
-    const size = normalizeTerminalSize(cols, rows)
-    const shell = pickShell()
-    const env = {
-      ...process.env,
-      TERM: 'xterm-256color'
-    }
-
-    const pty = this.createPty(shell, [], {
-      name: 'xterm-256color',
-      cwd: resolvedCwd,
-      env,
-      cols: size.cols,
-      rows: size.rows
+    const spec = buildScriptSpawnSpec({
+      shell: pickShell(),
+      cwd,
+      cols,
+      rows,
+      platform: this.platform
     })
+    const child = this.spawnProcess(spec.file, spec.args, {
+      cwd: spec.cwd,
+      env: spec.env,
+      stdio: ['pipe', 'pipe', 'pipe']
+    })
+    await waitForChildSpawn(child)
 
     const record = {
       terminalId: id,
-      cwd: resolvedCwd,
-      shell,
-      cols: size.cols,
-      rows: size.rows,
-      pty
+      cwd: spec.cwd,
+      shell: spec.shell,
+      cols: spec.cols,
+      rows: spec.rows,
+      child
     }
     this.terminals.set(id, record)
 
-    pty.onData?.((data) => {
+    child.stdout?.on?.('data', (data) => {
       this.#emit('terminal.pty.output', {
         terminalId: id,
         data: String(data ?? '')
       })
     })
 
-    pty.onExit?.((event = {}) => {
+    child.stderr?.on?.('data', (data) => {
+      this.#emit('terminal.pty.output', {
+        terminalId: id,
+        data: String(data ?? '')
+      })
+    })
+
+    child.on?.('exit', (code, signal) => {
       const current = this.terminals.get(id)
-      if (current?.pty === pty) this.terminals.delete(id)
+      if (current?.child === child) this.terminals.delete(id)
       this.#emit('terminal.pty.exit', {
         terminalId: id,
-        exitCode: Number.isFinite(Number(event?.exitCode)) ? Number(event.exitCode) : null,
-        signal: Number.isFinite(Number(event?.signal)) ? Number(event.signal) : null
+        exitCode: Number.isFinite(Number(code)) ? Number(code) : null,
+        signal: Number.isFinite(Number(signal)) ? Number(signal) : null
+      })
+    })
+
+    child.on?.('error', (err) => {
+      const current = this.terminals.get(id)
+      if (current?.child === child) this.terminals.delete(id)
+      this.#emit('terminal.pty.output', {
+        terminalId: id,
+        data: `[rootgrid] terminal error: ${String(err?.message ?? err)}\r\n`
+      })
+      this.#emit('terminal.pty.exit', {
+        terminalId: id,
+        exitCode: null,
+        signal: null
       })
     })
 
@@ -101,10 +193,10 @@ export class RunnerTerminalManager {
       requestId,
       ok: true,
       terminalId: id,
-      cwd: resolvedCwd,
-      shell,
-      cols: size.cols,
-      rows: size.rows
+      cwd: spec.cwd,
+      shell: spec.shell,
+      cols: spec.cols,
+      rows: spec.rows
     })
   }
 
@@ -112,7 +204,7 @@ export class RunnerTerminalManager {
     const id = String(terminalId ?? '').trim()
     const record = this.terminals.get(id)
     if (!record) throw new Error('terminal not found')
-    record.pty.write(String(data ?? ''))
+    record.child.stdin?.write?.(String(data ?? ''))
   }
 
   resize({ terminalId, cols, rows }) {
@@ -122,7 +214,6 @@ export class RunnerTerminalManager {
     const size = normalizeTerminalSize(cols, rows)
     record.cols = size.cols
     record.rows = size.rows
-    record.pty.resize(size.cols, size.rows)
   }
 
   close({ terminalId }) {
@@ -130,7 +221,7 @@ export class RunnerTerminalManager {
     const record = this.terminals.get(id)
     if (!record) return false
     this.terminals.delete(id)
-    try { record.pty.kill() } catch {}
+    try { record.child.kill('SIGHUP') } catch {}
     return true
   }
 

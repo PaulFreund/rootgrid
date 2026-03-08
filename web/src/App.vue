@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import { Archive, ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FileText, FolderClosed, GitBranch, Loader2, MoreHorizontal, Plus, Search, Settings, SlidersHorizontal, Square, Terminal, Trash2, X } from 'lucide-vue-next'
 
 import MarkdownView from './components/MarkdownView.vue'
+import WorkspaceFilesPane from './components/WorkspaceFilesPane.vue'
 import WorkspaceTerminalPane from './components/WorkspaceTerminalPane.vue'
 import {
   buildContextUsageSummary,
@@ -302,8 +303,9 @@ const ideFrameLoading = ref(false)
 const workspacePaneOpen = ref(false)
 const workspacePaneTab = ref('code')
 const workspaceFilesPath = ref('')
-const workspaceFilesParent = ref(null)
-const workspaceFileEntries = ref([])
+const workspaceDirectoryEntries = reactive(new Map())
+const workspaceExpandedDirs = reactive(new Set())
+const workspaceLoadingDirs = reactive(new Set())
 const workspaceFilesLoading = ref(false)
 const workspaceFilesError = ref('')
 const workspaceSelectedFilePath = ref('')
@@ -1041,6 +1043,11 @@ const selectedSession = computed(() => {
 })
 const selectedStore = computed(() => selectedSessionId.value ? sessionStores.get(selectedSessionId.value) : null)
 const selectedTokenUsage = computed(() => selectedSessionId.value ? (tokenUsageBySessionId.get(selectedSessionId.value) ?? null) : null)
+const workspaceRootEntries = computed(() => {
+  const rootPath = String(workspaceFilesPath.value ?? '').trim()
+  if (!rootPath) return []
+  return workspaceDirectoryEntries.get(rootPath) ?? []
+})
 
 const currentWorkspaceContext = computed(() => {
   const cwd = String(selectedSession.value?.cwd ?? defaults.cwd ?? '').trim()
@@ -1589,8 +1596,12 @@ async function loadWorkspaceFiles(path = null) {
       return false
     }
     workspaceFilesPath.value = String(data?.path ?? targetPath)
-    workspaceFilesParent.value = data?.parent ?? null
-    workspaceFileEntries.value = Array.isArray(data?.entries) ? data.entries : []
+    const nextEntries = Array.isArray(data?.entries) ? data.entries : []
+    workspaceDirectoryEntries.clear()
+    workspaceExpandedDirs.clear()
+    workspaceLoadingDirs.clear()
+    workspaceDirectoryEntries.set(workspaceFilesPath.value, nextEntries)
+    workspaceExpandedDirs.add(workspaceFilesPath.value)
     return true
   } catch (err) {
     workspaceFilesError.value = String(err?.message ?? err)
@@ -1598,6 +1609,47 @@ async function loadWorkspaceFiles(path = null) {
   } finally {
     workspaceFilesLoading.value = false
   }
+}
+
+async function ensureWorkspaceDirectoryLoaded(path, { activate = false } = {}) {
+  const ctx = resolveWorkspaceContext()
+  if (!ctx) return false
+  const targetPath = String(path ?? '').trim()
+  if (!targetPath) return false
+  if (workspaceDirectoryEntries.has(targetPath)) return true
+  if (workspaceLoadingDirs.has(targetPath)) return true
+  if (activate) activateWorkspacePane('files')
+  workspaceLoadingDirs.add(targetPath)
+  workspaceFilesError.value = ''
+  try {
+    const res = await apiFetch(buildWorkspaceQuery('/api/fs/list', {
+      machineId: ctx.machineId,
+      path: targetPath
+    }) + '&includeFiles=1')
+    const data = await res.json().catch(() => null)
+    if (!res.ok) {
+      workspaceFilesError.value = data?.error ?? `HTTP ${res.status}`
+      return false
+    }
+    workspaceDirectoryEntries.set(targetPath, Array.isArray(data?.entries) ? data.entries : [])
+    return true
+  } catch (err) {
+    workspaceFilesError.value = String(err?.message ?? err)
+    return false
+  } finally {
+    workspaceLoadingDirs.delete(targetPath)
+  }
+}
+
+async function toggleWorkspaceDirectory(path) {
+  const targetPath = String(path ?? '').trim()
+  if (!targetPath) return false
+  if (workspaceExpandedDirs.has(targetPath)) {
+    workspaceExpandedDirs.delete(targetPath)
+    return true
+  }
+  workspaceExpandedDirs.add(targetPath)
+  return ensureWorkspaceDirectoryLoaded(targetPath)
 }
 
 async function loadWorkspaceFile(path) {
@@ -1629,15 +1681,6 @@ async function loadWorkspaceFile(path) {
   } finally {
     workspaceFileLoading.value = false
   }
-}
-
-async function openWorkspaceEntry(entry) {
-  if (!entry) return
-  if (entry.kind === 'dir') {
-    await loadWorkspaceFiles(entry.path)
-    return
-  }
-  await loadWorkspaceFile(entry.path)
 }
 
 async function refreshWorkspaceGit() {
@@ -2127,6 +2170,13 @@ watch(
   () => [currentWorkspaceContext.value.machineId, currentWorkspaceContext.value.cwd],
   ([machineId, cwd], [prevMachineId, prevCwd]) => {
     if (machineId === prevMachineId && cwd === prevCwd) return
+    workspaceFilesPath.value = ''
+    workspaceDirectoryEntries.clear()
+    workspaceExpandedDirs.clear()
+    workspaceLoadingDirs.clear()
+    workspaceSelectedFilePath.value = ''
+    workspaceSelectedFile.value = null
+    workspaceFileError.value = ''
     const terminalSession = workspaceTerminalSession.value
     if (!terminalSession) return
     if (workspaceTerminalSessionMatchesContext(terminalSession, { machineId, cwd })) return
@@ -3301,49 +3351,23 @@ watch(
               />
             </div>
 
-            <div v-else-if="workspacePaneTab === 'files'" class="flex h-full min-h-0 flex-col">
-              <div class="border-b border-black/[0.04] px-4 py-3">
-                <div class="flex items-center gap-2">
-                  <button
-                    class="rounded-lg border border-black/[0.06] px-2.5 py-1.5 text-xs text-slate-700 transition-colors hover:bg-black/[0.04] disabled:opacity-40"
-                    :disabled="!workspaceFilesParent || workspaceFilesLoading"
-                    @click="loadWorkspaceFiles(workspaceFilesParent)"
-                  >
-                    Up
-                  </button>
-                  <div class="min-w-0 flex-1 truncate text-xs text-slate-500" :title="workspaceFilesPath">{{ workspaceFilesPath || currentWorkspaceContext.cwd }}</div>
-                </div>
-                <div v-if="workspaceFilesError" class="mt-2 text-xs text-red-600">{{ workspaceFilesError }}</div>
-                <div v-if="workspaceFileError" class="mt-2 text-xs text-red-600">{{ workspaceFileError }}</div>
-              </div>
-              <div class="grid min-h-0 flex-1 grid-cols-1">
-                <div class="min-h-0 overflow-auto border-b border-black/[0.04]">
-                  <div v-if="workspaceFilesLoading" class="px-4 py-3 text-sm text-slate-500">Loading files…</div>
-                  <div v-else-if="!workspaceFileEntries.length" class="px-4 py-3 text-sm text-slate-500">No files found.</div>
-                  <div v-else class="p-2">
-                    <button
-                      v-for="entry in workspaceFileEntries"
-                      :key="entry.path"
-                      class="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm transition-colors hover:bg-black/[0.035]"
-                      :class="workspaceSelectedFilePath === entry.path ? 'bg-black/[0.05]' : ''"
-                      @click="openWorkspaceEntry(entry)"
-                    >
-                      <FolderClosed v-if="entry.kind === 'dir'" class="h-4 w-4 shrink-0 text-slate-400" />
-                      <FileText v-else class="h-4 w-4 shrink-0 text-slate-400" />
-                      <span class="min-w-0 flex-1 truncate text-slate-700">{{ entry.name }}</span>
-                    </button>
-                  </div>
-                </div>
-                <div class="min-h-0 overflow-auto bg-[#fbfbfa] px-4 py-3">
-                  <div v-if="workspaceFileLoading" class="text-sm text-slate-500">Loading file…</div>
-                  <div v-else-if="workspaceSelectedFile?.binary" class="text-sm text-slate-500">Binary file preview is not supported.</div>
-                  <div v-else-if="workspaceSelectedFile?.text">
-                    <div class="mb-2 truncate text-xs text-slate-500" :title="workspaceSelectedFile.path">{{ workspaceSelectedFile.path }}</div>
-                    <pre class="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs font-mono text-slate-800">{{ workspaceSelectedFile.text }}</pre>
-                  </div>
-                  <div v-else class="text-sm text-slate-500">Select a file to preview it.</div>
-                </div>
-              </div>
+            <div v-else-if="workspacePaneTab === 'files'" class="min-h-0 h-full">
+              <WorkspaceFilesPane
+                :root-path="workspaceFilesPath || currentWorkspaceContext.cwd"
+                :root-entries="workspaceRootEntries"
+                :directory-entries="workspaceDirectoryEntries"
+                :expanded-dirs="workspaceExpandedDirs"
+                :loading-dirs="workspaceLoadingDirs"
+                :files-loading="workspaceFilesLoading"
+                :files-error="workspaceFilesError"
+                :selected-file-path="workspaceSelectedFilePath"
+                :selected-file="workspaceSelectedFile"
+                :file-loading="workspaceFileLoading"
+                :file-error="workspaceFileError"
+                @refresh="loadWorkspaceFiles()"
+                @toggle-dir="toggleWorkspaceDirectory"
+                @open-file="loadWorkspaceFile"
+              />
             </div>
 
             <div v-else class="flex h-full min-h-0 flex-col">
@@ -3469,49 +3493,23 @@ watch(
           />
         </div>
 
-        <div v-else-if="workspacePaneTab === 'files'" class="flex min-h-0 flex-1 flex-col">
-          <div class="border-t border-black/[0.04] px-4 py-3">
-            <div class="flex items-center gap-2">
-              <button
-                class="rounded-lg border border-black/[0.06] px-2.5 py-1.5 text-xs text-slate-700 transition-colors hover:bg-black/[0.04] disabled:opacity-40"
-                :disabled="!workspaceFilesParent || workspaceFilesLoading"
-                @click="loadWorkspaceFiles(workspaceFilesParent)"
-              >
-                Up
-              </button>
-              <div class="min-w-0 flex-1 truncate text-xs text-slate-500" :title="workspaceFilesPath">{{ workspaceFilesPath || currentWorkspaceContext.cwd }}</div>
-            </div>
-            <div v-if="workspaceFilesError" class="mt-2 text-xs text-red-600">{{ workspaceFilesError }}</div>
-            <div v-if="workspaceFileError" class="mt-2 text-xs text-red-600">{{ workspaceFileError }}</div>
-          </div>
-          <div class="grid min-h-0 flex-1 grid-cols-[260px_minmax(0,1fr)]">
-            <div class="min-h-0 overflow-auto border-r border-black/[0.04]">
-              <div v-if="workspaceFilesLoading" class="px-4 py-3 text-sm text-slate-500">Loading files…</div>
-              <div v-else-if="!workspaceFileEntries.length" class="px-4 py-3 text-sm text-slate-500">No files found.</div>
-              <div v-else class="p-2">
-                <button
-                  v-for="entry in workspaceFileEntries"
-                  :key="entry.path"
-                  class="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm transition-colors hover:bg-black/[0.035]"
-                  :class="workspaceSelectedFilePath === entry.path ? 'bg-black/[0.05]' : ''"
-                  @click="openWorkspaceEntry(entry)"
-                >
-                  <FolderClosed v-if="entry.kind === 'dir'" class="h-4 w-4 shrink-0 text-slate-400" />
-                  <FileText v-else class="h-4 w-4 shrink-0 text-slate-400" />
-                  <span class="min-w-0 flex-1 truncate text-slate-700">{{ entry.name }}</span>
-                </button>
-              </div>
-            </div>
-            <div class="min-h-0 overflow-auto bg-[#fbfbfa] px-4 py-3">
-              <div v-if="workspaceFileLoading" class="text-sm text-slate-500">Loading file…</div>
-              <div v-else-if="workspaceSelectedFile?.binary" class="text-sm text-slate-500">Binary file preview is not supported.</div>
-              <div v-else-if="workspaceSelectedFile?.text">
-                <div class="mb-2 truncate text-xs text-slate-500" :title="workspaceSelectedFile.path">{{ workspaceSelectedFile.path }}</div>
-                <pre class="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-xs font-mono text-slate-800">{{ workspaceSelectedFile.text }}</pre>
-              </div>
-              <div v-else class="text-sm text-slate-500">Select a file to preview it.</div>
-            </div>
-          </div>
+        <div v-else-if="workspacePaneTab === 'files'" class="min-h-0 flex-1">
+          <WorkspaceFilesPane
+            :root-path="workspaceFilesPath || currentWorkspaceContext.cwd"
+            :root-entries="workspaceRootEntries"
+            :directory-entries="workspaceDirectoryEntries"
+            :expanded-dirs="workspaceExpandedDirs"
+            :loading-dirs="workspaceLoadingDirs"
+            :files-loading="workspaceFilesLoading"
+            :files-error="workspaceFilesError"
+            :selected-file-path="workspaceSelectedFilePath"
+            :selected-file="workspaceSelectedFile"
+            :file-loading="workspaceFileLoading"
+            :file-error="workspaceFileError"
+            @refresh="loadWorkspaceFiles()"
+            @toggle-dir="toggleWorkspaceDirectory"
+            @open-file="loadWorkspaceFile"
+          />
         </div>
 
         <div v-else class="flex min-h-0 flex-1 flex-col">
