@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import {
   buildRecentWorkspaces,
+  finalizeCompletedPlan,
   formatAgeShort,
   formatAgo,
   formatCompactInt,
@@ -74,4 +75,17 @@ test('machine status and plan helpers derive labels consistently', () => {
   assert.match(machineStatusLabel(now, { lastSeenMs: now - (10 * 60 * 1000) }), /last seen/)
   assert.equal(planStepIsCompleted({ status: 'Completed' }), true)
   assert.equal(planStepIsCompleted({ status: 'in_progress' }), false)
+  assert.deepEqual(finalizeCompletedPlan([
+    { step: 'a', status: 'completed' },
+    { step: 'b', status: 'inProgress' }
+  ], 'completed'), [
+    { step: 'a', status: 'completed' },
+    { step: 'b', status: 'completed' }
+  ])
+  const pendingPlan = [
+    { step: 'a', status: 'completed' },
+    { step: 'b', status: 'pending' }
+  ]
+  assert.strictEqual(finalizeCompletedPlan(pendingPlan, 'completed'), pendingPlan)
+  assert.strictEqual(finalizeCompletedPlan(pendingPlan, 'interrupted'), pendingPlan)
 })

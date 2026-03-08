@@ -163,3 +163,27 @@ export function planStatusKey(status) {
 export function planStepIsCompleted(step) {
   return planStatusKey(step?.status) === 'completed'
 }
+
+export function finalizeCompletedPlan(plan, turnStatus) {
+  const steps = Array.isArray(plan) ? plan : null
+  if (!steps?.length) return steps
+  if (planStatusKey(turnStatus) !== 'completed') return steps
+
+  let hasInProgress = false
+  for (const step of steps) {
+    const key = planStatusKey(step?.status)
+    if (key === 'completed') continue
+    if (key === 'inprogress') {
+      hasInProgress = true
+      continue
+    }
+    return steps
+  }
+  if (!hasInProgress) return steps
+
+  return steps.map((step) => (
+    planStatusKey(step?.status) === 'inprogress'
+      ? { ...step, status: 'completed' }
+      : step
+  ))
+}

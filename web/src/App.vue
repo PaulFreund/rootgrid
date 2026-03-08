@@ -8,6 +8,7 @@ import {
   formatAgeShort as formatAgeShortValue,
   formatAgo as formatAgoValue,
   formatCompactInt,
+  finalizeCompletedPlan,
   indicatorDotClass,
   machineIsOnline as machineIsOnlineAt,
   machineShowLastSeen as machineShowLastSeenAt,
@@ -561,6 +562,10 @@ function applyDerivedSessionEvent(sessionId, event, store) {
   if (event.type === 'plan.updated') {
     store.plan = Array.isArray(event.payload?.plan) ? event.payload.plan : null
     store.planExplanation = event.payload?.explanation ?? null
+  }
+
+  if (event.type === 'turn.completed') {
+    store.plan = finalizeCompletedPlan(store.plan, event.payload?.status ?? null)
   }
 
   if (event.type === 'thread.tokenUsage.updated' || event.type === 'token.count') {

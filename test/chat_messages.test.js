@@ -225,11 +225,8 @@ test('buildChatMessages folds thinking details and keeps command steps interleav
   assert.equal(first[1].timeline[2]?.kind, 'explore')
   assert.equal(first[1].timeline[2]?.label, 'Read foo.js')
   assert.match(String(first[1].timeline[2]?.id ?? ''), /^explorecall-item-1-\d+$/)
-  assert.equal(first[1].timeline[3]?.kind, 'tool')
-  assert.equal(first[1].timeline[3]?.tool, 'fileChange')
-  assert.deepEqual(first[1].timeline[3]?.changes, [{ path: 'src/foo.js' }])
-  assert.equal(first[1].timeline[4]?.kind, 'diff')
-  assert.match(String(first[1].timeline[4]?.raw ?? ''), /diff --git a\/src\/foo.js b\/src\/foo.js/)
+  assert.equal(first[1].timeline[3]?.kind, 'diff')
+  assert.match(String(first[1].timeline[3]?.raw ?? ''), /diff --git a\/src\/foo.js b\/src\/foo.js/)
   assert.equal(first[2].role, 'assistant')
   assert.equal(first[2].text, 'Hello there')
 
@@ -458,4 +455,49 @@ test('buildChatMessages keeps completed commentary-only turns in the Thinking hi
   assert.match(messages[1].timeline[0].text, /Checking the files first/)
   assert.equal(messages[2].role, 'assistant')
   assert.equal(messages[2].text, 'Done.')
+})
+
+test('buildChatMessages keeps fileChange entries only when no diff summary exists', () => {
+  const store = createSessionStoreState()
+  store.backgroundExpandedByTurnId.set('turn-1', true)
+
+  store.events.push(
+    {
+      eventId: 'u-1',
+      type: 'session.input',
+      payload: { text: 'Update docs', attachments: [] }
+    },
+    {
+      eventId: 't-1',
+      seq: 1,
+      tsMs: 1,
+      type: 'turn.started',
+      payload: { turnId: 'turn-1' }
+    },
+    {
+      eventId: 'fc-1',
+      seq: 2,
+      tsMs: 2,
+      type: 'tool.completed',
+      payload: {
+        tool: 'fileChange',
+        itemId: 'file-1',
+        status: 'completed',
+        changes: [{ path: 'README.md' }]
+      }
+    },
+    {
+      eventId: 't-2',
+      seq: 3,
+      tsMs: 3,
+      type: 'turn.completed',
+      payload: { turnId: 'turn-1' }
+    }
+  )
+
+  const messages = buildChatMessages(store)
+  assert.equal(messages[1].stepKind, 'background')
+  assert.equal(messages[1].timeline.length, 1)
+  assert.equal(messages[1].timeline[0]?.kind, 'tool')
+  assert.equal(messages[1].timeline[0]?.tool, 'fileChange')
 })

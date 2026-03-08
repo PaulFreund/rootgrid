@@ -254,6 +254,7 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, toolCalls, 
   const rawReasoningChunks = Array.isArray(reasoningChunks) ? reasoningChunks : []
   const rawCommentaryChunks = Array.isArray(commentaryChunks) ? commentaryChunks : []
   const diffs = Array.isArray(diffEvents) ? diffEvents : []
+  const hasDiffs = diffs.some((diff) => String(diff?.raw ?? '').trim())
   const reasoningLoaded = Boolean(reasoningState?.loaded)
   const reasoningSections = rawReasoningChunks.length
     ? []
@@ -419,6 +420,7 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, toolCalls, 
       continue
     }
     if (item.kind === 'tool') {
+      if (hasDiffs && String(item.call?.tool ?? '') === 'fileChange') continue
       out.push({
         kind: 'tool',
         id: item.id,
