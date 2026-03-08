@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -112,5 +112,18 @@ export async function installLaunchdUserService({
     return { ok: false, step: 'kickstart', unitPath, error: kickstart.stderr || kickstart.stdout || 'launchctl kickstart failed' }
   }
 
+  return { ok: true, unitPath }
+}
+
+export async function removeLaunchdUserService({ label = ROOTGRID_LAUNCHD_LABEL } = {}) {
+  const uid = process.getuid?.()
+  const unitPath = getLaunchdUserPlistPath({ label })
+  if (!Number.isFinite(uid)) {
+    return { ok: false, step: 'uid', unitPath, error: 'launchd requires a numeric user id' }
+  }
+
+  await runCommandCapture('launchctl', ['bootout', `gui/${uid}`, unitPath]).catch(() => {})
+  await runCommandCapture('launchctl', ['disable', `gui/${uid}/${label}`]).catch(() => {})
+  await rm(unitPath, { force: true }).catch(() => {})
   return { ok: true, unitPath }
 }

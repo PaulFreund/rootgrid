@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -114,5 +114,20 @@ export async function installSystemdUserService({
     return { ok: false, step: 'enable', unitPath, error: enable.stderr || enable.stdout || 'systemctl enable failed' }
   }
 
+  return { ok: true, unitPath }
+}
+
+export async function removeSystemdUserService({ serviceName }) {
+  const unitPath = getSystemdUserUnitPath({ serviceName })
+
+  await runCommandCapture('systemctl', ['--user', 'disable', '--now', `${serviceName}.service`]).catch(() => {})
+  await rm(unitPath, { force: true }).catch(() => {})
+
+  const reload = await runCommandCapture('systemctl', ['--user', 'daemon-reload'])
+  if (!reload.ok) {
+    return { ok: false, step: 'daemon-reload', unitPath, error: reload.stderr || reload.stdout || 'systemctl daemon-reload failed' }
+  }
+
+  await runCommandCapture('systemctl', ['--user', 'reset-failed', `${serviceName}.service`]).catch(() => {})
   return { ok: true, unitPath }
 }

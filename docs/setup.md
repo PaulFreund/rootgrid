@@ -83,6 +83,22 @@ Examples:
 
 ---
 
+## After setup: updating or repairing the local install
+
+`rootgrid setup` is intentionally first-run only. If `~/.rootgrid/config.json` already exists, use these commands instead:
+
+- `rootgrid update-local`
+  - installs the current package into `~/.rootgrid/current`
+  - if autostart is enabled, refreshes/restarts the user service
+- `rootgrid install-service`
+  - reinstalls the user service against `~/.rootgrid/current`
+  - updates `autostart.enabled=true` and the detected method in config
+- `rootgrid remove-service`
+  - stops/removes the user service
+  - updates `autostart.enabled=false` and clears the method in config
+
+---
+
 ## Proposed config shape (v0)
 
 This is a **proposed** starting point; adjust as implementation realities land. A full repo example also lives at [`config.example.json`](../config.example.json).

@@ -33,6 +33,14 @@ node src/cli.js setup
 node src/cli.js
 ```
 
+For later local updates without rerunning setup:
+
+```bash
+rootgrid update-local     # refresh ~/.rootgrid/current from the current package and restart autostart if enabled
+rootgrid install-service  # install/start the user service again
+rootgrid remove-service   # stop/remove the user service
+```
+
 Then:
 - Open the printed URL (default `http://127.0.0.1:7337/`)
 - Paste the **client token** from `~/.rootgrid/config.json` into the login screen
@@ -85,6 +93,9 @@ See: `docs/reverse-proxy.md`.
 ## CLI commands (v0)
 
 - `rootgrid setup`: interactive wizard (prereqs, optional installs, autostart, runner + host/upstream config). See `docs/setup.md`.
+- `rootgrid update-local`: install the current package into the managed runtime and refresh the user service if autostart is enabled.
+- `rootgrid install-service`: install/start the user service (`systemd --user` on Linux/WSL, `launchd` on macOS).
+- `rootgrid remove-service`: stop/remove the user service and disable autostart in `~/.rootgrid/config.json`.
 
 ## Dev checks
 
