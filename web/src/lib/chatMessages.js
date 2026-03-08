@@ -402,6 +402,25 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, commandCall
   return out
 }
 
+function formatThoughtDuration(ms) {
+  const value = Number(ms ?? NaN)
+  if (!Number.isFinite(value) || value <= 0) return 'Thought'
+
+  const totalSeconds = Math.max(1, Math.round(value / 1000))
+  if (totalSeconds < 60) return `Thought for ${totalSeconds}s`
+
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+
+  if (hours > 0) {
+    if (minutes > 0) return `Thought for ${hours}h ${minutes}m`
+    return `Thought for ${hours}h`
+  }
+  if (seconds > 0) return `Thought for ${minutes}m ${seconds}s`
+  return `Thought for ${minutes}m`
+}
+
 function parseReasoningHeading(line) {
   const raw = String(line ?? '')
   let trimmed = raw.replace(/^\s+/, '')
@@ -638,9 +657,12 @@ function buildChatMessagesSlow(store) {
         reasoning: null,
         explore: { files: 0, searches: 0, lists: 0, active: false },
         timeline: null,
-        active: false
+        active: false,
+        durationMs: null
       },
       inserted: false,
+      startedTsMs: null,
+      completedTsMs: null,
       exploreFileKeys: new Set(),
       exploreSearchKeys: new Set(),
       exploreListKeys: new Set(),
@@ -663,15 +685,22 @@ function buildChatMessagesSlow(store) {
     return state
   }
 
-  const beginTurn = (turnId) => {
+  const beginTurn = (turnId, tsMs = null) => {
     activeTurnId = String(turnId ?? '').trim() || null
     if (!activeTurnId) return
-    ensureTurnBackgroundMessage(activeTurnId)
+    const state = ensureTurnBackgroundMessage(activeTurnId)
+    const startTs = Number(tsMs ?? NaN)
+    if (state && Number.isFinite(startTs) && startTs > 0) state.startedTsMs = startTs
   }
 
   const ensureAssistant = (idHint) => {
     if (currentAssistant) return currentAssistant
-    currentAssistant = { id: idHint, role: 'assistant', text: '' }
+    currentAssistant = {
+      id: idHint,
+      role: 'assistant',
+      text: '',
+      turnId: activeTurnId ? String(activeTurnId) : null
+    }
     msgs.push(currentAssistant)
     return currentAssistant
   }
@@ -693,12 +722,16 @@ function buildChatMessagesSlow(store) {
     if (event.type === 'turn.started') {
       currentAssistant = null
       toolMsgByItemId.clear()
-      beginTurn(event.payload?.turnId ?? event.eventId)
+      beginTurn(event.payload?.turnId ?? event.eventId, event.tsMs)
       continue
     }
 
     if (event.type === 'turn.completed') {
       currentAssistant = null
+      const turnId = String(event.payload?.turnId ?? '').trim() || activeTurnId
+      const state = getOrCreateTurnState(turnId)
+      const completedTs = Number(event.tsMs ?? NaN)
+      if (state && Number.isFinite(completedTs) && completedTs > 0) state.completedTsMs = completedTs
       activeTurnId = null
       continue
     }
@@ -838,14 +871,12 @@ function buildChatMessagesSlow(store) {
     }
   }
 
-  return msgs.filter((msg) => {
+  const filtered = msgs.filter((msg) => {
     if (msg?.stepKind !== 'background') return true
     const state = turnStateById.get(String(msg.turnId ?? ''))
     if (!state) return false
 
     const isCurrentTurn = String(store?.currentTurnId ?? '').trim() === state.turnId
-    const expanded = Boolean(store?.backgroundExpandedByTurnId?.get?.(state.turnId))
-    const reasoningState = expanded ? getTurnReasoningState(store, state.turnId) : null
     const commandCalls = Array.from(state.commandByItemId.values())
     const explore = {
       files: state.exploreFileKeys.size,
@@ -853,6 +884,10 @@ function buildChatMessagesSlow(store) {
       lists: state.exploreListKeys.size,
       active: Boolean(state.exploreActiveItemIds.size)
     }
+    const hasRunningCommand = commandCalls.some((call) => String(call?.status ?? '').toLowerCase() === 'running')
+    const active = Boolean(isCurrentTurn || explore.active || hasRunningCommand)
+    const expanded = active || Boolean(store?.backgroundExpandedByTurnId?.get?.(state.turnId))
+    const reasoningState = expanded ? getTurnReasoningState(store, state.turnId) : null
     const hasReasoning = reasoningTurnIds.has(state.turnId) || Boolean(
       reasoningState?.loaded &&
       Array.isArray(reasoningState?.sections) &&
@@ -863,15 +898,17 @@ function buildChatMessagesSlow(store) {
     }
 
     msg.expanded = expanded
-    msg.title = 'Thinking'
+    const startedTsMs = Number(state.startedTsMs ?? NaN)
+    const completedTsMs = Number(state.completedTsMs ?? NaN)
+    const durationMs = (Number.isFinite(startedTsMs) && Number.isFinite(completedTsMs) && completedTsMs >= startedTsMs)
+      ? (completedTsMs - startedTsMs)
+      : null
+    msg.title = active ? 'Thinking' : formatThoughtDuration(durationMs)
     msg.hasReasoning = hasReasoning
     msg.reasoning = reasoningState
     msg.explore = explore
-    msg.active = Boolean(
-      isCurrentTurn ||
-      explore.active ||
-      commandCalls.some((call) => String(call?.status ?? '').toLowerCase() === 'running')
-    )
+    msg.active = active
+    msg.durationMs = durationMs
     msg.timeline = expanded
       ? buildTurnBackgroundTimeline({
           exploreCalls: state.exploreCalls,
@@ -881,6 +918,13 @@ function buildChatMessagesSlow(store) {
       : null
     return true
   })
+
+  const activeBackgrounds = filtered.filter((msg) => msg?.stepKind === 'background' && msg.active)
+  if (!activeBackgrounds.length) return filtered
+
+  const remaining = filtered.filter((msg) => !(msg?.stepKind === 'background' && msg.active))
+  remaining.push(...activeBackgrounds)
+  return remaining
 }
 
 export function buildChatMessages(store) {

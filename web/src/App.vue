@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Archive, ArrowDown, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FolderClosed, Loader2, Mic, MoreHorizontal, Play, Plus, Search, Settings, SlidersHorizontal, Square, Trash2, X } from 'lucide-vue-next'
+import { Archive, ArrowDown, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FolderClosed, Loader2, Mic, MoreHorizontal, Play, Plus, Search, Settings, Square, Trash2, X } from 'lucide-vue-next'
 
 import MarkdownView from './components/MarkdownView.vue'
 import {
@@ -637,10 +637,9 @@ async function ensureTurnReasoningLoaded(sessionId, turnId) {
   })
 }
 
-function onBackgroundDetailsToggle(turnId, ev) {
+function setBackgroundExpanded(turnId, open) {
   const sid = selectedSessionId.value
   if (!sid || !turnId) return
-  const open = Boolean(ev?.target?.open)
   const store = getSessionStore(sid)
   const key = String(turnId)
   const current = Boolean(store.backgroundExpandedByTurnId.get(key))
@@ -648,6 +647,12 @@ function onBackgroundDetailsToggle(turnId, ev) {
   store.backgroundExpandedByTurnId.set(key, open)
   store.messageViewVersion = Number(store.messageViewVersion ?? 0) + 1
   if (open) ensureTurnReasoningLoaded(sid, key).catch(() => {})
+}
+
+function toggleBackgroundExpanded(message) {
+  const turnId = String(message?.turnId ?? '').trim()
+  if (!turnId || message?.active) return
+  setBackgroundExpanded(turnId, !Boolean(message?.expanded))
 }
 
 function toolDisplayCommand(m) {
@@ -828,15 +833,20 @@ const sidebarProjectLabel = computed(() => {
   const cwd = String(defaults.cwd ?? '').trim()
   return cwd ? sessionProject({ cwd }) : ''
 })
-const composerPolicySummary = computed(() => {
-  const approval = String(selectedSession.value?.approvalPolicy ?? defaults.approvalPolicy ?? 'on-request')
-  const sandbox = String(selectedSession.value?.sandbox ?? defaults.sandbox ?? 'workspace-write')
-  return `${approval} · ${sandbox}`
-})
 const composerMachineLabel = computed(() => {
   if (selectedSession.value) return sessionHostName(selectedSession.value) || 'Local'
   const machine = defaultsSelectedMachine.value
   return String(machine?.machineName ?? '').trim() || 'Local'
+})
+const composerMachineOnline = computed(() => {
+  if (selectedSession.value) {
+    const mid = String(selectedSession.value.machineId ?? '').trim()
+    if (!mid) return true
+    const machine = machineRowsById.get(mid) ?? null
+    return machine ? machineIsOnline(machine) : false
+  }
+  if (!defaultsSelectedMachine.value) return true
+  return machineIsOnline(defaultsSelectedMachine.value)
 })
 const composerProjectLabel = computed(() => {
   if (selectedSession.value) return sessionProject(selectedSession.value)
@@ -925,6 +935,21 @@ function diffStepSelectedFile(stepId, files) {
 }
 
 const chatMessages = computed(() => buildChatMessages(selectedStore.value ?? null))
+
+watch(
+  () => [selectedSessionId.value, Number(selectedStore.value?.messageViewVersion ?? 0)],
+  ([sessionId]) => {
+    if (!sessionId) return
+    for (const message of chatMessages.value) {
+      if (message?.stepKind !== 'background') continue
+      if (!message.expanded || !message.hasReasoning || !message.turnId) continue
+      const reasoning = message.reasoning
+      if (reasoning?.loaded || reasoning?.loading) continue
+      ensureTurnReasoningLoaded(sessionId, message.turnId).catch(() => {})
+    }
+  },
+  { flush: 'post' }
+)
 
 const {
   ensureDefaultsReady,
@@ -1121,8 +1146,6 @@ const {
 const {
   openRenameSession,
   saveRenameSession,
-  openSessionPolicy,
-  saveSessionPolicy,
   pendingApproval,
   approvalAllows,
   approvalExtraActions,
@@ -1216,7 +1239,6 @@ onMounted(async () => {
       if (sessionMenuId.value) closeSessionMenu()
       else if (renameOpen.value) renameOpen.value = false
       else if (defaultsOpen.value) defaultsOpen.value = false
-      else if (sessionPolicyOpen.value) sessionPolicyOpen.value = false
       else if (deleteOpen.value) deleteOpen.value = false
       else if (deleteMachineOpen.value) deleteMachineOpen.value = false
       else if (archiveOpen.value) archiveOpen.value = false
@@ -1590,13 +1612,6 @@ watch(
                     >
                       {{ sessionProject(selectedSession) }}
                     </button>
-                    <button
-                      class="inline-flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                      title="Session policies"
-                      @click="openSessionPolicy"
-                    >
-                      <MoreHorizontal class="h-3.5 w-3.5" />
-                    </button>
                   </div>
                   <div v-else class="truncate text-[13px] font-semibold text-slate-800">New thread</div>
                 </div>
@@ -1619,15 +1634,6 @@ watch(
                   <Loader2 v-if="ideStarting" class="h-3 w-3 animate-spin" />
                   <Code v-else class="h-3 w-3" />
                   Open
-                  <ChevronDown class="h-3 w-3 text-slate-400" />
-                </button>
-                <button
-                  class="inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white px-2.5 py-1 text-[11px] text-slate-600 transition-colors hover:bg-black/[0.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                  @click="selectedSession ? openSessionPolicy() : openSettings('defaults')"
-                  :title="selectedSession ? 'Session handoff / policies' : 'Default policies'"
-                >
-                  <SlidersHorizontal class="h-3 w-3" />
-                  {{ selectedSession ? 'Handoff' : 'Defaults' }}
                   <ChevronDown class="h-3 w-3 text-slate-400" />
                 </button>
                 <div
@@ -1677,23 +1683,11 @@ watch(
                   <!-- Interleaved "step lines" (reasoning sections + tools) -->
                   <div v-if="m.role === 'step'" class="w-full">
                     <!-- Per-turn "Details" fold (reasoning + exploration) -->
-                    <details
+                    <div
                       v-if="m.stepKind === 'background'"
                       class="group w-full"
-                      :open="m.expanded"
-                      @toggle="onBackgroundDetailsToggle(m.turnId, $event)"
                     >
-                      <summary class="flex cursor-pointer list-none items-center gap-2 select-none text-xs font-medium text-slate-700 hover:text-slate-900">
-                        <span>
-                          {{ m.title || 'Thinking' }}<span v-if="m.active" class="rg-thinking-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
-                        </span>
-                        <span class="ml-auto inline-flex items-center text-slate-400 opacity-0 transition-opacity group-hover:opacity-100">
-                          <ChevronUp v-if="m.expanded" class="h-3.5 w-3.5" />
-                          <ChevronDown v-else class="h-3.5 w-3.5" />
-                        </span>
-                      </summary>
-
-                      <div class="mt-2 space-y-3 border-l border-slate-200 pl-4">
+                      <div v-if="m.expanded" class="mb-2 space-y-3 border-l border-slate-200 pl-4">
                         <div v-if="m.reasoning?.loading" class="text-xs text-slate-500">Loading reasoning…</div>
                         <div v-else-if="m.reasoning?.error" class="text-xs text-rose-700">{{ m.reasoning.error }}</div>
 
@@ -1771,11 +1765,26 @@ watch(
                           <div v-if="m.reasoning?.truncated" class="text-xs text-slate-500">(reasoning truncated)</div>
                         </div>
 
-                        <div v-else class="text-xs text-slate-500">
-                          {{ m.explore?.active ? 'Exploring…' : '(no details)' }}
+                        <div v-else-if="m.explore?.active" class="text-xs text-slate-500">
+                          Exploring…
                         </div>
                       </div>
-                    </details>
+
+                      <button
+                        type="button"
+                        class="flex w-full items-center gap-2 text-left text-xs font-medium text-slate-700 transition-colors hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                        :class="m.active ? 'cursor-default' : 'cursor-pointer'"
+                        @click="toggleBackgroundExpanded(m)"
+                      >
+                        <span>
+                          {{ m.title || 'Thinking' }}<span v-if="m.active" class="rg-thinking-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+                        </span>
+                        <span v-if="!m.active" class="ml-auto inline-flex items-center text-slate-400 opacity-0 transition-opacity group-hover:opacity-100">
+                          <ChevronUp v-if="m.expanded" class="h-3.5 w-3.5" />
+                          <ChevronDown v-else class="h-3.5 w-3.5" />
+                        </span>
+                      </button>
+                    </div>
 
                     <!-- Inline diffs (VS Code-like) -->
                     <div v-else-if="m.stepKind === 'diff'" class="w-full">
@@ -2158,23 +2167,36 @@ watch(
                 </div>
               </div>
 
-              <div class="mt-2 flex items-center justify-between gap-3 px-1 text-[11px] text-slate-400">
-                <div class="flex min-w-0 items-center gap-3">
-                  <button
-                    class="inline-flex items-center gap-1 transition-colors hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30 rounded"
-                    @click="openSettings('machines')"
+              <div class="mt-2 flex flex-wrap items-center justify-between gap-2 px-1 text-[11px] text-slate-400">
+                <div class="flex min-w-0 flex-wrap items-center gap-2">
+                  <div
+                    class="inline-flex max-w-full items-center gap-1.5 rounded-full border border-black/[0.06] px-2.5 py-1 text-slate-500"
+                    :title="composerMachineLabel"
                   >
-                    <span>{{ composerMachineLabel === 'Local' ? 'Local' : composerMachineLabel }}</span>
-                    <ChevronDown class="h-3 w-3 shrink-0" />
-                  </button>
-                  <button
-                    class="inline-flex min-w-0 items-center gap-1 transition-colors hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30 rounded"
-                    @click="selectedSession ? openSessionPolicy() : openSettings('defaults')"
+                    <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="composerMachineOnline ? 'bg-emerald-500' : 'bg-slate-400'" />
+                    <span class="truncate">{{ composerMachineLabel }}</span>
+                  </div>
+
+                  <select
+                    v-model="composerApprovalPolicy"
+                    class="h-7 rounded-full border border-black/[0.06] bg-transparent px-2.5 pr-8 text-[11px] text-slate-600 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20"
+                    :title="selectedSession ? 'Session approval policy' : 'Default approval policy'"
                   >
-                    <span class="truncate">{{ selectedSession ? 'Session permissions' : 'Default permissions' }}</span>
-                    <ChevronDown class="h-3 w-3 shrink-0" />
-                  </button>
-                  <span class="hidden truncate md:inline">{{ composerPolicySummary }}</span>
+                    <option value="untrusted">untrusted</option>
+                    <option value="on-request">on-request</option>
+                    <option value="never">never</option>
+                    <option value="on-failure">on-failure</option>
+                  </select>
+
+                  <select
+                    v-model="composerSandbox"
+                    class="h-7 rounded-full border border-black/[0.06] bg-transparent px-2.5 pr-8 text-[11px] text-slate-600 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20"
+                    :title="selectedSession ? 'Session sandbox' : 'Default sandbox'"
+                  >
+                    <option value="read-only">read-only</option>
+                    <option value="workspace-write">workspace-write</option>
+                    <option value="danger-full-access">danger-full-access</option>
+                  </select>
                 </div>
                 <div class="hidden max-w-[240px] truncate sm:block" :title="selectedSession?.cwd ?? defaults.cwd">
                   {{ composerProjectLabel }}
@@ -2816,63 +2838,6 @@ watch(
 	        </div>
 	      </transition>
 
-	      <!-- Session policy modal -->
-	      <transition name="rg-fade">
-	        <div v-if="sessionPolicyOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-	          <div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
-	            <div class="text-sm font-semibold text-slate-900">Session policies</div>
-	            <div class="mt-1 text-xs text-slate-600">Updates Codex approval + sandbox settings (applies on the next turn).</div>
-
-	            <div class="mt-4 grid grid-cols-2 gap-2">
-	              <div>
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Approval policy</div>
-	                <select
-	                  v-model="sessionApprovalDraft"
-	                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-	                >
-	                  <option value="untrusted">untrusted</option>
-	                  <option value="on-request">on-request</option>
-	                  <option value="never">never</option>
-	                  <option value="on-failure">on-failure</option>
-	                </select>
-	              </div>
-
-	              <div>
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Sandbox</div>
-	                <select
-	                  v-model="sessionSandboxDraft"
-	                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-	                >
-	                  <option value="read-only">read-only</option>
-	                  <option value="workspace-write">workspace-write</option>
-	                  <option value="danger-full-access">danger-full-access</option>
-	                </select>
-	              </div>
-	            </div>
-
-	            <div v-if="sessionPolicyError" class="mt-3 text-sm text-red-600">{{ sessionPolicyError }}</div>
-
-	            <div class="mt-5 flex items-center justify-end gap-2">
-	              <button
-	                class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-	                @click="sessionPolicyOpen = false"
-	                :disabled="sessionPolicySaving"
-	              >
-	                Cancel
-	              </button>
-	              <button
-	                class="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
-	                @click="saveSessionPolicy"
-	                :disabled="sessionPolicySaving"
-	              >
-	                <Loader2 v-if="sessionPolicySaving" class="h-4 w-4 animate-spin" />
-	                Save
-	              </button>
-	            </div>
-	          </div>
-	        </div>
-	      </transition>
-	
 	      <!-- Approvals modal -->
 	      <transition name="rg-fade">
 	        <div v-if="pendingApproval" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">

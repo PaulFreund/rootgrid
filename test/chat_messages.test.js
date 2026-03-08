@@ -64,7 +64,6 @@ test('diff file selection helpers persist the selected file per diff event', () 
 
 test('buildChatMessages folds thinking details and keeps command steps interleaved before the answer', () => {
   const store = createSessionStoreState()
-  store.turnHasReasoningLive.add('turn-1')
   store.backgroundExpandedByTurnId.set('turn-1', true)
   store.reasoningByTurnId.set('turn-1', {
     loading: false,
@@ -84,6 +83,7 @@ test('buildChatMessages folds thinking details and keeps command steps interleav
     },
     {
       eventId: 'e-2',
+      tsMs: 1_000,
       type: 'turn.started',
       payload: { turnId: 'turn-1' }
     },
@@ -130,6 +130,7 @@ test('buildChatMessages folds thinking details and keeps command steps interleav
     },
     {
       eventId: 'e-7',
+      tsMs: 9_000,
       type: 'turn.completed',
       payload: { turnId: 'turn-1' }
     },
@@ -153,7 +154,9 @@ test('buildChatMessages folds thinking details and keeps command steps interleav
   assert.equal(first.length, 3)
   assert.equal(first[0].role, 'user')
   assert.equal(first[1].stepKind, 'background')
-  assert.equal(first[1].title, 'Thinking')
+  assert.equal(first[1].title, 'Thought for 8s')
+  assert.equal(first[1].active, false)
+  assert.equal(first[1].durationMs, 8_000)
   assert.deepEqual(first[1].timeline[0], {
     kind: 'reasoning',
     id: 'reasoning-sec-1',
@@ -202,5 +205,38 @@ test('buildChatMessages keeps an empty Thinking group visible while a turn is st
   assert.equal(messages[1].stepKind, 'background')
   assert.equal(messages[1].title, 'Thinking')
   assert.equal(messages[1].active, true)
-  assert.equal(messages[1].timeline, null)
+  assert.equal(messages[1].expanded, true)
+  assert.deepEqual(messages[1].timeline, [])
+})
+
+test('buildChatMessages keeps active assistant output above the Thinking row', () => {
+  const store = createSessionStoreState()
+  store.currentTurnId = 'turn-live'
+
+  store.events.push(
+    {
+      eventId: 'u-1',
+      type: 'session.input',
+      payload: { text: 'Do work', attachments: [] }
+    },
+    {
+      eventId: 't-1',
+      type: 'turn.started',
+      payload: { turnId: 'turn-live' }
+    },
+    {
+      eventId: 'o-1',
+      type: 'session.output',
+      payload: { stream: 'normalized', text: 'Working on it' }
+    }
+  )
+
+  const messages = buildChatMessages(store)
+  assert.equal(messages.length, 3)
+  assert.equal(messages[0].role, 'user')
+  assert.equal(messages[1].role, 'assistant')
+  assert.equal(messages[1].text, 'Working on it')
+  assert.equal(messages[2].stepKind, 'background')
+  assert.equal(messages[2].title, 'Thinking')
+  assert.equal(messages[2].active, true)
 })
