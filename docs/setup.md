@@ -73,7 +73,7 @@ Examples:
 
 ## Proposed config shape (v0)
 
-This is a **proposed** starting point; adjust as implementation realities land.
+This is a **proposed** starting point; adjust as implementation realities land. A full repo example also lives at [`config.example.json`](../config.example.json).
 
 ```json
 {

@@ -186,16 +186,6 @@ function formatExploreTitle({ files = 0, searches = 0, lists = 0, active = false
   return `${prefix} ${parts.join(', ')}`
 }
 
-function formatBackgroundTitle({ hasReasoning = false, explore = null } = {}) {
-  const parts = []
-  if (hasReasoning) parts.push('Reasoning')
-  if (explore && (explore.files || explore.searches || explore.lists || explore.active)) {
-    parts.push(formatExploreTitle(explore))
-  }
-  if (!parts.length) return 'Details'
-  return `Details — ${parts.join(' · ')}`
-}
-
 function normalizeCommandActions(commandActions) {
   if (Array.isArray(commandActions) && COMMAND_ACTIONS_CACHE.has(commandActions)) {
     return COMMAND_ACTIONS_CACHE.get(commandActions)
@@ -257,8 +247,9 @@ function exploreCountKey(action) {
   return null
 }
 
-function buildTurnBackgroundTimeline({ exploreCalls, reasoningState }) {
+function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, commandCalls }) {
   const calls = Array.isArray(exploreCalls) ? exploreCalls : []
+  const commands = Array.isArray(commandCalls) ? commandCalls : []
   const reasoningLoaded = Boolean(reasoningState?.loaded)
   const reasoningSections = (reasoningLoaded && Array.isArray(reasoningState?.sections)) ? reasoningState.sections : []
   const items = []
@@ -292,6 +283,19 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState }) {
       tsMs: Number.isFinite(tsMs) ? tsMs : null,
       itemId: String(call.itemId ?? ''),
       actions
+    })
+  }
+
+  for (const call of commands) {
+    if (!call || typeof call !== 'object') continue
+    const seq = Number(call.seq ?? NaN)
+    const tsMs = Number(call.tsMs ?? NaN)
+    items.push({
+      kind: 'command',
+      id: `command-${String(call.itemId ?? items.length + 1)}`,
+      seq: Number.isFinite(seq) ? seq : null,
+      tsMs: Number.isFinite(tsMs) ? tsMs : null,
+      call
     })
   }
 
@@ -336,6 +340,22 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState }) {
   for (const item of merged) {
     if (item.kind === 'reasoning') {
       out.push({ kind: 'reasoning', id: item.id, section: item.section })
+      continue
+    }
+    if (item.kind === 'command') {
+      out.push({
+        kind: 'command',
+        id: item.id,
+        itemId: item.call.itemId,
+        tool: item.call.tool,
+        command: item.call.command,
+        commandActions: item.call.commandActions,
+        cwd: item.call.cwd,
+        status: item.call.status,
+        exitCode: item.call.exitCode,
+        expanded: item.call.expanded,
+        output: item.call.output
+      })
       continue
     }
     if (item.kind !== 'exploreCall') continue
@@ -582,7 +602,6 @@ function buildChatMessagesSlow(store) {
   const events = Array.isArray(store?.events) ? store.events : []
   const msgs = []
   let currentAssistant = null
-  let currentAssistantIdx = null
   const toolMsgByItemId = new Map()
   let lastDiffText = null
 
@@ -597,96 +616,68 @@ function buildChatMessagesSlow(store) {
   }
 
   let activeTurnId = null
-  const exploreFileKeys = new Set()
-  const exploreSearchKeys = new Set()
-  const exploreListKeys = new Set()
-  let exploreCalls = null
-  const exploreActiveItemIds = new Set()
-  const exploreSeenItemIds = new Set()
+  const turnStateById = new Map()
+  const exploreTurnByItemId = new Map()
+  const commandTurnByItemId = new Map()
 
-  const resetTurnBackground = () => {
-    activeTurnId = null
-    exploreFileKeys.clear()
-    exploreSearchKeys.clear()
-    exploreListKeys.clear()
-    exploreCalls = null
-    exploreActiveItemIds.clear()
-    exploreSeenItemIds.clear()
+  const getOrCreateTurnState = (turnId) => {
+    const key = String(turnId ?? '').trim()
+    if (!key) return null
+    let state = turnStateById.get(key)
+    if (state) return state
+    state = {
+      turnId: key,
+      msg: {
+        id: `bg-${key}`,
+        role: 'step',
+        stepKind: 'background',
+        turnId: key,
+        expanded: Boolean(store?.backgroundExpandedByTurnId?.get?.(key)),
+        title: 'Thinking',
+        hasReasoning: false,
+        reasoning: null,
+        explore: { files: 0, searches: 0, lists: 0, active: false },
+        timeline: null,
+        active: false
+      },
+      inserted: false,
+      exploreFileKeys: new Set(),
+      exploreSearchKeys: new Set(),
+      exploreListKeys: new Set(),
+      exploreCalls: [],
+      exploreActiveItemIds: new Set(),
+      exploreSeenItemIds: new Set(),
+      commandByItemId: new Map()
+    }
+    turnStateById.set(key, state)
+    return state
+  }
+
+  const ensureTurnBackgroundMessage = (turnId) => {
+    const state = getOrCreateTurnState(turnId)
+    if (!state) return null
+    if (!state.inserted) {
+      msgs.push(state.msg)
+      state.inserted = true
+    }
+    return state
   }
 
   const beginTurn = (turnId) => {
-    resetTurnBackground()
     activeTurnId = String(turnId ?? '').trim() || null
     if (!activeTurnId) return
-    if (Boolean(store?.backgroundExpandedByTurnId?.get?.(activeTurnId))) exploreCalls = []
-  }
-
-  const maybeEmitBackground = () => {
-    if (!activeTurnId) return
-    const hasExplore = Boolean(
-      exploreFileKeys.size ||
-      exploreSearchKeys.size ||
-      exploreListKeys.size ||
-      exploreActiveItemIds.size
-    )
-    const tokenHasReasoning = reasoningTurnIds.has(activeTurnId)
-    if (!hasExplore && !tokenHasReasoning) {
-      resetTurnBackground()
-      return
-    }
-
-    const expanded = Boolean(store?.backgroundExpandedByTurnId?.get?.(activeTurnId))
-    const explore = {
-      files: exploreFileKeys.size,
-      searches: exploreSearchKeys.size,
-      lists: exploreListKeys.size,
-      active: Boolean(exploreActiveItemIds.size)
-    }
-    const reasoningState = expanded ? getTurnReasoningState(store, activeTurnId) : null
-    const hasReasoning = tokenHasReasoning || Boolean(
-      reasoningState?.loaded &&
-      Array.isArray(reasoningState?.sections) &&
-      reasoningState.sections.length
-    )
-    const timeline = expanded
-      ? buildTurnBackgroundTimeline({ exploreCalls: exploreCalls ?? [], reasoningState })
-      : null
-
-    const msg = {
-      id: `bg-${activeTurnId}`,
-      role: 'step',
-      stepKind: 'background',
-      turnId: activeTurnId,
-      expanded,
-      title: formatBackgroundTitle({ hasReasoning, explore }),
-      hasReasoning,
-      reasoning: reasoningState,
-      explore,
-      timeline
-    }
-
-    const insertAt = (Number.isInteger(currentAssistantIdx) && currentAssistantIdx !== null)
-      ? Math.max(0, Math.min(msgs.length, currentAssistantIdx))
-      : msgs.length
-    if (insertAt === msgs.length) msgs.push(msg)
-    else {
-      msgs.splice(insertAt, 0, msg)
-      if (Number.isInteger(currentAssistantIdx) && currentAssistantIdx !== null) currentAssistantIdx += 1
-    }
-    resetTurnBackground()
+    ensureTurnBackgroundMessage(activeTurnId)
   }
 
   const ensureAssistant = (idHint) => {
     if (currentAssistant) return currentAssistant
     currentAssistant = { id: idHint, role: 'assistant', text: '' }
-    currentAssistantIdx = msgs.length
     msgs.push(currentAssistant)
     return currentAssistant
   }
 
   for (const event of events) {
     if (event.type === 'session.input') {
-      maybeEmitBackground()
       msgs.push({
         id: event.eventId,
         role: 'user',
@@ -694,24 +685,21 @@ function buildChatMessagesSlow(store) {
         attachments: Array.isArray(event.payload?.attachments) ? event.payload.attachments : []
       })
       currentAssistant = null
-      currentAssistantIdx = null
+      activeTurnId = null
       toolMsgByItemId.clear()
       continue
     }
 
     if (event.type === 'turn.started') {
-      maybeEmitBackground()
       currentAssistant = null
-      currentAssistantIdx = null
       toolMsgByItemId.clear()
       beginTurn(event.payload?.turnId ?? event.eventId)
       continue
     }
 
     if (event.type === 'turn.completed') {
-      maybeEmitBackground()
       currentAssistant = null
-      currentAssistantIdx = null
+      activeTurnId = null
       continue
     }
 
@@ -752,27 +740,67 @@ function buildChatMessagesSlow(store) {
     const itemId = String(event.payload?.itemId ?? '')
     if (!itemId) continue
 
-    if (String(tool ?? '').toLowerCase() === 'commandexecution' && activeTurnId) {
+    if (String(tool ?? '').toLowerCase() === 'commandexecution') {
       const actions = normalizeCommandActions(event.payload?.commandActions)
+      const exploreTurnId = String(exploreTurnByItemId.get(itemId) ?? activeTurnId ?? '').trim() || null
       if (isExploringCallFromActions(actions)) {
+        if (!exploreTurnId) continue
+        const state = ensureTurnBackgroundMessage(exploreTurnId)
+        if (!state) continue
         if (event.type === 'tool.started') {
-          exploreActiveItemIds.add(itemId)
+          exploreTurnByItemId.set(itemId, exploreTurnId)
+          state.exploreActiveItemIds.add(itemId)
         } else {
-          exploreActiveItemIds.delete(itemId)
-          if (exploreSeenItemIds.has(itemId)) continue
-          exploreSeenItemIds.add(itemId)
+          state.exploreActiveItemIds.delete(itemId)
+          if (state.exploreSeenItemIds.has(itemId)) continue
+          state.exploreSeenItemIds.add(itemId)
 
           for (const action of actions) {
             const key = exploreCountKey(action)
             if (!key) continue
-            if (action.kind === 'read') exploreFileKeys.add(key)
-            else if (action.kind === 'search') exploreSearchKeys.add(key)
-            else if (action.kind === 'list') exploreListKeys.add(key)
+            if (action.kind === 'read') state.exploreFileKeys.add(key)
+            else if (action.kind === 'search') state.exploreSearchKeys.add(key)
+            else if (action.kind === 'list') state.exploreListKeys.add(key)
           }
-          if (exploreCalls) {
-            exploreCalls.push({ itemId, actions, seq: event.seq ?? null, tsMs: event.tsMs ?? null })
-          }
+          state.exploreCalls.push({ itemId, actions, seq: event.seq ?? null, tsMs: event.tsMs ?? null })
         }
+        continue
+      }
+
+      const commandTurnId = String(commandTurnByItemId.get(itemId) ?? activeTurnId ?? '').trim() || null
+      if (commandTurnId) {
+        if (event.type === 'tool.started') commandTurnByItemId.set(itemId, commandTurnId)
+        const state = ensureTurnBackgroundMessage(commandTurnId)
+        if (!state) continue
+        let call = state.commandByItemId.get(itemId) ?? null
+        if (!call) {
+          call = {
+            itemId,
+            tool,
+            command: event.payload?.command ?? null,
+            commandActions: event.payload?.commandActions ?? null,
+            cwd: event.payload?.cwd ?? null,
+            status: event.payload?.status ?? (event.type === 'tool.started' ? 'running' : 'completed'),
+            exitCode: event.payload?.exitCode ?? null,
+            expanded: Boolean(store?.toolExpanded?.get?.(itemId)),
+            output: store?.toolOutputByItemId?.get?.(itemId) ?? null,
+            seq: event.seq ?? null,
+            tsMs: event.tsMs ?? null
+          }
+          state.commandByItemId.set(itemId, call)
+        } else {
+          call.tool = tool ?? call.tool
+          call.command = event.payload?.command ?? call.command
+          call.commandActions = event.payload?.commandActions ?? call.commandActions
+          call.cwd = event.payload?.cwd ?? call.cwd
+          call.status = event.payload?.status ?? call.status
+          if (!call.status) call.status = (event.type === 'tool.started') ? 'running' : 'completed'
+          if (event.payload?.exitCode !== undefined) call.exitCode = event.payload.exitCode
+          if ((call.seq === null || call.seq === undefined) && event.seq !== undefined) call.seq = event.seq
+          if ((call.tsMs === null || call.tsMs === undefined) && event.tsMs !== undefined) call.tsMs = event.tsMs
+        }
+        call.expanded = Boolean(store?.toolExpanded?.get?.(itemId))
+        call.output = store?.toolOutputByItemId?.get?.(itemId) ?? call.output
         continue
       }
     }
@@ -810,8 +838,49 @@ function buildChatMessagesSlow(store) {
     }
   }
 
-  maybeEmitBackground()
-  return msgs
+  return msgs.filter((msg) => {
+    if (msg?.stepKind !== 'background') return true
+    const state = turnStateById.get(String(msg.turnId ?? ''))
+    if (!state) return false
+
+    const isCurrentTurn = String(store?.currentTurnId ?? '').trim() === state.turnId
+    const expanded = Boolean(store?.backgroundExpandedByTurnId?.get?.(state.turnId))
+    const reasoningState = expanded ? getTurnReasoningState(store, state.turnId) : null
+    const commandCalls = Array.from(state.commandByItemId.values())
+    const explore = {
+      files: state.exploreFileKeys.size,
+      searches: state.exploreSearchKeys.size,
+      lists: state.exploreListKeys.size,
+      active: Boolean(state.exploreActiveItemIds.size)
+    }
+    const hasReasoning = reasoningTurnIds.has(state.turnId) || Boolean(
+      reasoningState?.loaded &&
+      Array.isArray(reasoningState?.sections) &&
+      reasoningState.sections.length
+    )
+    if (!isCurrentTurn && !hasReasoning && !explore.files && !explore.searches && !explore.lists && !explore.active && !commandCalls.length) {
+      return false
+    }
+
+    msg.expanded = expanded
+    msg.title = 'Thinking'
+    msg.hasReasoning = hasReasoning
+    msg.reasoning = reasoningState
+    msg.explore = explore
+    msg.active = Boolean(
+      isCurrentTurn ||
+      explore.active ||
+      commandCalls.some((call) => String(call?.status ?? '').toLowerCase() === 'running')
+    )
+    msg.timeline = expanded
+      ? buildTurnBackgroundTimeline({
+          exploreCalls: state.exploreCalls,
+          reasoningState,
+          commandCalls
+        })
+      : null
+    return true
+  })
 }
 
 export function buildChatMessages(store) {

@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Archive, ArrowDown, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FolderClosed, Loader2, Mic, MoreHorizontal, Play, Plus, Search, Settings, SlidersHorizontal, Sparkles, Square, Trash2, X } from 'lucide-vue-next'
+import { Archive, ArrowDown, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FolderClosed, Loader2, Mic, MoreHorizontal, Play, Plus, Search, Settings, SlidersHorizontal, Square, Trash2, X } from 'lucide-vue-next'
 
 import MarkdownView from './components/MarkdownView.vue'
 import {
@@ -61,6 +61,10 @@ import {
   createSessionEnvelopeHandler
 } from './lib/sessionEnvelopeHandler.js'
 import {
+  buildSessionListEntries,
+  normalizeSessionListGroupingMode
+} from './lib/sessionListGrouping.js'
+import {
   createSessionListLoader
 } from './lib/sessionListLoader.js'
 import {
@@ -100,7 +104,7 @@ import {
   sessionTooltip as sessionTooltipForRow
 } from './lib/sessionUi.js'
 import {
-  computeVirtualWindow
+  computeVirtualWindowVariable
 } from './lib/virtualList.js'
 
 const authed = ref(false)
@@ -127,6 +131,7 @@ const hasSnapshot = ref(false)
 const sessionListScrollEl = ref(null)
 const sessionListScrollTop = ref(0)
 const sessionListViewportHeight = ref(720)
+const sessionListGroupingMode = ref(readSessionListGroupingMode())
 const sessionListLoading = ref(false)
 const sessionListHasMore = ref(false)
 const sessionListNextBeforeUpdatedMs = ref(null)
@@ -368,6 +373,10 @@ function closeSessionMenu() {
   sessionMenuId.value = null
 }
 
+function toggleSessionListGrouping() {
+  sessionListGroupingMode.value = sessionListGroupingMode.value === 'project' ? 'flat' : 'project'
+}
+
 function toggleSessionMenu(sessionId) {
   const sid = String(sessionId ?? '').trim()
   if (!sid) return
@@ -392,6 +401,23 @@ async function apiFetch(path, opts = {}) {
 
 function currentVisibility() {
   return currentVisibilityState()
+}
+
+function readSessionListGroupingMode() {
+  try {
+    if (typeof localStorage === 'undefined') return 'project'
+    return normalizeSessionListGroupingMode(localStorage.getItem('rootgrid.sessionListGrouping'))
+  } catch {
+    return 'project'
+  }
+}
+
+function persistSessionListGroupingMode(value) {
+  try {
+    if (typeof localStorage === 'undefined') return
+    localStorage.setItem('rootgrid.sessionListGrouping', normalizeSessionListGroupingMode(value))
+  } catch {
+  }
 }
 
 const {
@@ -774,6 +800,10 @@ watch(settingsTab, (t) => {
   if (t === 'system') refreshPushSubscription().catch(() => {})
 })
 
+watch(sessionListGroupingMode, (value) => {
+  persistSessionListGroupingMode(value)
+})
+
 const selectedSession = computed(() => {
   const sid = String(selectedSessionId.value ?? '').trim()
   if (!sid) return null
@@ -781,11 +811,17 @@ const selectedSession = computed(() => {
 })
 const selectedStore = computed(() => selectedSessionId.value ? sessionStores.get(selectedSessionId.value) : null)
 const selectedTokenUsage = computed(() => selectedSessionId.value ? (tokenUsageBySessionId.get(selectedSessionId.value) ?? null) : null)
-const visibleSessionWindow = computed(() => computeVirtualWindow(visibleSessions.value, {
+const sessionListEntries = computed(() => buildSessionListEntries(visibleSessions.value, {
+  groupingMode: sessionListGroupingMode.value,
+  getHostName: (session) => sessionHostName(session),
+  getProjectName: (session) => sessionProject(session)
+}))
+const visibleSessionWindow = computed(() => computeVirtualWindowVariable(sessionListEntries.value, {
   scrollTop: sessionListScrollTop.value,
   viewportHeight: sessionListViewportHeight.value,
-  rowHeight: 56,
-  overscan: 10
+  defaultItemHeight: 56,
+  overscanPx: 280,
+  getItemHeight: (entry) => entry?.kind === 'group' ? 28 : 56
 }))
 const sidebarProjectLabel = computed(() => {
   if (selectedSession.value) return sessionProject(selectedSession.value)
@@ -989,16 +1025,27 @@ function scrollToBottom() {
   if (selectedSessionId.value) scheduleMarkRead(selectedSessionId.value)
 }
 
+async function waitForNextPaint() {
+  await new Promise((resolve) => {
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => resolve())
+    else setTimeout(resolve, 0)
+  })
+}
+
 watch(
-  () => (selectedStore.value?.events.length ?? 0),
-  async () => {
-    if (!stickToBottom.value) return
+  () => [selectedSessionId.value, Number(selectedStore.value?.messageViewVersion ?? 0)],
+  async ([sessionId]) => {
+    if (!sessionId || !stickToBottom.value) return
     await nextTick()
+    await waitForNextPaint()
     const el = chatScrollEl.value
     if (!el) return
     el.scrollTop = el.scrollHeight
-    if (selectedSessionId.value) scheduleMarkRead(selectedSessionId.value)
-  }
+    await waitForNextPaint()
+    el.scrollTop = el.scrollHeight
+    scheduleMarkRead(sessionId)
+  },
+  { flush: 'post' }
 )
 
 const {
@@ -1309,7 +1356,7 @@ watch(
       </div>
     </div>
 
-    <div v-else class="h-full flex flex-col bg-[#f7f7f4]">
+    <div v-else class="h-full flex flex-col bg-white">
       <div
         v-if="connectionBanner"
         class="shrink-0 bg-white/80 backdrop-blur supports-[backdrop-filter]:bg-white/60"
@@ -1330,7 +1377,7 @@ watch(
 
       <div class="flex flex-1 min-h-0">
         <!-- Sidebar -->
-        <aside class="shrink-0 flex w-[228px] flex-col bg-[#f8f8f6]">
+        <aside class="shrink-0 flex w-[228px] flex-col bg-[#efefec]">
           <div class="shrink-0 px-3 pb-2 pt-3">
             <div class="flex items-center justify-between gap-3">
               <button
@@ -1354,20 +1401,6 @@ watch(
                 <Plus class="h-3.5 w-3.5 text-slate-400" />
                 New thread
               </button>
-              <button
-                class="w-full inline-flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-slate-400 transition-colors hover:bg-black/[0.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                title="Coming soon"
-              >
-                <Sparkles class="h-3.5 w-3.5" />
-                Automations
-              </button>
-              <button
-                class="w-full inline-flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-slate-400 transition-colors hover:bg-black/[0.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                title="Coming soon"
-              >
-                <FolderClosed class="h-3.5 w-3.5" />
-                Skills
-              </button>
             </div>
           </div>
 
@@ -1384,6 +1417,15 @@ watch(
                   title="Search threads"
                 >
                   <Search class="h-3.5 w-3.5" />
+                </button>
+                <button
+                  class="inline-flex h-7 items-center justify-center gap-1 rounded-md px-2 text-[11px] text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  :class="sessionListGroupingMode === 'project' ? 'bg-black/[0.05] text-slate-700' : ''"
+                  :title="sessionListGroupingMode === 'project' ? 'Show a flat thread list' : 'Group by host + project'"
+                  @click="toggleSessionListGrouping"
+                >
+                  <FolderClosed class="h-3.5 w-3.5" />
+                  {{ sessionListGroupingMode === 'project' ? 'Grouped' : 'Flat' }}
                 </button>
                 <button
                   class="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
@@ -1417,82 +1459,95 @@ watch(
               <div v-else>
                 <div v-if="visibleSessionWindow.offsetTop > 0" :style="{ height: `${visibleSessionWindow.offsetTop}px` }" />
 
-                <button
-                  v-for="s in visibleSessionWindow.items"
-                  :key="s.sessionId"
-                  class="group w-full rounded-lg px-2.5 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-slate-400/30"
-                  :class="selectedSessionId === s.sessionId ? 'bg-[#ecece8]' : 'hover:bg-black/[0.035]'"
-                  :title="sessionTooltip(s)"
-                  @click="selectedSessionId = s.sessionId"
-                >
-                  <div class="flex items-start gap-2.5">
-                    <span
-                      class="mt-1.5 h-2 w-2 shrink-0 rounded-full"
-                      :class="indicatorDotClass(sessionIndicator(s))"
-                    />
+                <template v-for="entry in visibleSessionWindow.items" :key="entry.key">
+                  <div
+                    v-if="entry.kind === 'group'"
+                    class="px-2.5 pb-1 pt-3 text-[10px] font-medium uppercase tracking-[0.16em] text-slate-500"
+                  >
+                    <div class="truncate" :title="entry.label">{{ entry.label }}</div>
+                  </div>
 
-                    <div class="min-w-0 flex-1">
-                      <div class="flex items-center justify-between gap-2">
-                        <div class="truncate text-[13px] font-medium text-slate-700">{{ sessionListTitle(s) }}</div>
-                        <div class="flex shrink-0 items-center gap-1">
-                          <div class="text-[11px] text-slate-400">{{ formatAgeShort(s.updatedMs) }}</div>
-                          <div class="relative" data-session-menu-root="true">
-                            <button
-                              class="inline-flex h-6 w-6 items-center justify-center rounded-md text-slate-300 transition-colors hover:bg-black/[0.05] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                              :class="sessionMenuId === s.sessionId ? 'bg-black/[0.05] text-slate-600 opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'"
-                              title="Thread actions"
-                              @click.stop="toggleSessionMenu(s.sessionId)"
-                            >
-                              <MoreHorizontal class="h-3.5 w-3.5" />
-                            </button>
+                  <button
+                    v-else
+                    class="group w-full rounded-lg px-2.5 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-slate-400/30"
+                    :class="selectedSessionId === entry.session.sessionId ? 'bg-[#ecece8]' : 'hover:bg-black/[0.035]'"
+                    :title="sessionTooltip(entry.session)"
+                    @click="selectedSessionId = entry.session.sessionId"
+                  >
+                    <div class="flex items-start gap-2.5">
+                      <span
+                        class="mt-1.5 h-2 w-2 shrink-0 rounded-full"
+                        :class="indicatorDotClass(sessionIndicator(entry.session))"
+                      />
 
-                            <div
-                              v-if="sessionMenuId === s.sessionId"
-                              class="absolute right-0 top-7 z-20 w-44 rounded-xl border border-black/[0.06] bg-white p-1 shadow-lg shadow-black/10"
-                            >
+                      <div class="min-w-0 flex-1">
+                        <div class="flex items-center justify-between gap-2">
+                          <div class="truncate text-[13px] font-medium text-slate-700">{{ sessionListTitle(entry.session) }}</div>
+                          <div class="flex shrink-0 items-center gap-1">
+                            <div class="text-[11px] text-slate-400">{{ formatAgeShort(entry.session.updatedMs) }}</div>
+                            <div class="relative" data-session-menu-root="true">
                               <button
-                                class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
-                                @click.stop="openSessionMenuRenameTitle(s)"
+                                class="inline-flex h-6 w-6 items-center justify-center rounded-md text-slate-300 transition-colors hover:bg-black/[0.05] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                                :class="sessionMenuId === entry.session.sessionId ? 'bg-black/[0.05] text-slate-600 opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'"
+                                title="Thread actions"
+                                @click.stop="toggleSessionMenu(entry.session.sessionId)"
                               >
-                                Rename thread
+                                <MoreHorizontal class="h-3.5 w-3.5" />
                               </button>
-                              <button
-                                class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
-                                @click.stop="openSessionMenuRenameProject(s)"
+
+                              <div
+                                v-if="sessionMenuId === entry.session.sessionId"
+                                class="absolute right-0 top-7 z-20 w-44 rounded-xl border border-black/[0.06] bg-white p-1 shadow-lg shadow-black/10"
                               >
-                                Edit project
-                              </button>
-                              <button
-                                class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
-                                @click.stop="archiveFromSessionMenu(s.sessionId)"
-                              >
-                                Archive
-                              </button>
-                              <button
-                                class="w-full rounded-lg px-3 py-2 text-left text-sm text-red-600 transition-colors hover:bg-red-50"
-                                @click.stop="openSessionMenuDelete(s.sessionId)"
-                              >
-                                Delete
-                              </button>
+                                <button
+                                  class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
+                                  @click.stop="openSessionMenuRenameTitle(entry.session)"
+                                >
+                                  Rename thread
+                                </button>
+                                <button
+                                  class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
+                                  @click.stop="openSessionMenuRenameProject(entry.session)"
+                                >
+                                  Edit project
+                                </button>
+                                <button
+                                  class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
+                                  @click.stop="archiveFromSessionMenu(entry.session.sessionId)"
+                                >
+                                  Archive
+                                </button>
+                                <button
+                                  class="w-full rounded-lg px-3 py-2 text-left text-sm text-red-600 transition-colors hover:bg-red-50"
+                                  @click.stop="openSessionMenuDelete(entry.session.sessionId)"
+                                >
+                                  Delete
+                                </button>
+                              </div>
                             </div>
                           </div>
                         </div>
-                      </div>
 
-                      <div class="mt-0.5 flex min-w-0 items-center gap-1.5 text-[11px] text-slate-400">
-                        <button
-                          class="shrink-0 max-w-[120px] truncate rounded-md px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.16em] text-slate-500 transition-colors hover:bg-black/[0.05]"
-                          :title="s.cwd"
-                          @click.stop="openRenameSession(s, { focus: 'project' })"
-                        >
-                          {{ sessionProject(s) }}
-                        </button>
-                        <span class="shrink-0 text-slate-300">·</span>
-                        <span class="truncate">{{ s.preview || sessionHostName(s) }}</span>
+                        <div class="mt-0.5 flex min-w-0 items-center gap-1.5 text-[11px] text-slate-400">
+                          <template v-if="sessionListGroupingMode === 'project'">
+                            <span class="truncate">{{ entry.session.preview || 'No preview yet' }}</span>
+                          </template>
+                          <template v-else>
+                            <button
+                              class="shrink-0 max-w-[120px] truncate rounded-md px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.16em] text-slate-500 transition-colors hover:bg-black/[0.05]"
+                              :title="entry.session.cwd"
+                              @click.stop="openRenameSession(entry.session, { focus: 'project' })"
+                            >
+                              {{ sessionProject(entry.session) }}
+                            </button>
+                            <span class="shrink-0 text-slate-300">·</span>
+                            <span class="truncate">{{ entry.session.preview || sessionHostName(entry.session) }}</span>
+                          </template>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                </button>
+                  </button>
+                </template>
 
                 <div v-if="visibleSessionWindow.offsetBottom > 0" :style="{ height: `${visibleSessionWindow.offsetBottom}px` }" />
                 <div v-if="sessionListLoading || sessionListHasMore" class="px-3 py-2 text-center text-[11px] text-slate-400">
@@ -1514,9 +1569,9 @@ watch(
         </aside>
 
       <!-- Main -->
-      <main class="flex-1 min-h-0 bg-[#f7f7f4] p-1.5">
-        <section class="flex h-full min-w-0 flex-col overflow-hidden rounded-[16px] bg-[#fbfbfa] shadow-[0_1px_2px_rgba(0,0,0,0.03)]">
-          <header class="bg-[#fbfbfa] px-4 py-2.5">
+      <main class="flex-1 min-h-0 bg-white p-1.5">
+        <section class="flex h-full min-w-0 flex-col overflow-hidden rounded-[16px] bg-white shadow-[0_1px_2px_rgba(0,0,0,0.03)]">
+          <header class="bg-white px-4 py-2.5">
             <div class="flex items-start justify-between gap-4">
               <div class="min-w-0">
                 <div class="flex min-w-0 items-center gap-2">
@@ -1628,8 +1683,14 @@ watch(
                       :open="m.expanded"
                       @toggle="onBackgroundDetailsToggle(m.turnId, $event)"
                     >
-                      <summary class="cursor-pointer select-none truncate text-xs font-medium text-slate-700 hover:text-slate-900">
-                        {{ m.title || 'Details' }}
+                      <summary class="flex cursor-pointer list-none items-center gap-2 select-none text-xs font-medium text-slate-700 hover:text-slate-900">
+                        <span>
+                          {{ m.title || 'Thinking' }}<span v-if="m.active" class="rg-thinking-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+                        </span>
+                        <span class="ml-auto inline-flex items-center text-slate-400 opacity-0 transition-opacity group-hover:opacity-100">
+                          <ChevronUp v-if="m.expanded" class="h-3.5 w-3.5" />
+                          <ChevronDown v-else class="h-3.5 w-3.5" />
+                        </span>
                       </summary>
 
                       <div class="mt-2 space-y-3 border-l border-slate-200 pl-4">
@@ -1644,6 +1705,64 @@ watch(
                               </summary>
                               <div v-if="String(it.section?.body ?? '').trim()" class="mt-2 border-l border-slate-200 pl-4">
                                 <MarkdownView :source="it.section.body" />
+                              </div>
+                            </details>
+                            <details
+                              v-else-if="it.kind === 'command'"
+                              class="group"
+                              :open="it.expanded"
+                              @toggle="onToolDetailsToggle(it.itemId, $event)"
+                            >
+                              <summary class="cursor-pointer select-none flex items-center justify-between gap-3">
+                                <div class="min-w-0 flex items-center gap-2 text-xs text-slate-600">
+                                  <span class="shrink-0 text-[10px] uppercase tracking-wider text-slate-400">Command</span>
+                                  <span class="shrink-0 text-slate-300">·</span>
+                                  <span class="shrink-0 text-slate-600">{{ String(it.status ?? '') }}</span>
+                                  <span v-if="it.exitCode !== null && it.exitCode !== undefined" class="shrink-0 text-slate-300">·</span>
+                                  <span v-if="it.exitCode !== null && it.exitCode !== undefined" class="shrink-0 text-slate-600">exit {{ it.exitCode }}</span>
+                                  <span
+                                    v-if="toolDisplayCommand(it)"
+                                    class="min-w-0 truncate font-mono text-slate-800"
+                                    :title="toolDisplayCommand(it)"
+                                  >
+                                    {{ toolDisplayCommand(it) }}
+                                  </span>
+                                </div>
+                              </summary>
+
+                              <div class="mt-2 space-y-3 border-l border-slate-200 pl-4">
+                                <div class="rounded-2xl border border-black/[0.06] bg-[#f3f3f0] p-3">
+                                  <div class="flex items-center justify-between gap-3">
+                                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Output</div>
+                                    <button
+                                      v-if="it.output?.hasMoreBefore"
+                                      class="rounded-md bg-slate-100 px-2.5 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                                      :disabled="it.output?.loading"
+                                      @click="loadMoreToolOutputBefore(selectedSessionId, it.itemId)"
+                                    >
+                                      Load more
+                                    </button>
+                                  </div>
+
+                                  <div v-if="!it.output" class="mt-2 text-xs text-slate-500">Loading…</div>
+                                  <div v-else>
+                                    <div v-if="it.output.loading" class="mt-2 text-xs text-slate-500">Loading…</div>
+
+                                    <div v-if="it.output.stdout" class="mt-2">
+                                      <div class="mb-1 text-[10px] uppercase tracking-wider text-slate-500">stdout</div>
+                                      <pre class="m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl border border-black/[0.06] bg-white p-2 text-xs font-mono text-slate-800">{{ it.output.stdout }}</pre>
+                                    </div>
+
+                                    <div v-if="it.output.stderr" class="mt-2">
+                                      <div class="mb-1 text-[10px] uppercase tracking-wider text-slate-500">stderr</div>
+                                      <pre class="m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl border border-black/[0.06] bg-white p-2 text-xs font-mono text-slate-800">{{ it.output.stderr }}</pre>
+                                    </div>
+
+                                    <div v-if="!it.output.loading && !it.output.stdout && !it.output.stderr" class="mt-2 text-xs text-slate-500">
+                                      (no output)
+                                    </div>
+                                  </div>
+                                </div>
                               </div>
                             </details>
                             <div v-else-if="it.kind === 'explore'" class="truncate text-xs text-slate-700" :title="it.label">{{ it.label }}</div>
@@ -1869,7 +1988,7 @@ watch(
 	          </div>
 
           <!-- Pinned plan checklist (Codex-style) -->
-          <div v-if="pinnedPlanHasUnchecked" class="shrink-0 bg-[#fbfbfa] px-6 pb-3">
+          <div v-if="pinnedPlanHasUnchecked" class="shrink-0 bg-white px-6 pb-3">
             <div class="mx-auto w-full max-w-[700px]">
               <div class="overflow-hidden rounded-[20px] border border-black/[0.05] bg-[#f5f5f2]">
                 <button
@@ -1915,7 +2034,7 @@ watch(
           </div>
 
           <footer
-            class="relative bg-[#fbfbfa] px-6 pb-4 pt-2"
+            class="relative bg-white px-6 pb-4 pt-2"
             @dragenter.prevent="onComposerDragEnter"
             @dragleave.prevent="onComposerDragLeave"
             @dragover.prevent

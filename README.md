@@ -30,6 +30,7 @@ Then:
 Configuration is written to:
 
 - `~/.rootgrid/config.json`
+- `config.example.json` – example config covering every current field
 
 ---
 
