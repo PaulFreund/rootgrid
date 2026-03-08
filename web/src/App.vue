@@ -1239,8 +1239,8 @@ const composerMachineUpgradeSupported = computed(() => machineSupportsWebUpgrade
 const composerMachineUpgradeAvailable = computed(() => (
   Boolean(composerMachine.value)
   && composerMachineOnline.value
-  && composerMachineVersionMismatch.value
-  && composerMachineUpgradeSupported.value
+  && (composerMachineVersionMismatch.value || composerMachineUnknownVersion.value)
+  && (composerMachineUpgradeSupported.value || composerMachineUnknownVersion.value)
 ))
 const composerMachineUpgradeWorking = computed(() => {
   const machineId = String(composerMachine.value?.machineId ?? '').trim()
@@ -1251,6 +1251,7 @@ const composerMachineUpgradePopoverVisible = computed(() => (
   && (composerMachinePopoverOpen.value || composerMachinePopoverHover.value)
 ))
 const composerMachineUpgradeStatus = computed(() => machineUpgradeStatusText(composerMachine.value))
+const composerMachineUpgradeErrorText = computed(() => String(machineUpgradeError.value ?? '').trim())
 const composerProjectLabel = computed(() => {
   if (selectedSession.value) return sessionProject(selectedSession.value)
   const cwd = String(defaults.cwd ?? '').trim()
@@ -3324,6 +3325,9 @@ watch(
                       >
                         {{ composerMachineUpgradeStatus }}
                       </div>
+                      <div v-if="composerMachineUpgradeErrorText" class="mt-2 text-[11px] text-red-600">
+                        {{ composerMachineUpgradeErrorText }}
+                      </div>
                       <div v-else-if="composerMachineUpgradeAvailable" class="mt-2 text-[11px] text-slate-500">
                         Upgrade this runner from the updated host.
                       </div>
@@ -3345,7 +3349,7 @@ watch(
                         @click.stop="composerMachine ? upgradeMachine(composerMachine.machineId) : null"
                       >
                         <Loader2 v-if="composerMachineUpgradeWorking" class="h-3.5 w-3.5 animate-spin" />
-                        Upgrade runner
+                        {{ composerMachineUnknownVersion && !composerMachineUpgradeSupported ? 'Try upgrade runner' : 'Upgrade runner' }}
                       </button>
                     </div>
                   </div>
@@ -3978,14 +3982,14 @@ watch(
 		                    </div>
 		                    <div class="shrink-0 flex items-center gap-2">
 		                      <button
-		                        v-if="machineIsOnline(m) && machineHasVersionMismatch(m) && machineSupportsWebUpgrade(m)"
+		                        v-if="machineIsOnline(m) && ((machineHasVersionMismatch(m) && machineSupportsWebUpgrade(m)) || machineHasUnknownVersion(m))"
 		                        class="inline-flex items-center gap-2 rounded-md bg-indigo-50 px-2.5 py-1.5 text-xs text-indigo-700 transition-colors hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
 		                        @click="upgradeMachine(m.machineId)"
 		                        :disabled="machineUpgradeWorkingId === m.machineId || ['starting', 'updating', 'restarting'].includes(String(m.upgrade?.state ?? ''))"
-		                        title="Pull, rebuild, and restart this runner using its configured upgrade commands."
+		                        :title="machineHasUnknownVersion(m) ? 'Try a remote runner upgrade. If this legacy runner does not support it, update it manually.' : 'Pull, rebuild, and restart this runner using its configured upgrade commands.'"
 		                      >
 		                        <Loader2 v-if="machineUpgradeWorkingId === m.machineId" class="h-3.5 w-3.5 animate-spin" />
-		                        Upgrade
+		                        {{ machineHasUnknownVersion(m) ? 'Try upgrade' : 'Upgrade' }}
 		                      </button>
 		                      <button
 		                        v-if="machineIsOnline(m)"
