@@ -10,9 +10,52 @@ export function normalizeTerminalGeometry(cols, rows, {
   }
 }
 
+function toOptionalNumber(value) {
+  if (value === null || value === undefined || value === '') return null
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
+}
+
 export function appendWorkspaceTerminalOutput(current, chunk, maxChars = 400_000) {
   const next = `${String(current ?? '')}${String(chunk ?? '')}`
   return next.length <= maxChars ? next : next.slice(-maxChars)
+}
+
+export function buildWorkspaceTerminalExitNotice({ exitCode = null, signal = null } = {}) {
+  const safeExitCode = toOptionalNumber(exitCode)
+  const safeSignal = toOptionalNumber(signal)
+  return `\r\n[process exited${safeExitCode !== null ? ` with code ${safeExitCode}` : ''}${safeSignal !== null ? ` signal ${safeSignal}` : ''}]\r\n`
+}
+
+export function createWorkspaceTerminalSession({
+  terminalId = '',
+  machineId = '',
+  cwd = '',
+  shell = '',
+  cols = 80,
+  rows = 24,
+  outputText = '',
+  outputVersion = 0,
+  connected = false,
+  exitCode = null,
+  signal = null
+} = {}) {
+  return {
+    terminalId: String(terminalId ?? '').trim(),
+    machineId: String(machineId ?? '').trim(),
+    cwd: String(cwd ?? '').trim(),
+    shell: String(shell ?? '').trim(),
+    cols: Number(cols) || 80,
+    rows: Number(rows) || 24,
+    outputText: String(outputText ?? ''),
+    outputVersion: Number(outputVersion) || 0,
+    outputResetVersion: 1,
+    chunkText: '',
+    chunkVersion: 0,
+    connected: Boolean(connected),
+    exitCode: toOptionalNumber(exitCode),
+    signal: toOptionalNumber(signal)
+  }
 }
 
 export function workspaceTerminalSessionMatchesContext(session, context) {

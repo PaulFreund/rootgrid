@@ -122,6 +122,8 @@ import {
 } from './lib/sidebarResize.js'
 import {
   appendWorkspaceTerminalOutput,
+  buildWorkspaceTerminalExitNotice,
+  createWorkspaceTerminalSession,
   normalizeTerminalGeometry,
   workspaceTerminalSessionMatchesContext
 } from './lib/workspaceTerminal.js'
@@ -195,6 +197,8 @@ const connectionBanner = computed(() => {
 })
 const composerContextPopoverOpen = ref(false)
 const composerContextPopoverHover = ref(false)
+const composerMachinePopoverOpen = ref(false)
+const composerMachinePopoverHover = ref(false)
 
 // sessionId -> { events: [], diff: string, seen: Set<string> }
 const sessionStores = reactive(new Map())
@@ -1010,8 +1014,11 @@ function handleTerminalEnvelope(env) {
     const terminalId = String(env.payload?.terminalId ?? env.scope?.terminalId ?? '').trim()
     if (!terminalId || workspaceTerminalSession.value?.terminalId !== terminalId) return true
     const next = workspaceTerminalSession.value
-    next.outputText = appendWorkspaceTerminalOutput(next.outputText, env.payload?.data ?? '')
+    const chunk = String(env.payload?.data ?? '')
+    next.outputText = appendWorkspaceTerminalOutput(next.outputText, chunk)
     next.outputVersion = Number(next.outputVersion ?? 0) + 1
+    next.chunkText = chunk
+    next.chunkVersion = Number(next.chunkVersion ?? 0) + 1
     return true
   }
   if (env.type === 'terminal.pty.exit') {
@@ -1019,13 +1026,24 @@ function handleTerminalEnvelope(env) {
     if (!terminalId || workspaceTerminalSession.value?.terminalId !== terminalId) return true
     const next = workspaceTerminalSession.value
     next.connected = false
-    next.exitCode = Number.isFinite(Number(env.payload?.exitCode)) ? Number(env.payload.exitCode) : null
-    next.signal = Number.isFinite(Number(env.payload?.signal)) ? Number(env.payload.signal) : null
-    next.outputText = appendWorkspaceTerminalOutput(
-      next.outputText,
-      `\r\n[process exited${next.exitCode !== null ? ` with code ${next.exitCode}` : ''}${next.signal !== null ? ` signal ${next.signal}` : ''}]\r\n`
-    )
+    const exitCode = env.payload?.exitCode
+    const signal = env.payload?.signal
+    next.exitCode = (exitCode === null || exitCode === undefined || exitCode === '')
+      ? null
+      : (Number.isFinite(Number(exitCode)) ? Number(exitCode) : null)
+    next.signal = (signal === null || signal === undefined || signal === '')
+      ? null
+      : (Number.isFinite(Number(signal)) ? Number(signal) : null)
+    const exitNotice = Boolean(env.payload?.disconnected)
+      ? '\r\n[terminal disconnected]\r\n'
+      : buildWorkspaceTerminalExitNotice({
+          exitCode: next.exitCode,
+          signal: next.signal
+        })
+    next.outputText = appendWorkspaceTerminalOutput(next.outputText, exitNotice)
     next.outputVersion = Number(next.outputVersion ?? 0) + 1
+    next.chunkText = exitNotice
+    next.chunkVersion = Number(next.chunkVersion ?? 0) + 1
     return true
   }
   return false
@@ -1192,6 +1210,13 @@ const composerMachineLabel = computed(() => {
   const machine = defaultsSelectedMachine.value
   return String(machine?.machineName ?? '').trim() || 'Local'
 })
+const composerMachine = computed(() => {
+  if (selectedSession.value) {
+    const mid = String(selectedSession.value.machineId ?? '').trim()
+    return mid ? (machineRowsById.get(mid) ?? null) : null
+  }
+  return defaultsSelectedMachine.value ?? null
+})
 const composerMachineOnline = computed(() => {
   if (selectedSession.value) {
     const mid = String(selectedSession.value.machineId ?? '').trim()
@@ -1202,6 +1227,23 @@ const composerMachineOnline = computed(() => {
   if (!defaultsSelectedMachine.value) return true
   return machineIsOnline(defaultsSelectedMachine.value)
 })
+const composerMachineVersionMismatch = computed(() => machineHasVersionMismatch(composerMachine.value))
+const composerMachineRunnerVersion = computed(() => machineRootgridVersion(composerMachine.value) ?? 'unknown')
+const composerMachineUpgradeSupported = computed(() => machineSupportsWebUpgrade(composerMachine.value))
+const composerMachineUpgradeAvailable = computed(() => (
+  Boolean(composerMachine.value)
+  && composerMachineOnline.value
+  && composerMachineVersionMismatch.value
+  && composerMachineUpgradeSupported.value
+))
+const composerMachineUpgradeWorking = computed(() => {
+  const machineId = String(composerMachine.value?.machineId ?? '').trim()
+  return Boolean(machineId && machineUpgradeWorkingId.value === machineId)
+})
+const composerMachineUpgradePopoverVisible = computed(() => (
+  composerMachineVersionMismatch.value && (composerMachinePopoverOpen.value || composerMachinePopoverHover.value)
+))
+const composerMachineUpgradeStatus = computed(() => machineUpgradeStatusText(composerMachine.value))
 const composerProjectLabel = computed(() => {
   if (selectedSession.value) return sessionProject(selectedSession.value)
   const cwd = String(defaults.cwd ?? '').trim()
@@ -1236,6 +1278,25 @@ const workspaceTerminalOpening = computed(() => (
   && !workspaceTerminalError.value
   && (workspaceTerminalStarting.value || !workspaceTerminalSession.value?.terminalId)
 ))
+
+function handleComposerMachineMouseEnter() {
+  if (!composerMachineVersionMismatch.value) return
+  composerMachinePopoverHover.value = true
+}
+
+function toggleComposerMachinePopover() {
+  if (!composerMachineVersionMismatch.value) return
+  composerMachinePopoverOpen.value = !composerMachinePopoverOpen.value
+}
+
+watch(
+  () => [composerMachineVersionMismatch.value, String(composerMachine.value?.machineId ?? '')],
+  ([hasMismatch]) => {
+    if (hasMismatch) return
+    composerMachinePopoverOpen.value = false
+    composerMachinePopoverHover.value = false
+  }
+)
 
 const pinnedPlanSteps = computed(() => {
   const plan = selectedStore.value?.plan
@@ -1744,7 +1805,23 @@ async function closeWorkspaceTerminalSession() {
   }
 }
 
-async function ensureWorkspaceTerminal({ cols = 80, rows = 24 } = {}) {
+function buildWorkspaceTerminalSessionFromPayload(data, fallback = null) {
+  return createWorkspaceTerminalSession({
+    terminalId: data?.terminalId ?? fallback?.terminalId ?? '',
+    machineId: data?.machineId ?? fallback?.machineId ?? '',
+    cwd: data?.cwd ?? fallback?.cwd ?? '',
+    shell: data?.shell ?? fallback?.shell ?? '',
+    cols: data?.cols ?? fallback?.cols ?? 80,
+    rows: data?.rows ?? fallback?.rows ?? 24,
+    outputText: data?.outputText ?? fallback?.outputText ?? '',
+    outputVersion: data?.outputVersion ?? fallback?.outputVersion ?? 0,
+    connected: data?.connected ?? fallback?.connected ?? false,
+    exitCode: data?.exitCode ?? fallback?.exitCode ?? null,
+    signal: data?.signal ?? fallback?.signal ?? null
+  })
+}
+
+async function ensureWorkspaceTerminal({ cols = 80, rows = 24, reuse = true } = {}) {
   if (workspaceTerminalStarting.value) return false
   const ctx = resolveWorkspaceContext()
   if (!ctx) return false
@@ -1762,19 +1839,12 @@ async function ensureWorkspaceTerminal({ cols = 80, rows = 24 } = {}) {
   await closeWorkspaceTerminalSession()
 
   const size = normalizeTerminalGeometry(cols, rows)
-  const session = {
-    terminalId: '',
+  const session = createWorkspaceTerminalSession({
     machineId: ctx.machineId,
     cwd: ctx.cwd,
-    shell: '',
     cols: size.cols,
-    rows: size.rows,
-    outputText: '',
-    outputVersion: 0,
-    connected: false,
-    exitCode: null,
-    signal: null
-  }
+    rows: size.rows
+  })
   workspaceTerminalStarting.value = true
   workspaceTerminalSession.value = session
   try {
@@ -1784,7 +1854,8 @@ async function ensureWorkspaceTerminal({ cols = 80, rows = 24 } = {}) {
         ...(ctx.machineId ? { machineId: ctx.machineId } : {}),
         cwd: ctx.cwd,
         cols: size.cols,
-        rows: size.rows
+        rows: size.rows,
+        reuse
       })
     })
     const data = await res.json().catch(() => null)
@@ -1793,14 +1864,7 @@ async function ensureWorkspaceTerminal({ cols = 80, rows = 24 } = {}) {
       workspaceTerminalSession.value = null
       return false
     }
-    session.terminalId = String(data?.terminalId ?? '').trim()
-    session.machineId = String(data?.machineId ?? ctx.machineId).trim()
-    session.cwd = String(data?.cwd ?? ctx.cwd).trim()
-    session.shell = String(data?.shell ?? '').trim()
-    session.cols = Number(data?.cols) || size.cols
-    session.rows = Number(data?.rows) || size.rows
-    session.connected = true
-    session.outputVersion += 1
+    workspaceTerminalSession.value = buildWorkspaceTerminalSessionFromPayload(data, session)
     return true
   } catch (err) {
     workspaceTerminalError.value = String(err?.message ?? err)
@@ -1826,7 +1890,7 @@ function scheduleWorkspaceTerminalInputFlush() {
       })
     } catch {
     }
-  }, 16)
+  }, 8)
 }
 
 function sendWorkspaceTerminalInput(data) {
@@ -1855,7 +1919,7 @@ function queueWorkspaceTerminalResize({ cols, rows }) {
       })
     } catch {
     }
-  }, 80)
+  }, 40)
 }
 
 async function onWorkspaceTerminalReady(size) {
@@ -1867,7 +1931,8 @@ async function reopenWorkspaceTerminal() {
     workspaceTerminalSession.value?.cols,
     workspaceTerminalSession.value?.rows
   )
-  await ensureWorkspaceTerminal(size)
+  await closeWorkspaceTerminalSession()
+  await ensureWorkspaceTerminal({ ...size, reuse: false })
 }
 
 async function openWorkspaceTool(tab) {
@@ -2033,6 +2098,8 @@ onMounted(async () => {
     if (ev.key === 'Escape') {
       composerContextPopoverOpen.value = false
       composerContextPopoverHover.value = false
+      composerMachinePopoverOpen.value = false
+      composerMachinePopoverHover.value = false
       if (sessionSidebarDragging.value) stopSessionSidebarDrag()
       else if (workspacePaneOpen.value) closeWorkspacePane()
       if (sessionMenuId.value) closeSessionMenu()
@@ -2050,10 +2117,15 @@ onMounted(async () => {
     const target = ev?.target
     const inSessionMenu = Boolean(target?.closest?.('[data-session-menu-root="true"]'))
     const inContextPopover = Boolean(target?.closest?.('[data-context-usage-root="true"]'))
+    const inMachinePopover = Boolean(target?.closest?.('[data-machine-upgrade-root="true"]'))
     if (!inSessionMenu) closeSessionMenu()
     if (!inContextPopover) {
       composerContextPopoverOpen.value = false
       composerContextPopoverHover.value = false
+    }
+    if (!inMachinePopover) {
+      composerMachinePopoverOpen.value = false
+      composerMachinePopoverHover.value = false
     }
   }
   sessionMenuOutsideHandler = onSessionMenuOutside
@@ -3203,11 +3275,63 @@ watch(
               <div class="mt-2 flex flex-wrap items-center justify-between gap-2 px-1 text-[11px] text-slate-400">
                 <div class="flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
                   <div
-                    class="inline-flex max-w-full items-center gap-1.5 rounded-full border border-black/[0.06] px-2 py-0.5 text-[10px] text-slate-500 sm:px-2.5 sm:py-1 sm:text-[11px]"
-                    :title="composerMachineLabel"
+                    class="relative shrink-0"
+                    data-machine-upgrade-root="true"
+                    @mouseenter="handleComposerMachineMouseEnter"
+                    @mouseleave="composerMachinePopoverHover = false"
                   >
-                    <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="composerMachineOnline ? 'bg-emerald-500' : 'bg-slate-400'" />
-                    <span class="truncate">{{ composerMachineLabel }}</span>
+                    <button
+                      type="button"
+                      class="inline-flex max-w-full items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] transition-colors sm:px-2.5 sm:py-1 sm:text-[11px]"
+                      :class="composerMachineVersionMismatch ? 'border-red-200 bg-red-50 text-red-700 hover:bg-red-100' : 'border-black/[0.06] bg-transparent text-slate-500'"
+                      :title="composerMachineVersionMismatch ? `Version mismatch: runner ${composerMachineRunnerVersion} · host ${appSettings.appVersion || 'unknown'}` : composerMachineLabel"
+                      @click.stop="toggleComposerMachinePopover"
+                    >
+                      <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="composerMachineOnline ? 'bg-emerald-500' : 'bg-slate-400'" />
+                      <span class="truncate">{{ composerMachineLabel }}</span>
+                    </button>
+
+                    <div
+                      v-if="composerMachineUpgradePopoverVisible"
+                      class="absolute bottom-full left-0 z-30 mb-2 w-[248px] rounded-2xl border border-red-200 bg-white px-3 py-3 text-left shadow-[0_12px_30px_rgba(15,23,42,0.14)]"
+                    >
+                      <div class="text-[11px] font-semibold text-red-700">Runner upgrade available</div>
+                      <div class="mt-1 text-[11px] text-slate-600">
+                        <span class="font-medium text-slate-700">Runner:</span>
+                        <span class="font-mono text-slate-700">{{ composerMachineRunnerVersion }}</span>
+                      </div>
+                      <div class="mt-1 text-[11px] text-slate-600">
+                        <span class="font-medium text-slate-700">Host:</span>
+                        <span class="font-mono text-slate-700">{{ appSettings.appVersion || 'unknown' }}</span>
+                      </div>
+                      <div
+                        v-if="composerMachineUpgradeStatus"
+                        class="mt-2 text-[11px]"
+                        :class="composerMachine?.upgrade?.state === 'failed' ? 'text-red-600' : 'text-slate-500'"
+                      >
+                        {{ composerMachineUpgradeStatus }}
+                      </div>
+                      <div v-else-if="composerMachineUpgradeAvailable" class="mt-2 text-[11px] text-slate-500">
+                        Upgrade this runner from the updated host.
+                      </div>
+                      <div v-else-if="!composerMachineOnline" class="mt-2 text-[11px] text-slate-500">
+                        Reconnect this runner to upgrade it from the web UI.
+                      </div>
+                      <div v-else class="mt-2 text-[11px] text-slate-500">
+                        Remote upgrade is unavailable for this runner.
+                      </div>
+
+                      <button
+                        v-if="composerMachineUpgradeAvailable"
+                        type="button"
+                        class="mt-3 inline-flex items-center gap-2 rounded-full bg-red-600 px-3 py-1.5 text-[11px] font-medium text-white transition-colors hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-40"
+                        :disabled="composerMachineUpgradeWorking || ['starting', 'receiving', 'installing', 'updating', 'restarting'].includes(String(composerMachine?.upgrade?.state ?? ''))"
+                        @click.stop="composerMachine ? upgradeMachine(composerMachine.machineId) : null"
+                      >
+                        <Loader2 v-if="composerMachineUpgradeWorking" class="h-3.5 w-3.5 animate-spin" />
+                        Upgrade runner
+                      </button>
+                    </div>
                   </div>
 
                   <select

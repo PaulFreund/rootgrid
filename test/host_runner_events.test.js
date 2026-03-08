@@ -287,7 +287,10 @@ test('terminal PTY replies resolve start requests and forward output and exit ov
       rows: 40
     }
   ]])
-  assert.equal(terminalSessions.has('terminal-1'), false)
+  assert.equal(terminalSessions.has('terminal-1'), true)
+  assert.equal(terminalSessions.get('terminal-1')?.connected, false)
+  assert.match(terminalSessions.get('terminal-1')?.outputText ?? '', /hello/)
+  assert.match(terminalSessions.get('terminal-1')?.outputText ?? '', /\[process exited/)
   assert.equal(sseEvents.length, 2)
   assert.equal(sseEvents[0]?.type, 'terminal.pty.output')
   assert.deepEqual(sseEvents[0]?.scope, { machineId: 'machine-1', terminalId: 'terminal-1' })

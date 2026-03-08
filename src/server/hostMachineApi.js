@@ -1,6 +1,12 @@
 import crypto from 'node:crypto'
 import { rm } from 'node:fs/promises'
 
+import {
+  findReusableTerminalSession,
+  listMatchingTerminalIds,
+  serializeTerminalSession
+} from './terminalSessionState.js'
+
 export function createHostMachineApi({
   auth,
   store,
@@ -272,6 +278,7 @@ export function createHostMachineApi({
         const body = await readJsonBody(req)
         const preferredMachineId = body?.machineId ?? null
         const cwd = body?.cwd
+        const reuse = body?.reuse !== false
         if (!cwd || typeof cwd !== 'string') {
           json(res, 400, { error: 'cwd is required' })
           return true
@@ -281,6 +288,38 @@ export function createHostMachineApi({
           json(res, 503, { error: 'no runner connected' })
           return true
         }
+        if (reuse) {
+          const existing = findReusableTerminalSession(terminalSessions, { machineId, cwd })
+          if (existing) {
+            const cols = Number(body?.cols) || existing.cols || 80
+            const rows = Number(body?.rows) || existing.rows || 24
+            existing.cols = cols
+            existing.rows = rows
+            existing.updatedAtMs = Date.now()
+            if (existing.connected) {
+              try {
+                runnerWs.sendToMachine(machineId, makeEnvelope({
+                  type: 'terminal.pty.resize',
+                  scope: { machineId },
+                  payload: {
+                    terminalId: existing.terminalId,
+                    cols,
+                    rows
+                  }
+                }))
+              } catch {
+              }
+            }
+            json(res, 200, serializeTerminalSession(existing, { reused: true }))
+            return true
+          }
+        } else {
+          for (const terminalId of listMatchingTerminalIds(terminalSessions, { machineId, cwd })) {
+            const existing = terminalSessions.get(terminalId)
+            if (existing?.connected) continue
+            terminalSessions.delete(terminalId)
+          }
+        }
         try {
           const out = await terminalPtyStartOnRunner({
             machineId,
@@ -288,7 +327,18 @@ export function createHostMachineApi({
             cols: Number(body?.cols) || 80,
             rows: Number(body?.rows) || 24
           })
-          json(res, 200, { machineId, ...out })
+          const record = terminalSessions.get(String(out?.terminalId ?? '').trim())
+          const fallbackCols = Number(body?.cols) || 80
+          const fallbackRows = Number(body?.rows) || 24
+          json(res, 200, serializeTerminalSession(record ?? {
+            terminalId: out?.terminalId,
+            machineId,
+            cwd: out?.cwd ?? cwd,
+            shell: out?.shell ?? '',
+            cols: out?.cols ?? fallbackCols,
+            rows: out?.rows ?? fallbackRows,
+            connected: true
+          }, { reused: false }))
         } catch (err) {
           const code = Number(err?.statusCode) || 500
           json(res, code, { error: String(err?.message ?? err) })
@@ -302,6 +352,10 @@ export function createHostMachineApi({
         const terminal = terminalSessions.get(terminalId)
         if (!terminal) {
           json(res, 404, { error: 'terminal not found' })
+          return true
+        }
+        if (!terminal.connected) {
+          json(res, 409, { error: 'terminal not connected' })
           return true
         }
         if (!runnerWs.listConnectedMachineIds().includes(terminal.machineId)) {
@@ -331,11 +385,18 @@ export function createHostMachineApi({
           json(res, 404, { error: 'terminal not found' })
           return true
         }
+        const body = await readJsonBody(req)
+        if (!terminal.connected) {
+          terminal.cols = Number(body?.cols) || terminal.cols || 80
+          terminal.rows = Number(body?.rows) || terminal.rows || 24
+          terminal.updatedAtMs = Date.now()
+          json(res, 202, { ok: true, terminalId, connected: false })
+          return true
+        }
         if (!runnerWs.listConnectedMachineIds().includes(terminal.machineId)) {
           json(res, 503, { error: 'runner not connected' })
           return true
         }
-        const body = await readJsonBody(req)
         const ok = runnerWs.sendToMachine(terminal.machineId, makeEnvelope({
           type: 'terminal.pty.resize',
           scope: { machineId: terminal.machineId },

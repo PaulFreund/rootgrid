@@ -9,9 +9,21 @@ const props = defineProps({
     type: String,
     default: ''
   },
-  outputText: {
+  snapshotText: {
     type: String,
     default: ''
+  },
+  snapshotVersion: {
+    type: Number,
+    default: 0
+  },
+  chunkText: {
+    type: String,
+    default: ''
+  },
+  chunkVersion: {
+    type: Number,
+    default: 0
   },
   connected: {
     type: Boolean,
@@ -43,6 +55,14 @@ function applyOutputTextNow(text, { reset = false } = {}) {
   const delta = nextText.slice(renderedText.length)
   if (delta) terminal.write(delta)
   renderedText = nextText
+}
+
+function appendChunkNow(chunk) {
+  if (!terminal) return
+  const text = String(chunk ?? '')
+  if (!text) return
+  terminal.write(text)
+  renderedText = `${renderedText}${text}`
 }
 
 function flushPendingOutput() {
@@ -127,7 +147,7 @@ async function mountTerminal() {
     cols: terminal.cols,
     rows: terminal.rows
   })
-  applyOutputText(props.outputText, { reset: true, immediate: true })
+  applyOutputText(props.snapshotText, { reset: true, immediate: true })
 
   if (typeof ResizeObserver !== 'undefined') {
     resizeObserver = new ResizeObserver(() => {
@@ -168,13 +188,13 @@ onBeforeUnmount(() => {
   disposeTerminal()
 })
 
-watch(() => props.outputText, (value) => {
-  applyOutputText(value)
+watch(() => [props.sessionKey, props.snapshotVersion], () => {
+  applyOutputText(props.snapshotText, { reset: true, immediate: true })
+  fitTerminal()
 })
 
-watch(() => props.sessionKey, () => {
-  applyOutputText(props.outputText, { reset: true, immediate: true })
-  fitTerminal()
+watch(() => props.chunkVersion, () => {
+  appendChunkNow(props.chunkText)
 })
 
 watch(() => props.connected, () => {

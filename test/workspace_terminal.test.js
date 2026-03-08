@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 
 import {
   appendWorkspaceTerminalOutput,
+  buildWorkspaceTerminalExitNotice,
+  createWorkspaceTerminalSession,
   normalizeTerminalGeometry,
   workspaceTerminalSessionMatchesContext
 } from '../web/src/lib/workspaceTerminal.js'
@@ -16,6 +18,40 @@ test('normalizeTerminalGeometry clamps invalid values to terminal-safe bounds', 
 test('appendWorkspaceTerminalOutput appends chunks and keeps the tail when capped', () => {
   assert.equal(appendWorkspaceTerminalOutput('hello', ' world'), 'hello world')
   assert.equal(appendWorkspaceTerminalOutput('abcdef', 'ghij', 8), 'cdefghij')
+})
+
+test('workspace terminal helpers build exit notices and normalized session records', () => {
+  assert.equal(
+    buildWorkspaceTerminalExitNotice({ exitCode: 7, signal: null }),
+    '\r\n[process exited with code 7]\r\n'
+  )
+
+  assert.deepEqual(createWorkspaceTerminalSession({
+    terminalId: 'term-1',
+    machineId: 'machine-1',
+    cwd: '/tmp/workspace',
+    shell: '/bin/bash',
+    cols: 120,
+    rows: 40,
+    outputText: 'hello',
+    outputVersion: 3,
+    connected: true
+  }), {
+    terminalId: 'term-1',
+    machineId: 'machine-1',
+    cwd: '/tmp/workspace',
+    shell: '/bin/bash',
+    cols: 120,
+    rows: 40,
+    outputText: 'hello',
+    outputVersion: 3,
+    outputResetVersion: 1,
+    chunkText: '',
+    chunkVersion: 0,
+    connected: true,
+    exitCode: null,
+    signal: null
+  })
 })
 
 test('workspaceTerminalSessionMatchesContext requires matching machine and cwd', () => {

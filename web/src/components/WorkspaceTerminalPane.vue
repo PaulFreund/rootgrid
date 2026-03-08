@@ -71,7 +71,10 @@ const openLabel = computed(() => (props.error ? 'Retry' : 'New shell'))
     <div class="relative min-h-0 flex-1 overflow-hidden rounded-[24px] bg-white">
       <XtermTerminal
         :session-key="session?.terminalId ?? ''"
-        :output-text="session?.outputText ?? ''"
+        :snapshot-text="session?.outputText ?? ''"
+        :snapshot-version="session?.outputResetVersion ?? 0"
+        :chunk-text="session?.chunkText ?? ''"
+        :chunk-version="session?.chunkVersion ?? 0"
         :connected="Boolean(session?.connected)"
         @ready="$emit('ready', $event)"
         @input="$emit('input', $event)"

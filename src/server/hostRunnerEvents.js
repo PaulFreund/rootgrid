@@ -1,3 +1,16 @@
+import {
+  appendTerminalOutputRecord,
+  applyTerminalExit,
+  applyTerminalStart,
+  createTerminalSessionRecord
+} from './terminalSessionState.js'
+
+function toOptionalNumber(value) {
+  if (value === null || value === undefined || value === '') return null
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
+}
+
 export function buildSessionLabel({ sessionId = null, session = null, cwd = null } = {}) {
   const project = session?.projectLabel ?? null
   if (typeof project === 'string' && project.trim()) return project.trim()
@@ -168,15 +181,15 @@ export function createHostRunnerEventHandlers({
         } else {
           const terminalId = String(msg.payload?.terminalId ?? '').trim()
           if (terminalId) {
-            terminalSessions.set(terminalId, {
+            const current = terminalSessions.get(terminalId) ?? null
+            terminalSessions.set(terminalId, applyTerminalStart(current, {
               terminalId,
               machineId,
-              cwd: String(msg.payload?.cwd ?? '').trim(),
-              shell: String(msg.payload?.shell ?? '').trim(),
-              cols: Number(msg.payload?.cols ?? 0) || 0,
-              rows: Number(msg.payload?.rows ?? 0) || 0,
-              createdAtMs: Date.now()
-            })
+              cwd: msg.payload?.cwd,
+              shell: msg.payload?.shell,
+              cols: msg.payload?.cols,
+              rows: msg.payload?.rows
+            }))
           }
           pendingTerminalStarts.resolve(requestId, msg.payload)
         }
@@ -185,7 +198,13 @@ export function createHostRunnerEventHandlers({
 
       if (msg?.type === 'terminal.pty.output') {
         const terminalId = String(msg.payload?.terminalId ?? '').trim()
-        if (!terminalId || !terminalSessions.has(terminalId)) return
+        if (!terminalId) return
+        const current = terminalSessions.get(terminalId) ?? createTerminalSessionRecord({
+          terminalId,
+          machineId,
+          connected: true
+        })
+        terminalSessions.set(terminalId, appendTerminalOutputRecord(current, msg.payload?.data ?? ''))
         sse.send(makeEnvelope({
           type: 'terminal.pty.output',
           scope: { machineId, terminalId },
@@ -201,15 +220,22 @@ export function createHostRunnerEventHandlers({
       if (msg?.type === 'terminal.pty.exit') {
         const terminalId = String(msg.payload?.terminalId ?? '').trim()
         if (!terminalId) return
-        terminalSessions.delete(terminalId)
+        const current = terminalSessions.get(terminalId) ?? createTerminalSessionRecord({
+          terminalId,
+          machineId
+        })
+        terminalSessions.set(terminalId, applyTerminalExit(current, {
+          exitCode: msg.payload?.exitCode,
+          signal: msg.payload?.signal
+        }))
         sse.send(makeEnvelope({
           type: 'terminal.pty.exit',
           scope: { machineId, terminalId },
           payload: {
             machineId,
             terminalId,
-            exitCode: Number.isFinite(Number(msg.payload?.exitCode)) ? Number(msg.payload.exitCode) : null,
-            signal: Number.isFinite(Number(msg.payload?.signal)) ? Number(msg.payload.signal) : null
+            exitCode: toOptionalNumber(msg.payload?.exitCode),
+            signal: toOptionalNumber(msg.payload?.signal)
           }
         }), { recordHistory: false })
         return
@@ -398,7 +424,9 @@ export function createHostRunnerEventHandlers({
       pendingIdeStarts.rejectByMachine(machineId, new Error('runner disconnected while starting ide session'))
       for (const [terminalId, terminal] of terminalSessions.entries()) {
         if (terminal?.machineId !== machineId) continue
-        terminalSessions.delete(terminalId)
+        terminalSessions.set(terminalId, applyTerminalExit(terminal, {
+          disconnected: true
+        }))
         sse.send(makeEnvelope({
           type: 'terminal.pty.exit',
           scope: { machineId, terminalId },
@@ -406,7 +434,8 @@ export function createHostRunnerEventHandlers({
             machineId,
             terminalId,
             exitCode: null,
-            signal: null
+            signal: null,
+            disconnected: true
           }
         }), { recordHistory: false })
       }

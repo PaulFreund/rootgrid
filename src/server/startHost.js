@@ -46,7 +46,7 @@ export async function startHost({ config }) {
 
   const approvals = new Map() // approvalId -> { machineId, sessionId }
   const ideSessions = new Map() // ideId -> { machineId, cwd, port, basePath }
-  const terminalSessions = new Map() // terminalId -> { terminalId, machineId, cwd, shell, cols, rows, createdAtMs }
+  const terminalSessions = new Map() // terminalId -> { terminalId, machineId, cwd, shell, cols, rows, connected, outputText, outputVersion, createdAtMs, updatedAtMs }
   const pendingIdeStarts = createPendingRequestBook()
   const pendingMachineUpgrades = createPendingRequestBook()
   const pendingMachineUpgradeTransfers = createPendingRequestBook()
