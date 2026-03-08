@@ -1,11 +1,13 @@
 import crypto from 'node:crypto'
 
 import { JsonRpcStdioClient } from './JsonRpcStdioClient.js'
+import { JsonRpcDebugCapture } from './JsonRpcDebugCapture.js'
 import {
   approvalPolicyCandidates,
   buildResumeThreadAttempts,
   buildStartThreadAttempts,
   buildStartTurnAttempts,
+  normalizeAgentMessagePhase,
   normalizeItemType,
   reasoningEffortCandidates,
   safeString,
@@ -38,10 +40,11 @@ export class CodexAppServerSession {
    *   sessionId: string,
    *   cwd: string,
    *   options: any,
+   *   debug?: any,
    *   emit: (type: string, payload: any) => void,
    * }} opts
    */
-  constructor({ sessionId, cwd, options, emit }) {
+  constructor({ sessionId, cwd, options, debug = null, emit }) {
     this.sessionId = sessionId
     this.cwd = cwd
     this.options = options ?? null
@@ -52,6 +55,7 @@ export class CodexAppServerSession {
     this.activeTurnId = null
     this.started = false
     this.turnText = ''
+    this.turnCommentaryText = ''
     this.turnTextMax = 8_000
 
     // Dedupe guards. Some Codex app-server builds emit both a wrapped event
@@ -66,7 +70,7 @@ export class CodexAppServerSession {
 
     /** @type {Map<string, { resolve: (v:any)=>void, reject:(e:any)=>void }>} */
     this.pendingApprovals = new Map()
-    /** @type {Map<string, { sawDelta: boolean }>} */
+    /** @type {Map<string, { sawDelta: boolean, phase?: string|null }>} */
     this.itemState = new Map()
     /** @type {Map<string, string>} */
     this.lastDeltaByKey = new Map()
@@ -91,6 +95,15 @@ export class CodexAppServerSession {
       args: ['app-server'],
       cwd: this.cwd,
       env: process.env,
+      debugCapture: (debug?.codexRawCapture?.enabled)
+        ? new JsonRpcDebugCapture({
+          sessionId: this.sessionId,
+          cwd: this.cwd,
+          command: 'codex',
+          args: ['app-server'],
+          dir: debug?.codexRawCapture?.dir ?? null
+        })
+        : null,
       onNotification: (msg) => this.#onNotification(msg),
       onRequest: (msg) => this.#onRequest(msg),
       onStderr: (chunk) => {
@@ -113,6 +126,7 @@ export class CodexAppServerSession {
 
   #resetTurnScopedState() {
     this.turnText = ''
+    this.turnCommentaryText = ''
     this.lastNormalizedChunk = { text: null, tsMs: 0 }
     this.lastReasoningChunk = { text: null, tsMs: 0 }
     try { this.seenToolStarted.clear() } catch { }
@@ -137,31 +151,40 @@ export class CodexAppServerSession {
     }
   }
 
-  #appendTurnText(chunk) {
+  #appendTurnText(chunk, { phase = null } = {}) {
     if (!chunk) return
-    this.turnText += String(chunk)
-    if (this.turnText.length > this.turnTextMax) {
-      this.turnText = this.turnText.slice(this.turnText.length - this.turnTextMax)
+    const next = String(chunk)
+    const target = normalizeAgentMessagePhase(phase) === 'commentary'
+      ? 'turnCommentaryText'
+      : 'turnText'
+    this[target] += next
+    if (this[target].length > this.turnTextMax) {
+      this[target] = this[target].slice(this[target].length - this.turnTextMax)
     }
   }
 
   #turnPreview() {
-    const t = String(this.turnText ?? '').replace(/\s+/g, ' ').trim()
+    const source = String(this.turnText ?? '').trim()
+      ? this.turnText
+      : this.turnCommentaryText
+    const t = String(source ?? '').replace(/\s+/g, ' ').trim()
     if (!t) return null
     return t.length > 200 ? `${t.slice(0, 197)}…` : t
   }
 
-  #bufferOutput({ stream, text, itemId = null }) {
+  #bufferOutput({ stream, text, itemId = null, phase = null }) {
     const body = String(text ?? '')
     if (!body) return
 
     const sid = (typeof itemId === 'string' && itemId.trim()) ? itemId.trim() : null
-    const key = `${String(stream ?? 'normalized')}:${sid ?? ''}`
+    const normalizedPhase = normalizeAgentMessagePhase(phase)
+    const key = `${String(stream ?? 'normalized')}:${sid ?? ''}:${normalizedPhase ?? ''}`
     let entry = this.outputBuffers.get(key)
     if (!entry) {
       entry = {
         stream: String(stream ?? 'normalized'),
         itemId: sid,
+        phase: normalizedPhase,
         text: '',
         timer: null
       }
@@ -192,6 +215,7 @@ export class CodexAppServerSession {
       seq: this.nextSeq(),
       stream: entry.stream,
       text: entry.text,
+      ...(entry.phase ? { phase: entry.phase } : {}),
       ...(entry.itemId ? { itemId: entry.itemId } : {})
     })
   }
@@ -247,6 +271,18 @@ export class CodexAppServerSession {
     }
     this.lastReasoningChunk = { text: t, tsMs: now }
     return false
+  }
+
+  #rememberItemPhase(itemId, phase) {
+    const key = safeString(itemId)
+    const normalizedPhase = normalizeAgentMessagePhase(phase)
+    if (!key || !normalizedPhase) return
+    const prev = this.itemState.get(key) ?? { sawDelta: false }
+    this.itemState.set(key, { ...prev, phase: normalizedPhase })
+  }
+
+  #agentMessageStreamForPhase(phase) {
+    return normalizeAgentMessagePhase(phase) === 'commentary' ? 'commentary' : 'normalized'
   }
 
   nextSeq() {
@@ -598,13 +634,15 @@ export class CodexAppServerSession {
       }
       const text = tryExtractDeltaText(params)
       if (text) {
+        const phase = normalizeAgentMessagePhase(params?.phase ?? this.itemState.get(itemId)?.phase ?? null)
+        const stream = this.#agentMessageStreamForPhase(phase)
         const key = `agent:${itemId ?? ''}`
         if (this.lastDeltaByKey.get(key) === text) return
         this.lastDeltaByKey.set(key, text)
-        if (this.#shouldDropNormalizedChunk(text)) return
+        if (stream === 'normalized' && this.#shouldDropNormalizedChunk(text)) return
 
-        this.#appendTurnText(text)
-        this.#bufferOutput({ stream: 'normalized', text })
+        this.#appendTurnText(text, { phase })
+        this.#bufferOutput({ stream, text, phase })
       }
       return
     }
@@ -699,9 +737,15 @@ export class CodexAppServerSession {
     }
 
     if (method === 'item/started') {
+      const item = params?.item ?? null
+      const itemId = item?.id ?? params?.itemId ?? null
+      const type = normalizeItemType(item?.type ?? null)
+      if (type === 'agentmessage') {
+        this.#rememberItemPhase(itemId, item?.phase ?? params?.phase ?? null)
+      }
       const started = buildToolStartedEvent({
         sessionId: this.sessionId,
-        item: params?.item ?? null
+        item
       })
       if (!started) return
       if (this.seenToolStarted.has(started.dedupeKey)) return
@@ -715,14 +759,17 @@ export class CodexAppServerSession {
       const itemId = item?.id ?? params?.itemId ?? null
       const typeRaw = item?.type ?? null
       const type = normalizeItemType(typeRaw)
+      if (type === 'agentmessage') this.#rememberItemPhase(itemId, item?.phase ?? params?.phase ?? null)
       if (type === 'agentmessage') {
         const sawDelta = itemId ? (this.itemState.get(itemId)?.sawDelta ?? false) : false
         if (!sawDelta) {
           const text = tryExtractAgentMessageText(item)
           if (text) {
-            if (this.#shouldDropNormalizedChunk(text)) return
-            this.#appendTurnText(text)
-            this.#bufferOutput({ stream: 'normalized', text })
+            const phase = normalizeAgentMessagePhase(item?.phase ?? this.itemState.get(itemId)?.phase ?? null)
+            const stream = this.#agentMessageStreamForPhase(phase)
+            if (stream === 'normalized' && this.#shouldDropNormalizedChunk(text)) return
+            this.#appendTurnText(text, { phase })
+            this.#bufferOutput({ stream, text, phase })
           }
         }
       }

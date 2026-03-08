@@ -28,7 +28,7 @@ function buildStore() {
   return store
 }
 
-test('listSessionEventsPage summary mode keeps normalized and unattributed stderr/stdout only', () => {
+test('listSessionEventsPage summary mode keeps normalized/commentary and unattributed stderr/stdout only', () => {
   const store = buildStore()
 
   store.appendEvent({
@@ -50,25 +50,32 @@ test('listSessionEventsPage summary mode keeps normalized and unattributed stder
     sessionId: 's-1',
     tsMs: 3,
     type: 'session.output',
-    payload: { stream: 'reasoning', text: 'hidden reasoning' }
+    payload: { stream: 'commentary', text: 'thinking aloud' }
   })
   store.appendEvent({
     eventId: 'e-4',
     sessionId: 's-1',
     tsMs: 4,
     type: 'session.output',
-    payload: { stream: 'stdout', itemId: 'tool-1', text: 'hidden tool output' }
+    payload: { stream: 'reasoning', text: 'hidden reasoning' }
   })
   store.appendEvent({
     eventId: 'e-5',
     sessionId: 's-1',
     tsMs: 5,
     type: 'session.output',
+    payload: { stream: 'stdout', itemId: 'tool-1', text: 'hidden tool output' }
+  })
+  store.appendEvent({
+    eventId: 'e-6',
+    sessionId: 's-1',
+    tsMs: 6,
+    type: 'session.output',
     payload: { stream: 'stderr', text: 'visible error' }
   })
 
   const summary = listSessionEventsPage(store.db, 's-1', { mode: 'summary', limit: 20 })
-  assert.deepEqual(summary.events.map((event) => event.eventId), ['e-1', 'e-2', 'e-5'])
+  assert.deepEqual(summary.events.map((event) => event.eventId), ['e-1', 'e-2', 'e-3', 'e-6'])
 })
 
 test('turn reasoning helpers resolve range, dedupe chunks, and attach section ordering', () => {

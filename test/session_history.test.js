@@ -46,6 +46,15 @@ test('session output events coalesce safely for consecutive append-only text del
   assert.equal(first.payload.text, 'hello')
   assert.equal(first.seq, 2)
   assert.equal(first.tsMs, 2)
+  assert.equal(canCoalesceSessionEvent({
+    eventId: 'e-3',
+    type: 'session.output',
+    payload: { stream: 'commentary', text: 'thin' }
+  }, {
+    eventId: 'e-4',
+    type: 'session.output',
+    payload: { stream: 'commentary', text: 'king' }
+  }), true)
   assert.equal(canCoalesceSessionEvent(first, {
     eventId: 'e-3',
     type: 'session.output',

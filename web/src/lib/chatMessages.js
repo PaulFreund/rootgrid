@@ -3,6 +3,7 @@ import { getTurnReasoningState } from './sessionHistory.js'
 const DIFF_CACHE_MAX = 64
 const COMMAND_ACTIONS_CACHE = new WeakMap()
 const DIFF_CACHE = new Map()
+const DIFF_SUMMARY_CACHE = new Map()
 const CHAT_MESSAGES_CACHE = new WeakMap()
 
 function cacheDiff(key, value) {
@@ -247,10 +248,12 @@ function exploreCountKey(action) {
   return null
 }
 
-function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, commandCalls, reasoningChunks }) {
+function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, toolCalls, reasoningChunks, commentaryChunks, diffEvents }) {
   const calls = Array.isArray(exploreCalls) ? exploreCalls : []
-  const commands = Array.isArray(commandCalls) ? commandCalls : []
+  const tools = Array.isArray(toolCalls) ? toolCalls : []
   const rawReasoningChunks = Array.isArray(reasoningChunks) ? reasoningChunks : []
+  const rawCommentaryChunks = Array.isArray(commentaryChunks) ? commentaryChunks : []
+  const diffs = Array.isArray(diffEvents) ? diffEvents : []
   const reasoningLoaded = Boolean(reasoningState?.loaded)
   const reasoningSections = rawReasoningChunks.length
     ? []
@@ -288,6 +291,21 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, commandCall
     })
   }
 
+  for (const chunk of rawCommentaryChunks) {
+    if (!chunk) continue
+    const text = String(chunk.text ?? '')
+    if (!text.trim()) continue
+    const seq = Number(chunk.seq ?? NaN)
+    const tsMs = Number(chunk.tsMs ?? NaN)
+    items.push({
+      kind: 'commentaryChunk',
+      id: `commentary-live-${String(chunk.id ?? items.length + 1)}`,
+      seq: Number.isFinite(seq) ? seq : null,
+      tsMs: Number.isFinite(tsMs) ? tsMs : null,
+      text
+    })
+  }
+
   for (const call of calls) {
     if (!call) continue
     const actions = Array.isArray(call.actions) ? call.actions : []
@@ -304,16 +322,32 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, commandCall
     })
   }
 
-  for (const call of commands) {
+  for (const call of tools) {
     if (!call || typeof call !== 'object') continue
     const seq = Number(call.seq ?? NaN)
     const tsMs = Number(call.tsMs ?? NaN)
     items.push({
-      kind: 'command',
-      id: `command-${String(call.itemId ?? items.length + 1)}`,
+      kind: 'tool',
+      id: `tool-${String(call.itemId ?? items.length + 1)}`,
       seq: Number.isFinite(seq) ? seq : null,
       tsMs: Number.isFinite(tsMs) ? tsMs : null,
       call
+    })
+  }
+
+  for (const diff of diffs) {
+    if (!diff || typeof diff !== 'object') continue
+    const raw = String(diff.raw ?? '')
+    if (!raw.trim()) continue
+    const seq = Number(diff.seq ?? NaN)
+    const tsMs = Number(diff.tsMs ?? NaN)
+    items.push({
+      kind: 'diff',
+      id: String(diff.eventId ?? `diff-${items.length + 1}`),
+      seq: Number.isFinite(seq) ? seq : null,
+      tsMs: Number.isFinite(tsMs) ? tsMs : null,
+      raw,
+      expanded: Boolean(diff.expanded)
     })
   }
 
@@ -344,6 +378,10 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, commandCall
       prev.text += item.text
       continue
     }
+    if (prev?.kind === 'commentaryChunk' && item.kind === 'commentaryChunk') {
+      prev.text += item.text
+      continue
+    }
     if (readsOnly(prev) && readsOnly(item)) {
       prev.actions.push(...item.actions)
       continue
@@ -368,23 +406,41 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, commandCall
       })
       continue
     }
+    if (item.kind === 'commentaryChunk') {
+      out.push({
+        kind: 'commentaryText',
+        id: item.id,
+        text: item.text
+      })
+      continue
+    }
     if (item.kind === 'reasoning') {
       out.push({ kind: 'reasoning', id: item.id, section: item.section })
       continue
     }
-    if (item.kind === 'command') {
+    if (item.kind === 'tool') {
       out.push({
-        kind: 'command',
+        kind: 'tool',
         id: item.id,
         itemId: item.call.itemId,
         tool: item.call.tool,
         command: item.call.command,
         commandActions: item.call.commandActions,
         cwd: item.call.cwd,
+        changes: item.call.changes,
         status: item.call.status,
         exitCode: item.call.exitCode,
         expanded: item.call.expanded,
         output: item.call.output
+      })
+      continue
+    }
+    if (item.kind === 'diff') {
+      out.push({
+        kind: 'diff',
+        id: item.id,
+        raw: item.raw,
+        expanded: item.expanded
       })
       continue
     }
@@ -621,6 +677,58 @@ export function parseUnifiedDiff(diffText, { maxBytes = 2_000_000, maxLines = 50
   return cacheDiff(key, files)
 }
 
+export function summarizeUnifiedDiff(diffText, { maxBytes = 2_000_000, maxLines = 50_000 } = {}) {
+  const key = String(diffText ?? '')
+  const cached = DIFF_SUMMARY_CACHE.get(key)
+  if (cached) {
+    DIFF_SUMMARY_CACHE.delete(key)
+    DIFF_SUMMARY_CACHE.set(key, cached)
+    return cached
+  }
+
+  const text = key.replace(/\r/g, '')
+  if (!text.trim()) {
+    const empty = { files: 0, added: 0, removed: 0, paths: [] }
+    DIFF_SUMMARY_CACHE.set(key, empty)
+    return empty
+  }
+
+  const limitedText = text.length > maxBytes ? text.slice(0, maxBytes) : text
+  const lines = limitedText.split('\n')
+  const limited = (lines.length > maxLines) ? lines.slice(0, maxLines) : lines
+
+  const paths = []
+  const seenPaths = new Set()
+  let added = 0
+  let removed = 0
+
+  for (const line of limited) {
+    if (line.startsWith('+++ ')) {
+      const path = normalizeDiffPath(line.slice(4))
+      if (path && !seenPaths.has(path)) {
+        seenPaths.add(path)
+        paths.push(path)
+      }
+      continue
+    }
+    if (line.startsWith('+') && !line.startsWith('+++')) {
+      added += 1
+      continue
+    }
+    if (line.startsWith('-') && !line.startsWith('---')) {
+      removed += 1
+    }
+  }
+
+  const summary = { files: paths.length, added, removed, paths }
+  DIFF_SUMMARY_CACHE.set(key, summary)
+  if (DIFF_SUMMARY_CACHE.size > DIFF_CACHE_MAX) {
+    const oldest = DIFF_SUMMARY_CACHE.keys().next().value
+    if (oldest !== undefined) DIFF_SUMMARY_CACHE.delete(oldest)
+  }
+  return summary
+}
+
 export function diffStepSelectedPath(stepId, files, store) {
   const key = String(stepId ?? '').trim()
   const list = Array.isArray(files) ? files : []
@@ -671,7 +779,7 @@ function buildChatMessagesSlow(store) {
   let activeTurnId = null
   const turnStateById = new Map()
   const exploreTurnByItemId = new Map()
-  const commandTurnByItemId = new Map()
+  const backgroundToolTurnByItemId = new Map()
 
   const getOrCreateTurnState = (turnId) => {
     const key = String(turnId ?? '').trim()
@@ -702,9 +810,11 @@ function buildChatMessagesSlow(store) {
       exploreListKeys: new Set(),
       exploreCalls: [],
       exploreActiveItemIds: new Set(),
-        exploreSeenItemIds: new Set(),
-      commandByItemId: new Map(),
-      reasoningChunks: []
+      exploreSeenItemIds: new Set(),
+      toolByItemId: new Map(),
+      diffEvents: [],
+      reasoningChunks: [],
+      commentaryChunks: []
     }
     turnStateById.set(key, state)
     return state
@@ -776,12 +886,26 @@ function buildChatMessagesSlow(store) {
       if (!String(diff ?? '').trim()) continue
       if (lastDiffText === diff) continue
       lastDiffText = diff
+      const turnId = String(activeTurnId ?? '').trim()
+      if (turnId) {
+        const state = ensureTurnBackgroundMessage(turnId)
+        if (state) {
+          state.diffEvents.push({
+            eventId: event.eventId,
+            raw: diff,
+            seq: event.seq ?? null,
+            tsMs: event.tsMs ?? null,
+            expanded: Boolean(store?.diffExpandedByEventId?.get?.(String(event.eventId)))
+          })
+          continue
+        }
+      }
       msgs.push({
         id: event.eventId,
         role: 'step',
         stepKind: 'diff',
-        files: parseUnifiedDiff(diff),
-        raw: diff
+        raw: diff,
+        expanded: Boolean(store?.diffExpandedByEventId?.get?.(String(event.eventId)))
       })
       continue
     }
@@ -795,6 +919,21 @@ function buildChatMessagesSlow(store) {
           const state = ensureTurnBackgroundMessage(turnId)
           if (state && String(text ?? '').trim()) {
             state.reasoningChunks.push({
+              id: event.eventId,
+              text: String(text ?? ''),
+              seq: event.seq ?? null,
+              tsMs: event.tsMs ?? null
+            })
+          }
+        }
+        continue
+      }
+      if (stream === 'commentary') {
+        const turnId = String(activeTurnId ?? '').trim()
+        if (turnId) {
+          const state = ensureTurnBackgroundMessage(turnId)
+          if (state && String(text ?? '').trim()) {
+            state.commentaryChunks.push({
               id: event.eventId,
               text: String(text ?? ''),
               seq: event.seq ?? null,
@@ -823,7 +962,11 @@ function buildChatMessagesSlow(store) {
     const itemId = String(event.payload?.itemId ?? '')
     if (!itemId) continue
 
-    if (String(tool ?? '').toLowerCase() === 'commandexecution') {
+    const lowerTool = String(tool ?? '').toLowerCase()
+    const displayTool = lowerTool === 'commandexecution'
+      ? 'commandExecution'
+      : (lowerTool === 'filechange' ? 'fileChange' : tool)
+    if (lowerTool === 'commandexecution') {
       const actions = normalizeCommandActions(event.payload?.commandActions)
       const exploreTurnId = String(exploreTurnByItemId.get(itemId) ?? activeTurnId ?? '').trim() || null
       if (isExploringCallFromActions(actions)) {
@@ -849,43 +992,46 @@ function buildChatMessagesSlow(store) {
         }
         continue
       }
+    }
 
-      const commandTurnId = String(commandTurnByItemId.get(itemId) ?? activeTurnId ?? '').trim() || null
-      if (commandTurnId) {
-        if (event.type === 'tool.started') commandTurnByItemId.set(itemId, commandTurnId)
-        const state = ensureTurnBackgroundMessage(commandTurnId)
-        if (!state) continue
-        let call = state.commandByItemId.get(itemId) ?? null
-        if (!call) {
-          call = {
-            itemId,
-            tool,
-            command: event.payload?.command ?? null,
-            commandActions: event.payload?.commandActions ?? null,
-            cwd: event.payload?.cwd ?? null,
-            status: event.payload?.status ?? (event.type === 'tool.started' ? 'running' : 'completed'),
-            exitCode: event.payload?.exitCode ?? null,
-            expanded: Boolean(store?.toolExpanded?.get?.(itemId)),
-            output: store?.toolOutputByItemId?.get?.(itemId) ?? null,
-            seq: event.seq ?? null,
-            tsMs: event.tsMs ?? null
-          }
-          state.commandByItemId.set(itemId, call)
-        } else {
-          call.tool = tool ?? call.tool
-          call.command = event.payload?.command ?? call.command
-          call.commandActions = event.payload?.commandActions ?? call.commandActions
-          call.cwd = event.payload?.cwd ?? call.cwd
-          call.status = event.payload?.status ?? call.status
-          if (!call.status) call.status = (event.type === 'tool.started') ? 'running' : 'completed'
-          if (event.payload?.exitCode !== undefined) call.exitCode = event.payload.exitCode
-          if ((call.seq === null || call.seq === undefined) && event.seq !== undefined) call.seq = event.seq
-          if ((call.tsMs === null || call.tsMs === undefined) && event.tsMs !== undefined) call.tsMs = event.tsMs
+    const foldIntoBackground = lowerTool === 'commandexecution' || lowerTool === 'filechange'
+    const toolTurnId = String(backgroundToolTurnByItemId.get(itemId) ?? activeTurnId ?? '').trim() || null
+    if (foldIntoBackground && toolTurnId) {
+      if (event.type === 'tool.started') backgroundToolTurnByItemId.set(itemId, toolTurnId)
+      const state = ensureTurnBackgroundMessage(toolTurnId)
+      if (!state) continue
+      let call = state.toolByItemId.get(itemId) ?? null
+      if (!call) {
+        call = {
+          itemId,
+          tool: displayTool,
+          command: event.payload?.command ?? null,
+          commandActions: event.payload?.commandActions ?? null,
+          cwd: event.payload?.cwd ?? null,
+          changes: Array.isArray(event.payload?.changes) ? event.payload.changes : null,
+          status: event.payload?.status ?? (event.type === 'tool.started' ? 'running' : 'completed'),
+          exitCode: event.payload?.exitCode ?? null,
+          expanded: Boolean(store?.toolExpanded?.get?.(itemId)),
+          output: store?.toolOutputByItemId?.get?.(itemId) ?? null,
+          seq: event.seq ?? null,
+          tsMs: event.tsMs ?? null
         }
-        call.expanded = Boolean(store?.toolExpanded?.get?.(itemId))
-        call.output = store?.toolOutputByItemId?.get?.(itemId) ?? call.output
-        continue
+        state.toolByItemId.set(itemId, call)
+      } else {
+        call.tool = displayTool ?? call.tool
+        call.command = event.payload?.command ?? call.command
+        call.commandActions = event.payload?.commandActions ?? call.commandActions
+        call.cwd = event.payload?.cwd ?? call.cwd
+        call.changes = Array.isArray(event.payload?.changes) ? event.payload.changes : call.changes
+        call.status = event.payload?.status ?? call.status
+        if (!call.status) call.status = (event.type === 'tool.started') ? 'running' : 'completed'
+        if (event.payload?.exitCode !== undefined) call.exitCode = event.payload.exitCode
+        if ((call.seq === null || call.seq === undefined) && event.seq !== undefined) call.seq = event.seq
+        if ((call.tsMs === null || call.tsMs === undefined) && event.tsMs !== undefined) call.tsMs = event.tsMs
       }
+      call.expanded = Boolean(store?.toolExpanded?.get?.(itemId))
+      call.output = store?.toolOutputByItemId?.get?.(itemId) ?? call.output
+      continue
     }
 
     let msg = toolMsgByItemId.get(itemId) ?? null
@@ -894,7 +1040,7 @@ function buildChatMessagesSlow(store) {
         id: `tool-${itemId}`,
         role: 'step',
         stepKind: 'tool',
-        tool,
+        tool: displayTool,
         itemId,
         command: event.payload?.command ?? null,
         commandActions: event.payload?.commandActions ?? null,
@@ -908,7 +1054,7 @@ function buildChatMessagesSlow(store) {
       msgs.push(msg)
       toolMsgByItemId.set(itemId, msg)
     } else {
-      msg.tool = tool ?? msg.tool
+      msg.tool = displayTool ?? msg.tool
       msg.command = event.payload?.command ?? msg.command
       msg.commandActions = event.payload?.commandActions ?? msg.commandActions
       msg.cwd = event.payload?.cwd ?? msg.cwd
@@ -927,15 +1073,16 @@ function buildChatMessagesSlow(store) {
     if (!state) return false
 
     const isCurrentTurn = String(store?.currentTurnId ?? '').trim() === state.turnId
-    const commandCalls = Array.from(state.commandByItemId.values())
+    const toolCalls = Array.from(state.toolByItemId.values())
     const explore = {
       files: state.exploreFileKeys.size,
       searches: state.exploreSearchKeys.size,
       lists: state.exploreListKeys.size,
       active: Boolean(state.exploreActiveItemIds.size)
     }
-    const hasRunningCommand = commandCalls.some((call) => String(call?.status ?? '').toLowerCase() === 'running')
-    const active = Boolean(isCurrentTurn || explore.active || hasRunningCommand)
+    const hasCommentary = Array.isArray(state.commentaryChunks) && state.commentaryChunks.length > 0
+    const hasRunningTool = toolCalls.some((call) => String(call?.status ?? '').toLowerCase() === 'running')
+    const active = Boolean(isCurrentTurn || explore.active || hasRunningTool)
     const expanded = active || Boolean(store?.backgroundExpandedByTurnId?.get?.(state.turnId))
     const reasoningState = expanded ? getTurnReasoningState(store, state.turnId) : null
     const hasReasoning = reasoningTurnIds.has(state.turnId) || Boolean(
@@ -943,7 +1090,7 @@ function buildChatMessagesSlow(store) {
       Array.isArray(reasoningState?.sections) &&
       reasoningState.sections.length
     )
-    if (!isCurrentTurn && !hasReasoning && !explore.files && !explore.searches && !explore.lists && !explore.active && !commandCalls.length) {
+    if (!isCurrentTurn && !hasReasoning && !hasCommentary && !explore.files && !explore.searches && !explore.lists && !explore.active && !toolCalls.length && !state.diffEvents.length) {
       return false
     }
 
@@ -955,6 +1102,7 @@ function buildChatMessagesSlow(store) {
       : null
     msg.title = active ? 'Thinking' : formatThoughtDuration(durationMs)
     msg.hasReasoning = hasReasoning
+    msg.hasCommentary = hasCommentary
     msg.reasoning = reasoningState
     msg.explore = explore
     msg.active = active
@@ -963,17 +1111,24 @@ function buildChatMessagesSlow(store) {
       ? buildTurnBackgroundTimeline({
           exploreCalls: state.exploreCalls,
           reasoningState,
-          commandCalls,
-          reasoningChunks: state.reasoningChunks
+          toolCalls,
+          diffEvents: state.diffEvents,
+          reasoningChunks: state.reasoningChunks,
+          commentaryChunks: state.commentaryChunks
         })
       : null
     return true
   })
 
-  const activeBackgrounds = filtered.filter((msg) => msg?.stepKind === 'background' && msg.active)
-  if (!activeBackgrounds.length) return filtered
+  const currentTurnId = String(store?.currentTurnId ?? '').trim()
+  const visible = currentTurnId
+    ? filtered.filter((msg) => !(msg?.role === 'assistant' && String(msg?.turnId ?? '').trim() === currentTurnId))
+    : filtered
 
-  const remaining = filtered.filter((msg) => !(msg?.stepKind === 'background' && msg.active))
+  const activeBackgrounds = visible.filter((msg) => msg?.stepKind === 'background' && msg.active)
+  if (!activeBackgrounds.length) return visible
+
+  const remaining = visible.filter((msg) => !(msg?.stepKind === 'background' && msg.active))
   remaining.push(...activeBackgrounds)
   return remaining
 }

@@ -12,6 +12,12 @@ export const RootgridConfigSchema = z.object({
     sseToasts: z.enum(['always', 'never', 'if-not-visible']).default('if-not-visible'),
     webPush: z.enum(['always', 'never', 'if-not-visible']).default('if-not-visible')
   }).default({ sseToasts: 'if-not-visible', webPush: 'if-not-visible' }),
+  debug: z.object({
+    codexRawCapture: z.object({
+      enabled: z.boolean().default(false),
+      dir: z.string().min(1).nullable().default(null)
+    }).default({ enabled: false, dir: null })
+  }).default({ codexRawCapture: { enabled: false, dir: null } }),
   autostart: z.object({
     enabled: z.boolean(),
     method: z.enum(['systemd-user']).nullable()

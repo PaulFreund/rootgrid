@@ -297,6 +297,15 @@ export function tryExtractPlanText(item) {
   return text || tryExtractAgentMessageText(item)
 }
 
+export function normalizeAgentMessagePhase(value) {
+  if (typeof value !== 'string') return null
+  const normalized = value.toLowerCase().replace(/[\s_-]/g, '')
+  if (!normalized) return null
+  if (normalized === 'commentary') return 'commentary'
+  if (normalized === 'finalanswer') return 'final_answer'
+  return normalized
+}
+
 export function normalizeItemType(value) {
   if (typeof value !== 'string') return null
   const normalized = value.toLowerCase().replace(/[\s_-]/g, '')

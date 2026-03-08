@@ -80,6 +80,9 @@ This is a **proposed** starting point; adjust as implementation realities land. 
   "version": 1,
   "retentionDays": 30,
   "notifications": { "sseToasts": "if-not-visible", "webPush": "if-not-visible" },
+  "debug": {
+    "codexRawCapture": { "enabled": false, "dir": null }
+  },
   "autostart": { "enabled": false, "method": null },
   "runner": {
     "enabled": true,
@@ -115,6 +118,8 @@ Notes:
   - `"if-not-visible"` (default): send when the relevant session is not currently open in a visible Rootgrid tab
   - `"always"`: always send push (even while the UI is visible)
   - `"never"`: disable push sends (subscription can remain registered)
+- `debug.codexRawCapture.enabled` turns on raw `codex app-server` capture for every new runner session.
+- `debug.codexRawCapture.dir` optionally overrides the output directory; when `null`, Rootgrid writes to `~/.rootgrid/debug/codex/`.
 - In host mode:
   - `host.auth.clientToken` protects **browser/web UI** access.
   - `host.auth.runnerToken` protects **runner registration**.

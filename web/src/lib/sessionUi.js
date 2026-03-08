@@ -23,6 +23,7 @@ export function createSessionStoreState() {
     messageViewVersion: 0,
     toolOutputByItemId: new Map(),
     toolExpanded: new Map(),
+    diffExpandedByEventId: new Map(),
     diffSelectedFileByEventId: new Map()
   }
 }

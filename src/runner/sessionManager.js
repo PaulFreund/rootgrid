@@ -14,12 +14,14 @@ export class RunnerSessionManager {
    * @param {{
    *   machineId: string,
    *   send: (envelope: any) => boolean,
+   *   debug?: any,
    *   makeEnvelope: (input: { type: string, scope?: any, payload?: any, track?: boolean }) => any
    * }} opts
    */
-  constructor({ machineId, send, makeEnvelope }) {
+  constructor({ machineId, send, debug = null, makeEnvelope }) {
     this.machineId = machineId
     this.send = send
+    this.debug = debug ?? null
     this.makeEnvelope = makeEnvelope
     /** @type {Map<string, CodexAppServerSession>} */
     this.sessions = new Map()
@@ -105,6 +107,7 @@ export class RunnerSessionManager {
       sessionId,
       cwd,
       options,
+      debug: this.debug,
       emit: (type, eventPayload) => this.#emit(type, this.#sessionScope(sessionId), eventPayload)
     })
     this.sessions.set(sessionId, session)
@@ -158,6 +161,7 @@ export class RunnerSessionManager {
         sessionId,
         cwd,
         options,
+        debug: this.debug,
         emit: (type, eventPayload) => this.#emit(type, this.#sessionScope(sessionId), eventPayload)
       })
       this.sessions.set(sessionId, session)

@@ -14,6 +14,12 @@ export function buildDefaultConfig() {
       sseToasts: 'if-not-visible',
       webPush: 'if-not-visible'
     },
+    debug: {
+      codexRawCapture: {
+        enabled: false,
+        dir: null
+      }
+    },
     autostart: {
       enabled: false,
       method: null

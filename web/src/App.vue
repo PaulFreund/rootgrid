@@ -39,7 +39,9 @@ import {
   buildChatMessages,
   diffStepSelectedFile as diffStepSelectedFileHelper,
   diffStepSelectedPath as diffStepSelectedPathHelper,
+  parseUnifiedDiff,
   parseReasoningSections,
+  summarizeUnifiedDiff,
   setDiffStepSelectedPath as setDiffStepSelectedPathHelper
 } from './lib/chatMessages.js'
 import {
@@ -629,6 +631,18 @@ function onToolDetailsToggle(itemId, ev) {
   if (open) ensureToolOutputLoaded(sid, key).catch(() => {})
 }
 
+function onDiffDetailsToggle(stepId, ev) {
+  const sid = selectedSessionId.value
+  if (!sid || !stepId) return
+  const open = Boolean(ev?.target?.open)
+  const store = getSessionStore(sid)
+  const key = String(stepId)
+  const current = Boolean(store.diffExpandedByEventId.get(key))
+  if (current === open) return
+  store.diffExpandedByEventId.set(key, open)
+  store.messageViewVersion = Number(store.messageViewVersion ?? 0) + 1
+}
+
 async function ensureTurnReasoningLoaded(sessionId, turnId) {
   await ensureTurnReasoningLoadedHelper({
     apiFetch,
@@ -685,6 +699,78 @@ function toolDisplayCommand(m) {
   }
   const cmd = String(m?.command ?? '').trim()
   return cmd
+}
+
+function pluralize(count, singular, plural = `${singular}s`) {
+  return Number(count) === 1 ? singular : plural
+}
+
+function splitHistoryLabelParts(label, fallbackLead = '') {
+  const text = String(label ?? '').trim()
+  if (!text) return { lead: String(fallbackLead ?? '').trim(), detail: '' }
+  const match = text.match(/^(\S+)(?:\s+(.+))?$/)
+  if (!match) return { lead: text, detail: '' }
+  return {
+    lead: String(match[1] ?? '').trim(),
+    detail: String(match[2] ?? '').trim()
+  }
+}
+
+function timelineToolSummary(m) {
+  const tool = String(m?.tool ?? '')
+  if (tool === 'commandExecution') {
+    const cmd = toolDisplayCommand(m)
+    return cmd ? `Ran ${cmd}` : 'Ran command'
+  }
+  if (tool === 'fileChange') {
+    const count = Array.isArray(m?.changes) ? m.changes.length : 0
+    if (count === 1) {
+      const path = String(m?.changes?.[0]?.path ?? '').trim()
+      if (path) return `Changed ${path}`
+    }
+    if (count > 0) return `Changed ${count} ${pluralize(count, 'file')}`
+    return 'Changed files'
+  }
+  return String(tool || 'Tool')
+}
+
+function timelineToolSummaryParts(m) {
+  return splitHistoryLabelParts(timelineToolSummary(m), 'Tool')
+}
+
+function timelineToolMeta(m) {
+  const tool = String(m?.tool ?? '').trim()
+  const exitCode = Number(m?.exitCode ?? NaN)
+  if (tool === 'commandExecution' && Number.isFinite(exitCode) && exitCode !== 0) return `Exit ${exitCode}`
+  return ''
+}
+
+function diffStepSummary(step) {
+  const summary = summarizeUnifiedDiff(String(step?.raw ?? ''))
+  const files = Array.isArray(summary?.paths) ? summary.paths : []
+  let detail = 'files'
+  if (files.length === 1) detail = files[0]
+  else if (files.length > 1) detail = `${files.length} ${pluralize(files.length, 'file')}`
+  const label = detail ? `Changed ${detail}` : 'Changed files'
+  return {
+    label,
+    lead: 'Changed',
+    detail,
+    added: Number(summary?.added ?? 0) || 0,
+    removed: Number(summary?.removed ?? 0) || 0
+  }
+}
+
+function reasoningSectionSummaryParts(section) {
+  const title = String(section?.title ?? '').trim()
+  if (!title || title.toLowerCase() === 'reasoning') {
+    return { lead: 'Reasoning', detail: '' }
+  }
+  return { lead: 'Reasoning', detail: title }
+}
+
+function exploreSummaryParts(item) {
+  return splitHistoryLabelParts(item?.label, 'Step')
 }
 
 async function loadSession(sessionId) {
@@ -952,6 +1038,10 @@ function setDiffStepSelectedPath(stepId, path) {
 
 function diffStepSelectedFile(stepId, files) {
   return diffStepSelectedFileHelper(stepId, files, selectedStore.value)
+}
+
+function diffStepFiles(step) {
+  return parseUnifiedDiff(String(step?.raw ?? ''))
 }
 
 const chatMessages = computed(() => buildChatMessages(selectedStore.value ?? null))
@@ -1710,14 +1800,14 @@ watch(
                       v-if="m.stepKind === 'background'"
                       class="group w-full"
                     >
-                      <div v-if="m.expanded" class="mb-2 space-y-3 border-l border-slate-200 pl-4">
+                      <div v-if="m.expanded" class="mb-2 space-y-4 border-l border-slate-200 pl-4">
                         <div v-if="m.reasoning?.loading" class="text-xs text-slate-500">Loading reasoning…</div>
                         <div v-else-if="m.reasoning?.error" class="text-xs text-rose-700">{{ m.reasoning.error }}</div>
 
                         <div v-if="Array.isArray(m.timeline) && m.timeline.length" class="space-y-2">
                           <template v-for="it in m.timeline" :key="it.id">
                             <div
-                              v-if="it.kind === 'reasoningText'"
+                              v-if="it.kind === 'reasoningText' || it.kind === 'commentaryText'"
                               class="whitespace-pre-wrap text-sm leading-7 text-slate-700"
                             >
                               {{ it.text }}
@@ -1727,8 +1817,18 @@ watch(
                               class="group"
                               @toggle="onReasoningSectionToggle(m.turnId, $event)"
                             >
-                              <summary class="cursor-pointer select-none truncate text-xs font-medium text-slate-700 hover:text-slate-900">
-                                {{ it.section?.title || 'Reasoning' }}
+                              <summary class="cursor-pointer list-none select-none rounded-xl bg-black/[0.03] px-3 py-2 transition-colors hover:bg-black/[0.045]">
+                                <div class="flex items-center justify-between gap-4">
+                                  <div class="min-w-0 truncate text-sm">
+                                    <span class="text-slate-800">{{ reasoningSectionSummaryParts(it.section).lead }}</span>
+                                    <span v-if="reasoningSectionSummaryParts(it.section).detail" class="ml-1 text-slate-500">
+                                      {{ reasoningSectionSummaryParts(it.section).detail }}
+                                    </span>
+                                  </div>
+                                  <div class="shrink-0 text-slate-300 transition-colors group-hover:text-slate-400">
+                                    <ChevronDown class="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+                                  </div>
+                                </div>
                               </summary>
                               <div
                                 v-if="m.reasoning?.loadingBody && !String(it.section?.body ?? '').trim()"
@@ -1741,29 +1841,40 @@ watch(
                               </div>
                             </details>
                             <details
-                              v-else-if="it.kind === 'command'"
+                              v-else-if="it.kind === 'tool'"
                               class="group"
                               :open="it.expanded"
                               @toggle="onToolDetailsToggle(it.itemId, $event)"
                             >
-                              <summary class="cursor-pointer select-none flex items-center justify-between gap-3">
-                                <div class="min-w-0 flex items-center gap-2 text-xs text-slate-600">
-                                  <span class="shrink-0 text-[10px] uppercase tracking-wider text-slate-400">Command</span>
-                                  <span class="shrink-0 text-slate-300">·</span>
-                                  <span class="shrink-0 text-slate-600">{{ String(it.status ?? '') }}</span>
-                                  <span v-if="it.exitCode !== null && it.exitCode !== undefined" class="shrink-0 text-slate-300">·</span>
-                                  <span v-if="it.exitCode !== null && it.exitCode !== undefined" class="shrink-0 text-slate-600">exit {{ it.exitCode }}</span>
-                                  <span
-                                    v-if="toolDisplayCommand(it)"
-                                    class="min-w-0 truncate font-mono text-slate-800"
-                                    :title="toolDisplayCommand(it)"
-                                  >
-                                    {{ toolDisplayCommand(it) }}
-                                  </span>
+                              <summary class="cursor-pointer list-none select-none rounded-xl bg-black/[0.03] px-3 py-2 transition-colors hover:bg-black/[0.045]">
+                                <div class="flex items-center justify-between gap-4">
+                                  <div class="min-w-0 truncate text-sm" :title="timelineToolSummary(it)">
+                                    <span class="text-slate-800">{{ timelineToolSummaryParts(it).lead }}</span>
+                                    <span v-if="timelineToolSummaryParts(it).detail" class="ml-1 text-slate-500">
+                                      {{ timelineToolSummaryParts(it).detail }}
+                                    </span>
+                                  </div>
+                                  <div v-if="timelineToolMeta(it)" class="shrink-0 text-xs text-slate-500">
+                                    {{ timelineToolMeta(it) }}
+                                  </div>
+                                  <div v-else class="shrink-0 text-slate-300 transition-colors group-hover:text-slate-400">
+                                    <ChevronDown class="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+                                  </div>
                                 </div>
                               </summary>
 
                               <div class="mt-2 space-y-3 border-l border-slate-200 pl-4">
+                                <div
+                                  v-if="it.tool === 'fileChange' && Array.isArray(it.changes) && it.changes.length"
+                                  class="rounded-2xl border border-black/[0.06] bg-[#f3f3f0] p-3"
+                                >
+                                  <div class="text-[11px] uppercase tracking-wider text-slate-500">Files</div>
+                                  <div class="mt-2 space-y-1 text-xs font-mono text-slate-800">
+                                    <div v-for="(c, idx) in it.changes.slice(0, 50)" :key="idx" class="truncate" :title="c.path">{{ c.path }}</div>
+                                    <div v-if="it.changes.length > 50" class="text-[11px] text-slate-500">…and {{ it.changes.length - 50 }} more</div>
+                                  </div>
+                                </div>
+
                                 <div class="rounded-2xl border border-black/[0.06] bg-[#f3f3f0] p-3">
                                   <div class="flex items-center justify-between gap-3">
                                     <div class="text-[11px] uppercase tracking-wider text-slate-500">Output</div>
@@ -1798,7 +1909,104 @@ watch(
                                 </div>
                               </div>
                             </details>
-                            <div v-else-if="it.kind === 'explore'" class="truncate text-xs text-slate-700" :title="it.label">{{ it.label }}</div>
+                            <details
+                              v-else-if="it.kind === 'diff'"
+                              class="group"
+                              :open="it.expanded"
+                              @toggle="onDiffDetailsToggle(it.id, $event)"
+                            >
+                              <summary class="cursor-pointer list-none select-none rounded-xl bg-black/[0.03] px-3 py-2 transition-colors hover:bg-black/[0.045]">
+                                <div class="flex items-center justify-between gap-4">
+                                  <div class="min-w-0 truncate text-sm" :title="diffStepSummary(it).label">
+                                    <span class="text-slate-800">{{ diffStepSummary(it).lead }}</span>
+                                    <span v-if="diffStepSummary(it).detail" class="ml-1 text-slate-500">
+                                      {{ diffStepSummary(it).detail }}
+                                    </span>
+                                  </div>
+                                  <div class="shrink-0 text-xs font-mono">
+                                    <span class="text-emerald-700">+{{ diffStepSummary(it).added }}</span>
+                                    <span class="ml-2 text-rose-700">-{{ diffStepSummary(it).removed }}</span>
+                                  </div>
+                                </div>
+                              </summary>
+
+                              <div v-if="it.expanded" class="mt-2 overflow-hidden rounded-[20px] border border-black/[0.06] bg-[#f7f7f4]">
+                                <div class="flex items-center gap-2 border-b border-black/[0.05] bg-[#f1f1ee] px-3 py-2">
+                                  <div class="shrink-0 text-[11px] uppercase tracking-wider text-slate-500">Edited file</div>
+                                  <select
+                                    v-if="diffStepFiles(it).length > 1"
+                                    :value="diffStepSelectedPath(it.id, diffStepFiles(it))"
+                                    class="min-w-0 flex-1 rounded-md border border-black/[0.06] bg-white px-2 py-1 text-xs text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20"
+                                    @change="setDiffStepSelectedPath(it.id, $event.target.value)"
+                                  >
+                                    <option v-for="f in diffStepFiles(it)" :key="f.path" :value="f.path">{{ f.path }}</option>
+                                  </select>
+                                  <div v-else class="min-w-0 flex-1 truncate text-xs font-mono text-slate-800">
+                                    {{ diffStepSelectedFile(it.id, diffStepFiles(it))?.path ?? '' }}
+                                  </div>
+                                  <button
+                                    class="inline-flex h-7 w-7 items-center justify-center rounded-md bg-white text-slate-700 transition-colors hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/30"
+                                    title="Copy diff"
+                                    @click="copyText(diffStepSelectedFile(it.id, diffStepFiles(it))?.raw ?? it.raw ?? '')"
+                                  >
+                                    <Copy class="h-3.5 w-3.5" />
+                                  </button>
+                                </div>
+
+                                <div v-if="!diffStepFiles(it).length" class="p-3">
+                                  <pre class="m-0 whitespace-pre-wrap break-words text-xs font-mono text-slate-800">{{ it.raw ?? '' }}</pre>
+                                </div>
+
+                                <template v-else>
+                                  <div class="flex items-center justify-between gap-3 border-b border-black/[0.05] px-3 py-2">
+                                    <div class="min-w-0 truncate text-xs font-mono text-slate-800">
+                                      {{ diffStepSelectedFile(it.id, diffStepFiles(it))?.path ?? '' }}
+                                    </div>
+                                    <div class="shrink-0 text-xs font-mono">
+                                      <span class="text-emerald-700">+{{ diffStepSelectedFile(it.id, diffStepFiles(it))?.added ?? 0 }}</span>
+                                      <span class="ml-2 text-rose-700">-{{ diffStepSelectedFile(it.id, diffStepFiles(it))?.removed ?? 0 }}</span>
+                                    </div>
+                                  </div>
+
+                                  <div class="max-h-[520px] overflow-auto">
+                                    <table class="w-full border-collapse text-xs font-mono">
+                                      <tbody>
+                                        <tr
+                                          v-for="(l, idx) in (diffStepSelectedFile(it.id, diffStepFiles(it))?.lines ?? [])"
+                                          :key="idx"
+                                          :class="l.kind === 'add'
+                                            ? 'bg-emerald-50/70'
+                                            : (l.kind === 'del'
+                                              ? 'bg-rose-50/70'
+                                              : (l.kind === 'hunk' ? 'bg-[#f0f0ed]' : 'bg-[#fbfbfa]'))"
+                                        >
+                                          <td class="w-12 select-none whitespace-nowrap pr-2 text-right align-top text-slate-400">{{ l.oldLine ?? '' }}</td>
+                                          <td class="w-12 select-none whitespace-nowrap pr-2 text-right align-top text-slate-400">{{ l.newLine ?? '' }}</td>
+                                          <td class="pr-3 align-top">
+                                            <pre
+                                              class="m-0 whitespace-pre text-slate-800"
+                                              :class="l.kind === 'hunk' ? 'text-slate-600' : ''"
+                                            >{{ l.kind === 'hunk' ? l.text : l.text }}</pre>
+                                          </td>
+                                        </tr>
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                </template>
+                              </div>
+                            </details>
+                            <div
+                              v-else-if="it.kind === 'explore'"
+                              class="flex items-center justify-between gap-4 rounded-xl bg-black/[0.03] px-3 py-2 text-sm"
+                              :title="it.label"
+                            >
+                              <div class="min-w-0 truncate">
+                                <span class="text-slate-800">{{ exploreSummaryParts(it).lead }}</span>
+                                <span v-if="exploreSummaryParts(it).detail" class="ml-1 text-slate-500">
+                                  {{ exploreSummaryParts(it).detail }}
+                                </span>
+                              </div>
+                            </div>
                           </template>
 
                           <div v-if="m.reasoning?.truncated" class="text-xs text-slate-500">(reasoning truncated)</div>
@@ -1833,42 +2041,57 @@ watch(
                     </div>
 
                     <!-- Inline diffs (VS Code-like) -->
-                    <div v-else-if="m.stepKind === 'diff'" class="w-full">
-                      <div class="overflow-hidden rounded-[20px] border border-black/[0.06] bg-[#f7f7f4]">
+                    <details
+                      v-else-if="m.stepKind === 'diff'"
+                      class="group w-full"
+                      :open="m.expanded"
+                      @toggle="onDiffDetailsToggle(m.id, $event)"
+                    >
+                      <summary class="cursor-pointer select-none flex items-center justify-between gap-4 py-0.5">
+                        <div class="min-w-0 truncate text-sm text-slate-800" :title="diffStepSummary(m).label">
+                          {{ diffStepSummary(m).label }}
+                        </div>
+                        <div class="shrink-0 text-xs font-mono">
+                          <span class="text-emerald-700">+{{ diffStepSummary(m).added }}</span>
+                          <span class="ml-2 text-rose-700">-{{ diffStepSummary(m).removed }}</span>
+                        </div>
+                      </summary>
+
+                      <div v-if="m.expanded" class="mt-2 overflow-hidden rounded-[20px] border border-black/[0.06] bg-[#f7f7f4]">
                         <div class="flex items-center gap-2 border-b border-black/[0.05] bg-[#f1f1ee] px-3 py-2">
                           <div class="shrink-0 text-[11px] uppercase tracking-wider text-slate-500">Edited file</div>
                           <select
-                            v-if="Array.isArray(m.files) && m.files.length > 1"
-                            :value="diffStepSelectedPath(m.id, m.files)"
+                            v-if="diffStepFiles(m).length > 1"
+                            :value="diffStepSelectedPath(m.id, diffStepFiles(m))"
                             class="min-w-0 flex-1 rounded-md border border-black/[0.06] bg-white px-2 py-1 text-xs text-slate-900 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20"
                             @change="setDiffStepSelectedPath(m.id, $event.target.value)"
                           >
-                            <option v-for="f in m.files" :key="f.path" :value="f.path">{{ f.path }}</option>
+                            <option v-for="f in diffStepFiles(m)" :key="f.path" :value="f.path">{{ f.path }}</option>
                           </select>
                           <div v-else class="min-w-0 flex-1 truncate text-xs font-mono text-slate-800">
-                            {{ diffStepSelectedFile(m.id, m.files)?.path ?? '' }}
+                            {{ diffStepSelectedFile(m.id, diffStepFiles(m))?.path ?? '' }}
                           </div>
                           <button
                             class="inline-flex h-7 w-7 items-center justify-center rounded-md bg-white text-slate-700 transition-colors hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/30"
                             title="Copy diff"
-                            @click="copyText(diffStepSelectedFile(m.id, m.files)?.raw ?? m.raw ?? '')"
+                            @click="copyText(diffStepSelectedFile(m.id, diffStepFiles(m))?.raw ?? m.raw ?? '')"
                           >
                             <Copy class="h-3.5 w-3.5" />
                           </button>
                         </div>
 
-                        <div v-if="!Array.isArray(m.files) || !m.files.length" class="p-3">
+                        <div v-if="!diffStepFiles(m).length" class="p-3">
                           <pre class="m-0 whitespace-pre-wrap break-words text-xs font-mono text-slate-800">{{ m.raw ?? '' }}</pre>
                         </div>
 
                         <template v-else>
                           <div class="flex items-center justify-between gap-3 border-b border-black/[0.05] px-3 py-2">
                             <div class="min-w-0 truncate text-xs font-mono text-slate-800">
-                              {{ diffStepSelectedFile(m.id, m.files)?.path ?? '' }}
+                              {{ diffStepSelectedFile(m.id, diffStepFiles(m))?.path ?? '' }}
                             </div>
                             <div class="shrink-0 text-xs font-mono">
-                              <span class="text-emerald-700">+{{ diffStepSelectedFile(m.id, m.files)?.added ?? 0 }}</span>
-                              <span class="ml-2 text-rose-700">-{{ diffStepSelectedFile(m.id, m.files)?.removed ?? 0 }}</span>
+                              <span class="text-emerald-700">+{{ diffStepSelectedFile(m.id, diffStepFiles(m))?.added ?? 0 }}</span>
+                              <span class="ml-2 text-rose-700">-{{ diffStepSelectedFile(m.id, diffStepFiles(m))?.removed ?? 0 }}</span>
                             </div>
                           </div>
 
@@ -1876,7 +2099,7 @@ watch(
                             <table class="w-full border-collapse text-xs font-mono">
                               <tbody>
                                 <tr
-                                  v-for="(l, idx) in (diffStepSelectedFile(m.id, m.files)?.lines ?? [])"
+                                  v-for="(l, idx) in (diffStepSelectedFile(m.id, diffStepFiles(m))?.lines ?? [])"
                                   :key="idx"
                                   :class="l.kind === 'add'
                                     ? 'bg-emerald-50/70'
@@ -1898,7 +2121,7 @@ watch(
                           </div>
                         </template>
                       </div>
-                    </div>
+                    </details>
 
                     <!-- Tool step -->
                     <details
@@ -1907,26 +2130,12 @@ watch(
                       :open="m.expanded"
                       @toggle="onToolDetailsToggle(m.itemId, $event)"
                     >
-                      <summary class="cursor-pointer select-none flex items-center justify-between gap-3">
-                        <div class="min-w-0 flex items-center gap-2 text-xs text-slate-600">
-                          <span class="shrink-0 text-[10px] uppercase tracking-wider text-slate-400">
-                            {{ m.tool === 'commandExecution' ? 'Command' : (m.tool === 'fileChange' ? 'File changes' : 'Tool') }}
-                          </span>
-                          <span class="shrink-0 text-slate-300">·</span>
-                          <span class="shrink-0 text-slate-600">{{ String(m.status ?? '') }}</span>
-                          <span v-if="m.exitCode !== null && m.exitCode !== undefined" class="shrink-0 text-slate-300">·</span>
-                          <span v-if="m.exitCode !== null && m.exitCode !== undefined" class="shrink-0 text-slate-600">exit {{ m.exitCode }}</span>
-
-                          <span
-                            v-if="toolDisplayCommand(m)"
-                            class="min-w-0 truncate font-mono text-slate-800"
-                            :title="toolDisplayCommand(m)"
-                          >
-                            {{ toolDisplayCommand(m) }}
-                          </span>
-                          <span v-else-if="m.tool === 'fileChange'" class="min-w-0 truncate text-slate-700">
-                            {{ Array.isArray(m.changes) ? `${m.changes.length} file(s)` : 'file changes' }}
-                          </span>
+                      <summary class="cursor-pointer select-none flex items-center justify-between gap-4 py-0.5">
+                        <div class="min-w-0 truncate text-sm text-slate-800" :title="timelineToolSummary(m)">
+                          {{ timelineToolSummary(m) }}
+                        </div>
+                        <div class="shrink-0 text-xs text-slate-500">
+                          {{ timelineToolMeta(m) }}
                         </div>
                       </summary>
 

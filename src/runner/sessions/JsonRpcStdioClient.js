@@ -19,6 +19,7 @@ export class JsonRpcStdioClient {
    *   onRequest?: (msg: { id: string|number, method: string, params: any }) => Promise<any>,
    *   onStderr?: (chunk: string) => void,
    *   onExit?: (info: { code: number|null, signal: NodeJS.Signals|null }) => void,
+   *   debugCapture?: import('./JsonRpcDebugCapture.js').JsonRpcDebugCapture | null,
    * }} opts
    */
   constructor({
@@ -29,7 +30,8 @@ export class JsonRpcStdioClient {
     onNotification = () => {},
     onRequest = async () => null,
     onStderr = () => {},
-    onExit = () => {}
+    onExit = () => {},
+    debugCapture = null
   }) {
     this.command = command
     this.args = args
@@ -39,6 +41,7 @@ export class JsonRpcStdioClient {
     this.onRequest = onRequest
     this.onStderr = onStderr
     this.onExit = onExit
+    this.debugCapture = debugCapture
 
     this.nextId = 1
     /** @type {Map<number, { resolve: (v:any)=>void, reject: (e:any)=>void }>} */
@@ -50,6 +53,7 @@ export class JsonRpcStdioClient {
 
   async start() {
     if (this.proc) return
+    await this.debugCapture?.start?.()
 
     const proc = spawn(this.command, this.args, {
       cwd: this.cwd,
@@ -57,23 +61,37 @@ export class JsonRpcStdioClient {
       stdio: ['pipe', 'pipe', 'pipe']
     })
     this.proc = proc
+    this.debugCapture?.recordProcess('spawn', {
+      pid: proc.pid ?? null,
+      command: this.command,
+      args: this.args,
+      cwd: this.cwd ?? null
+    })
 
     proc.on('exit', (code, signal) => {
+      this.debugCapture?.recordProcess('exit', { code, signal })
       this.onExit({ code, signal })
       for (const { reject } of this.pending.values()) {
         reject(new Error(`app-server exited (code=${code}, signal=${signal})`))
       }
       this.pending.clear()
+      void this.debugCapture?.close?.()
     })
 
     proc.on('error', (err) => {
+      this.debugCapture?.recordProcess('error', {
+        message: String(err?.message ?? err)
+      })
       for (const { reject } of this.pending.values()) reject(err)
       this.pending.clear()
+      void this.debugCapture?.close?.()
     })
 
     proc.stderr?.on('data', (buf) => {
+      const text = String(buf)
+      this.debugCapture?.recordStderr(text)
       try {
-        this.onStderr(String(buf))
+        this.onStderr(text)
       } catch {
       }
     })
@@ -94,8 +112,10 @@ export class JsonRpcStdioClient {
     try {
       msg = JSON.parse(raw)
     } catch {
+      this.debugCapture?.recordIncoming(raw, null)
       return
     }
+    this.debugCapture?.recordIncoming(raw, msg)
     if (!msg || typeof msg !== 'object') return
 
     // Response to our outgoing request
@@ -133,7 +153,9 @@ export class JsonRpcStdioClient {
    */
   #write(msg) {
     if (!this.proc?.stdin) throw new Error('app-server not started')
-    this.proc.stdin.write(`${JSON.stringify(msg)}\n`)
+    const raw = JSON.stringify(msg)
+    this.debugCapture?.recordOutbound(msg, raw)
+    this.proc.stdin.write(`${raw}\n`)
   }
 
   /**
@@ -180,4 +202,3 @@ export class JsonRpcStdioClient {
     }
   }
 }
-

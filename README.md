@@ -57,6 +57,7 @@ See: `docs/reverse-proxy.md`.
 - **“Unauthorized” in UI**: use `host.auth.clientToken` from `~/.rootgrid/config.json` (then reload)
 - **“no runner connected”**: ensure `runner.enabled=true` and Rootgrid is running on the runner machine
 - **Codex not found**: install the Codex CLI (`codex`) and re-run `rootgrid`
+- **Need raw Codex traffic for debugging**: set `debug.codexRawCapture.enabled=true` in `~/.rootgrid/config.json`; captures land in `~/.rootgrid/debug/codex/` by default
 - **SSE stuck behind proxy**: disable proxy buffering for `/api/events`
 - **VS Code button fails**: install `code-server` on the runner; ensure the runner tunnel (`/v1/tunnel`) is connected
 

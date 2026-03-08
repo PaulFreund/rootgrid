@@ -37,7 +37,13 @@ export function canCoalesceSessionEvent(prev, next, { atStart = false } = {}) {
   const prevStream = String(prevPayload?.stream ?? 'normalized')
   const nextStream = String(nextPayload?.stream ?? 'normalized')
   if (prevStream !== nextStream) return false
-  if (prevStream !== 'normalized' && prevStream !== 'stdout' && prevStream !== 'stderr') return false
+  if (
+    prevStream !== 'normalized' &&
+    prevStream !== 'commentary' &&
+    prevStream !== 'reasoning' &&
+    prevStream !== 'stdout' &&
+    prevStream !== 'stderr'
+  ) return false
 
   return typeof nextPayload?.text === 'string' && nextPayload.text.length > 0
 }
@@ -302,6 +308,7 @@ export function resetSessionStoreState(store) {
   try { store.pendingAfter?.splice?.(0, store.pendingAfter.length) } catch {}
   store.toolOutputByItemId.clear()
   store.toolExpanded.clear()
+  try { store.diffExpandedByEventId?.clear?.() } catch {}
   try { store.diffSelectedFileByEventId?.clear?.() } catch {}
 }
 

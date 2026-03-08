@@ -6,6 +6,7 @@ import {
   buildResumeThreadAttempts,
   buildStartTurnAttempts,
   minimizeFileChanges,
+  normalizeAgentMessagePhase,
   sandboxPolicyCandidates,
   tryExtractAgentMessageText,
   tryExtractDeltaText,
@@ -74,6 +75,14 @@ test('Codex item extraction helpers normalize mixed content shapes', () => {
     summary: ['first', 'second'],
     content: ['ignored']
   }), 'first\nsecond')
+})
+
+test('normalizeAgentMessagePhase keeps commentary/final_answer distinctions', () => {
+  assert.equal(normalizeAgentMessagePhase('commentary'), 'commentary')
+  assert.equal(normalizeAgentMessagePhase('final_answer'), 'final_answer')
+  assert.equal(normalizeAgentMessagePhase('final-answer'), 'final_answer')
+  assert.equal(normalizeAgentMessagePhase(' Final Answer '), 'final_answer')
+  assert.equal(normalizeAgentMessagePhase(null), null)
 })
 
 test('minimizeFileChanges keeps only small path/kind records', () => {

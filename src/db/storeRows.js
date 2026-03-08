@@ -1,4 +1,4 @@
-export const SUMMARY_SESSION_EVENTS_WHERE = `(type != 'session.output' OR stream IN ('normalized') OR ((stream = 'stderr' OR stream = 'stdout') AND item_id IS NULL))`
+export const SUMMARY_SESSION_EVENTS_WHERE = `(type != 'session.output' OR stream IN ('normalized', 'commentary') OR ((stream = 'stderr' OR stream = 'stdout') AND item_id IS NULL))`
 
 export function parseJsonCell(value, fallback = null) {
   if (value === null || value === undefined || value === '') return fallback

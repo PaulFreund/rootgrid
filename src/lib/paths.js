@@ -24,3 +24,7 @@ export function getVapidKeysPath() {
 export function getUploadsDir() {
   return join(getRootgridDir(), 'uploads')
 }
+
+export function getCodexDebugDir() {
+  return join(getRootgridDir(), 'debug', 'codex')
+}

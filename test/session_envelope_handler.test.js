@@ -28,6 +28,7 @@ test('session envelope handler keeps registry maps in sync for snapshot/update/d
   let postVisibilityCalls = 0
   const toasts = { value: [] }
   const tokenUpdates = []
+  const addedEvents = []
 
   const handleEnvelope = createSessionEnvelopeHandler({
     currentVisibility: () => 'visible',
@@ -60,7 +61,9 @@ test('session envelope handler keeps registry maps in sync for snapshot/update/d
     bumpSessionToTop: () => {},
     updateTokenUsage: (sessionId, payload) => tokenUpdates.push({ sessionId, payload }),
     appendToolOutput: () => {},
-    addSessionEvent: () => {}
+    addSessionEvent: (sessionId, event) => {
+      addedEvents.push({ sessionId, event })
+    }
   })
 
   handleEnvelope({
@@ -138,6 +141,23 @@ test('session envelope handler keeps registry maps in sync for snapshot/update/d
   assert.equal(sessionStores.get('s-1').pendingAfter.length, 1)
   assert.equal(sessionStores.get('s-1').pendingAfter[0].payload.text, 'hello')
 
+  sessionStores.get('s-1').loadingBefore = false
+  handleEnvelope({
+    id: 'turn-1',
+    ts: 11.5,
+    type: 'turn.started',
+    scope: { sessionId: 's-1' },
+    payload: { turnId: 'turn-live' }
+  })
+  handleEnvelope({
+    id: 'reason-1',
+    ts: 12,
+    type: 'session.output',
+    scope: { sessionId: 's-1' },
+    payload: { stream: 'reasoning', text: 'inspect files' }
+  })
+  assert.equal(sessionStores.get('s-1').turnHasReasoningLive.has('turn-live'), true)
+
   handleEnvelope({
     type: 'registry.session.delete',
     payload: { sessionId: 's-1' }
@@ -173,4 +193,5 @@ test('session envelope handler keeps registry maps in sync for snapshot/update/d
     payload: { title: 'One', message: 'Only once', notificationKey: 'turn:s-1:t-1' }
   })
   assert.equal(toasts.value.length, 2)
+  assert.ok(addedEvents.some(({ event }) => event.type === 'session.output' && event.payload?.stream === 'reasoning'))
 })

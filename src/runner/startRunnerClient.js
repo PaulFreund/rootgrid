@@ -28,7 +28,7 @@ function makeEnvelope({ type, scope = null, payload = null }) {
   return { v: 1, type, ts: Date.now(), id: crypto.randomUUID(), scope, payload }
 }
 
-export async function startRunnerClient({ url, token, machineId, machineName }) {
+export async function startRunnerClient({ url, token, machineId, machineName, debug = null }) {
   if (!token) throw new Error('Runner token missing')
 
   const wsUrl = `${toWsBaseUrl(url)}/v1/runner/ws`
@@ -104,6 +104,7 @@ export async function startRunnerClient({ url, token, machineId, machineName }) 
   const sessions = new RunnerSessionManager({
     machineId,
     send: sendToHost,
+    debug,
     makeEnvelope: makeTrackedEnvelope
   })
 

@@ -7,6 +7,7 @@ import {
   diffStepSelectedPath,
   parseReasoningSections,
   parseUnifiedDiff,
+  summarizeUnifiedDiff,
   setDiffStepSelectedPath
 } from '../web/src/lib/chatMessages.js'
 import { createSessionStoreState } from '../web/src/lib/sessionUi.js'
@@ -48,6 +49,31 @@ test('parseUnifiedDiff memoizes parsed files and keeps basic hunk counts', () =>
   assert.deepEqual(first[0].lines.map((line) => line.kind), ['meta', 'meta', 'meta', 'hunk', 'del', 'add'])
 })
 
+test('summarizeUnifiedDiff counts files and line deltas without full render state', () => {
+  const diff = [
+    'diff --git a/src/a.txt b/src/a.txt',
+    '--- a/src/a.txt',
+    '+++ b/src/a.txt',
+    '@@ -1 +1 @@',
+    '-old line',
+    '+new line',
+    'diff --git a/src/b.txt b/src/b.txt',
+    '--- a/src/b.txt',
+    '+++ b/src/b.txt',
+    '@@ -1,2 +1,3 @@',
+    '-a',
+    '-b',
+    '+c'
+  ].join('\n')
+
+  assert.deepEqual(summarizeUnifiedDiff(diff), {
+    files: 2,
+    added: 2,
+    removed: 3,
+    paths: ['src/a.txt', 'src/b.txt']
+  })
+})
+
 test('diff file selection helpers persist the selected file per diff event', () => {
   const store = createSessionStoreState()
   const files = [
@@ -65,6 +91,7 @@ test('diff file selection helpers persist the selected file per diff event', () 
 test('buildChatMessages folds thinking details and keeps command steps interleaved before the answer', () => {
   const store = createSessionStoreState()
   store.backgroundExpandedByTurnId.set('turn-1', true)
+  store.toolExpanded.set('file-1', false)
   store.reasoningByTurnId.set('turn-1', {
     loading: false,
     loaded: true,
@@ -125,17 +152,45 @@ test('buildChatMessages folds thinking details and keeps command steps interleav
     },
     {
       eventId: 'e-6',
+      type: 'tool.completed',
+      seq: 8,
+      tsMs: 8,
+      payload: {
+        tool: 'fileChange',
+        itemId: 'file-1',
+        status: 'completed',
+        changes: [{ path: 'src/foo.js' }]
+      }
+    },
+    {
+      eventId: 'e-6b',
+      type: 'diff.updated',
+      seq: 8.5,
+      tsMs: 8.5,
+      payload: {
+        diff: [
+          'diff --git a/src/foo.js b/src/foo.js',
+          '--- a/src/foo.js',
+          '+++ b/src/foo.js',
+          '@@ -1 +1 @@',
+          '-old',
+          '+new'
+        ].join('\n')
+      }
+    },
+    {
+      eventId: 'e-7',
       type: 'session.output',
       payload: { stream: 'normalized', text: 'Hello there' }
     },
     {
-      eventId: 'e-7',
+      eventId: 'e-8',
       tsMs: 9_000,
       type: 'turn.completed',
       payload: { turnId: 'turn-1' }
     },
     {
-      eventId: 'e-8',
+      eventId: 'e-9',
       type: 'tool.completed',
       seq: 9,
       tsMs: 9,
@@ -162,7 +217,7 @@ test('buildChatMessages folds thinking details and keeps command steps interleav
     id: 'reasoning-sec-1',
     section: { id: 'sec-1', title: 'Plan', body: 'Read foo.js', seq: 5 }
   })
-  assert.equal(first[1].timeline[1]?.kind, 'command')
+  assert.equal(first[1].timeline[1]?.kind, 'tool')
   assert.equal(first[1].timeline[1]?.itemId, 'cmd-1')
   assert.equal(first[1].timeline[1]?.status, 'completed')
   assert.equal(first[1].timeline[1]?.exitCode, 0)
@@ -170,6 +225,11 @@ test('buildChatMessages folds thinking details and keeps command steps interleav
   assert.equal(first[1].timeline[2]?.kind, 'explore')
   assert.equal(first[1].timeline[2]?.label, 'Read foo.js')
   assert.match(String(first[1].timeline[2]?.id ?? ''), /^explorecall-item-1-\d+$/)
+  assert.equal(first[1].timeline[3]?.kind, 'tool')
+  assert.equal(first[1].timeline[3]?.tool, 'fileChange')
+  assert.deepEqual(first[1].timeline[3]?.changes, [{ path: 'src/foo.js' }])
+  assert.equal(first[1].timeline[4]?.kind, 'diff')
+  assert.match(String(first[1].timeline[4]?.raw ?? ''), /diff --git a\/src\/foo.js b\/src\/foo.js/)
   assert.equal(first[2].role, 'assistant')
   assert.equal(first[2].text, 'Hello there')
 
@@ -180,6 +240,31 @@ test('buildChatMessages folds thinking details and keeps command steps interleav
   const third = buildChatMessages(store)
   assert.notStrictEqual(third, first)
   assert.deepEqual(third, first)
+})
+
+test('buildChatMessages keeps diff steps raw until unfolded', () => {
+  const store = createSessionStoreState()
+  store.events.push({
+    eventId: 'diff-1',
+    type: 'diff.updated',
+    payload: {
+      diff: [
+        'diff --git a/src/a.txt b/src/a.txt',
+        '--- a/src/a.txt',
+        '+++ b/src/a.txt',
+        '@@ -1 +1 @@',
+        '-old',
+        '+new'
+      ].join('\n')
+    }
+  })
+
+  const messages = buildChatMessages(store)
+  assert.equal(messages.length, 1)
+  assert.equal(messages[0].stepKind, 'diff')
+  assert.equal(messages[0].expanded, false)
+  assert.equal('files' in messages[0], false)
+  assert.match(String(messages[0].raw ?? ''), /diff --git a\/src\/a.txt b\/src\/a.txt/)
 })
 
 test('buildChatMessages keeps an empty Thinking group visible while a turn is still running', () => {
@@ -209,7 +294,7 @@ test('buildChatMessages keeps an empty Thinking group visible while a turn is st
   assert.deepEqual(messages[1].timeline, [])
 })
 
-test('buildChatMessages keeps active assistant output above the Thinking row', () => {
+test('buildChatMessages keeps live commentary inside Thinking and hides the final answer until the turn completes', () => {
   const store = createSessionStoreState()
   store.currentTurnId = 'turn-live'
 
@@ -226,19 +311,46 @@ test('buildChatMessages keeps active assistant output above the Thinking row', (
     },
     {
       eventId: 'o-1',
+      seq: 2,
+      tsMs: 2,
       type: 'session.output',
-      payload: { stream: 'normalized', text: 'Working on it' }
+      payload: { stream: 'commentary', text: 'Working on it' }
+    },
+    {
+      eventId: 'o-2',
+      seq: 3,
+      tsMs: 3,
+      type: 'session.output',
+      payload: { stream: 'normalized', text: 'Final answer in progress' }
     }
   )
 
   const messages = buildChatMessages(store)
-  assert.equal(messages.length, 3)
+  assert.equal(messages.length, 2)
   assert.equal(messages[0].role, 'user')
-  assert.equal(messages[1].role, 'assistant')
-  assert.equal(messages[1].text, 'Working on it')
-  assert.equal(messages[2].stepKind, 'background')
-  assert.equal(messages[2].title, 'Thinking')
-  assert.equal(messages[2].active, true)
+  assert.equal(messages[1].stepKind, 'background')
+  assert.equal(messages[1].title, 'Thinking')
+  assert.equal(messages[1].active, true)
+  assert.deepEqual(
+    messages[1].timeline.map((it) => it.kind),
+    ['commentaryText']
+  )
+  assert.match(messages[1].timeline[0].text, /Working on it/)
+
+  store.currentTurnId = null
+  store.events.push({
+    eventId: 'done-1',
+    seq: 4,
+    tsMs: 4,
+    type: 'turn.completed',
+    payload: { turnId: 'turn-live' }
+  })
+
+  const completedMessages = buildChatMessages(store)
+  assert.equal(completedMessages.length, 3)
+  assert.equal(completedMessages[1].stepKind, 'background')
+  assert.equal(completedMessages[2].role, 'assistant')
+  assert.equal(completedMessages[2].text, 'Final answer in progress')
 })
 
 test('buildChatMessages interleaves live reasoning chunks with command steps by seq', () => {
@@ -297,4 +409,53 @@ test('buildChatMessages interleaves live reasoning chunks with command steps by 
   assert.match(messages[1].timeline[0].text, /Looking for the relevant files/)
   assert.equal(messages[1].timeline[1].label, 'Read README.md')
   assert.match(messages[1].timeline[2].text, /Now I know where to make the change/)
+})
+
+test('buildChatMessages keeps completed commentary-only turns in the Thinking history', () => {
+  const store = createSessionStoreState()
+  store.backgroundExpandedByTurnId.set('turn-1', true)
+
+  store.events.push(
+    {
+      eventId: 'u-1',
+      type: 'session.input',
+      payload: { text: 'Fix it', attachments: [] }
+    },
+    {
+      eventId: 't-1',
+      seq: 1,
+      tsMs: 1,
+      type: 'turn.started',
+      payload: { turnId: 'turn-1' }
+    },
+    {
+      eventId: 'c-1',
+      seq: 2,
+      tsMs: 2,
+      type: 'session.output',
+      payload: { stream: 'commentary', text: 'Checking the files first.' }
+    },
+    {
+      eventId: 'a-1',
+      seq: 3,
+      tsMs: 3,
+      type: 'session.output',
+      payload: { stream: 'normalized', text: 'Done.' }
+    },
+    {
+      eventId: 't-2',
+      seq: 4,
+      tsMs: 4,
+      type: 'turn.completed',
+      payload: { turnId: 'turn-1' }
+    }
+  )
+
+  const messages = buildChatMessages(store)
+  assert.equal(messages.length, 3)
+  assert.equal(messages[1].stepKind, 'background')
+  assert.deepEqual(messages[1].timeline.map((it) => it.kind), ['commentaryText'])
+  assert.match(messages[1].timeline[0].text, /Checking the files first/)
+  assert.equal(messages[2].role, 'assistant')
+  assert.equal(messages[2].text, 'Done.')
 })

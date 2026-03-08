@@ -76,5 +76,5 @@ test('eventRowToRecord parses payload and summarizeTextSnippet collapses whitesp
   })
 
   assert.equal(summarizeTextSnippet('  hello   there  '), 'hello there')
-  assert.match(SUMMARY_SESSION_EVENTS_WHERE, /session\.output|normalized|stderr/)
+  assert.match(SUMMARY_SESSION_EVENTS_WHERE, /session\.output|normalized|commentary|stderr/)
 })

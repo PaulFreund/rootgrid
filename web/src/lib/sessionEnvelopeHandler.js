@@ -234,7 +234,6 @@ export function createSessionEnvelopeHandler({
           store.turnHasReasoningLive.add(tid)
           store.messageViewVersion = Number(store.messageViewVersion ?? 0) + 1
         }
-        return
       }
       if (stream === 'plan') return
     }

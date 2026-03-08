@@ -27,6 +27,21 @@ Codex exposes a first-party structured interface (`codex app-server`) used by ri
   - a structured event stream (`events.jsonl`) for UI rendering
   - raw process stdout/stderr for debugging
 
+### Optional raw app-server capture
+
+When debugging protocol/compatibility issues, Rootgrid can capture the raw `codex app-server` stdio traffic for each session.
+
+- Config: `debug.codexRawCapture.enabled=true`
+- Optional output dir override: `debug.codexRawCapture.dir`
+- Default output dir: `~/.rootgrid/debug/codex/`
+- Capture includes:
+  - outbound JSON-RPC requests/notifications/responses
+  - inbound JSON-RPC requests/notifications/responses
+  - raw stderr chunks
+  - process spawn/exit records
+
+The capture is off by default and does not change normal session persistence.
+
 ### Making patch output reliable
 Prefer structured patch/diff artifacts if Codex emits them in the JSON-RPC event stream. Otherwise:
 - enforce a patch contract via session instructions
