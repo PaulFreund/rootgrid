@@ -47,6 +47,10 @@ test('buildRunnerInstallScript generates a self-contained bootstrap script', () 
   assert.match(script, /runnerToken/)
   assert.match(script, /https:\/\/rootgrid\.example\.test\/api\/install\/runner-bundle\?installToken=install-token-123/)
   assert.match(script, /ROOTGRID_FORCE=1/)
+  assert.match(script, /Install Codex now via npm\? \(npm i -g @openai\/codex\)/)
+  assert.match(script, /Install code-server now\? \(runs the official install script\)/)
+  assert.match(script, /Continue runner install without Codex\?/)
+  assert.match(script, /Continue runner install without code-server\?/)
 })
 
 test('runner install manager creates expiring bootstrap payloads', async () => {

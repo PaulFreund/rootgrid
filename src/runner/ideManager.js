@@ -1,7 +1,9 @@
 import { spawn } from 'node:child_process'
-import { mkdir, rm } from 'node:fs/promises'
+import { constants as fsConstants } from 'node:fs'
+import { access, mkdir, rm } from 'node:fs/promises'
 import net from 'node:net'
-import { join } from 'node:path'
+import { homedir } from 'node:os'
+import { delimiter, isAbsolute, join } from 'node:path'
 
 import { buildIdeBasePath } from '../lib/idePaths.js'
 import { getRootgridTmpDir } from '../lib/paths.js'
@@ -50,6 +52,7 @@ async function getFreePort() {
 }
 
 let cachedCodeServerCapabilitiesPromise = null
+let cachedCodeServerCommandPromise = null
 
 export function buildCodeServerEnv(baseEnv = process.env) {
   const env = { ...(baseEnv ?? {}) }
@@ -58,32 +61,101 @@ export function buildCodeServerEnv(baseEnv = process.env) {
   return env
 }
 
+export function listCodeServerCommandCandidates(baseEnv = process.env) {
+  const env = buildCodeServerEnv(baseEnv)
+  const values = [
+    env.ROOTGRID_CODE_SERVER_BIN,
+    env.CODE_SERVER_BIN
+  ]
+  const pathEntries = String(env.PATH ?? '')
+    .split(delimiter)
+    .map((value) => String(value ?? '').trim())
+    .filter(Boolean)
+  for (const dir of pathEntries) values.push(join(dir, 'code-server'))
+  const home = String(env.HOME ?? homedir() ?? '').trim()
+  if (home) values.push(join(home, '.local', 'bin', 'code-server'))
+  values.push('/usr/local/bin/code-server')
+  values.push('/usr/bin/code-server')
+  values.push('/opt/homebrew/bin/code-server')
+  values.push('/home/linuxbrew/.linuxbrew/bin/code-server')
+
+  const seen = new Set()
+  const out = []
+  for (const raw of values) {
+    const candidate = String(raw ?? '').trim()
+    if (!candidate || seen.has(candidate)) continue
+    seen.add(candidate)
+    out.push(candidate)
+  }
+  return out
+}
+
+async function resolveCodeServerCommand(baseEnv = process.env) {
+  if (!cachedCodeServerCommandPromise) {
+    cachedCodeServerCommandPromise = (async () => {
+      const candidates = listCodeServerCommandCandidates(baseEnv)
+      for (const candidate of candidates) {
+        if (!candidate) continue
+        if (!isAbsolute(candidate)) continue
+        try {
+          await access(candidate, fsConstants.X_OK)
+          return {
+            command: candidate,
+            candidates
+          }
+        } catch {
+        }
+      }
+      return {
+        command: null,
+        candidates
+      }
+    })()
+  }
+  return await cachedCodeServerCommandPromise
+}
+
 async function readCodeServerCapabilities() {
   if (!cachedCodeServerCapabilitiesPromise) {
-    cachedCodeServerCapabilitiesPromise = new Promise((resolve) => {
-      const proc = spawn('code-server', ['--help'], {
-        env: buildCodeServerEnv(process.env),
-        stdio: ['ignore', 'pipe', 'pipe']
-      })
-      let text = ''
-      const append = (chunk) => {
-        text += String(chunk ?? '')
-      }
-      proc.stdout?.on('data', append)
-      proc.stderr?.on('data', append)
-      proc.once('error', () => {
-        resolve({
+    cachedCodeServerCapabilitiesPromise = (async () => {
+      const resolved = await resolveCodeServerCommand(process.env)
+      if (!resolved.command) {
+        return {
+          command: null,
+          candidates: resolved.candidates,
           supportsAbsProxyBasePath: false,
           supportsBasePath: false
+        }
+      }
+      return await new Promise((resolve) => {
+        const proc = spawn(resolved.command, ['--help'], {
+          env: buildCodeServerEnv(process.env),
+          stdio: ['ignore', 'pipe', 'pipe']
+        })
+        let text = ''
+        const append = (chunk) => {
+          text += String(chunk ?? '')
+        }
+        proc.stdout?.on('data', append)
+        proc.stderr?.on('data', append)
+        proc.once('error', () => {
+          resolve({
+            command: resolved.command,
+            candidates: resolved.candidates,
+            supportsAbsProxyBasePath: false,
+            supportsBasePath: false
+          })
+        })
+        proc.once('exit', () => {
+          resolve({
+            command: resolved.command,
+            candidates: resolved.candidates,
+            supportsAbsProxyBasePath: text.includes('--abs-proxy-base-path'),
+            supportsBasePath: text.includes('--base-path')
+          })
         })
       })
-      proc.once('exit', () => {
-        resolve({
-          supportsAbsProxyBasePath: text.includes('--abs-proxy-base-path'),
-          supportsBasePath: text.includes('--base-path')
-        })
-      })
-    })
+    })()
   }
   return await cachedCodeServerCapabilitiesPromise
 }
@@ -174,6 +246,11 @@ export class RunnerIdeManager {
     if (!port) throw new Error('failed to allocate port')
 
     const capabilities = await readCodeServerCapabilities()
+    if (!capabilities?.command) {
+      const tried = Array.isArray(capabilities?.candidates) ? capabilities.candidates : []
+      const detail = tried.length ? ` Tried: ${tried.join(', ')}` : ''
+      throw new Error(`code-server not found.${detail} Set ROOTGRID_CODE_SERVER_BIN or install code-server on the runner host.`)
+    }
     const spec = buildCodeServerLaunchSpec({
       ideId,
       machineId: this.machineId,
@@ -186,7 +263,7 @@ export class RunnerIdeManager {
     })
     await mkdir(spec.userDataDir, { recursive: true })
 
-    const proc = spawn('code-server', spec.args, {
+    const proc = spawn(capabilities.command, spec.args, {
       cwd,
       env: buildCodeServerEnv(process.env),
       stdio: ['ignore', 'pipe', 'pipe']

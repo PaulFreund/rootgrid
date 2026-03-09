@@ -77,6 +77,105 @@ need_cmd() {
   fi
 }
 
+has_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+prompt_yes_no() {
+  local question="$1"
+  local default_answer="$2"
+  local reply=""
+
+  if [ -r /dev/tty ]; then
+    if [ "$default_answer" = "1" ]; then
+      printf "%s [Y/n]: " "$question" > /dev/tty
+    else
+      printf "%s [y/N]: " "$question" > /dev/tty
+    fi
+    read -r reply < /dev/tty || reply=""
+  fi
+
+  reply="$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')"
+  if [ -z "$reply" ]; then
+    [ "$default_answer" = "1" ]
+    return
+  fi
+  case "$reply" in
+    y|yes) return 0 ;;
+    n|no) return 1 ;;
+  esac
+  [ "$default_answer" = "1" ]
+}
+
+ensure_optional_tool() {
+  local name="$1"
+  local version_cmd="$2"
+  local install_question="$3"
+  local install_cmd="$4"
+  local docs_url="$5"
+  local continue_question="$6"
+
+  if eval "$version_cmd" >/dev/null 2>&1; then
+    local version_line
+    version_line="$(eval "$version_cmd" 2>/dev/null | head -n 1 || true)"
+    if [ -n "$version_line" ]; then
+      echo "[ok] $name: $version_line"
+    else
+      echo "[ok] $name: installed"
+    fi
+    return 0
+  fi
+
+  echo
+  echo "[!] $name was not found in PATH."
+  [ -n "$docs_url" ] && echo "    Docs: $docs_url"
+
+  local install_choice="\${ROOTGRID_AUTO_INSTALL_OPTIONAL_TOOLS:-}"
+  if [ "$name" = "Codex" ] && [ -n "\${ROOTGRID_INSTALL_CODEX:-}" ]; then
+    install_choice="$ROOTGRID_INSTALL_CODEX"
+  fi
+  if [ "$name" = "code-server" ] && [ -n "\${ROOTGRID_INSTALL_CODE_SERVER:-}" ]; then
+    install_choice="$ROOTGRID_INSTALL_CODE_SERVER"
+  fi
+
+  if [ "$install_choice" = "1" ] || [ "$install_choice" = "true" ] || [ "$install_choice" = "yes" ]; then
+    :
+  elif [ "$install_choice" = "0" ] || [ "$install_choice" = "false" ] || [ "$install_choice" = "no" ]; then
+    return 1
+  else
+    if ! prompt_yes_no "$install_question" 1; then
+      return 1
+    fi
+  fi
+
+  echo
+  echo "Installing $name…"
+  if ! sh -lc "$install_cmd"; then
+    echo
+    echo "[!] $name install command failed."
+  fi
+
+  if eval "$version_cmd" >/dev/null 2>&1; then
+    local version_line
+    version_line="$(eval "$version_cmd" 2>/dev/null | head -n 1 || true)"
+    if [ -n "$version_line" ]; then
+      echo "[ok] $name: $version_line"
+    else
+      echo "[ok] $name: installed"
+    fi
+    return 0
+  fi
+
+  echo
+  echo "[!] $name is still not available in PATH."
+  if [ -n "$continue_question" ]; then
+    if ! prompt_yes_no "$continue_question" 0; then
+      exit 1
+    fi
+  fi
+  return 1
+}
+
 need_cmd curl
 need_cmd tar
 need_cmd "$NODE_BIN"
@@ -90,6 +189,33 @@ fi
 mkdir -p "$EXTRACT_DIR" "$ROOTGRID_DIR"
 curl -fsSL "$ROOTGRID_BUNDLE_URL" -o "$ARCHIVE_PATH"
 tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"
+
+if has_cmd npm; then
+  ensure_optional_tool \
+    "Codex" \
+    "codex --version" \
+    "Install Codex now via npm? (npm i -g @openai/codex)" \
+    "npm i -g @openai/codex" \
+    "https://developers.openai.com/codex/cli" \
+    "Continue runner install without Codex?"
+else
+  echo
+  echo "[!] npm was not found in PATH, so Codex cannot be auto-installed."
+  echo "    Install Codex manually: npm i -g @openai/codex"
+  if ! has_cmd codex; then
+    if ! prompt_yes_no "Continue runner install without Codex?" 0; then
+      exit 1
+    fi
+  fi
+fi
+
+ensure_optional_tool \
+  "code-server" \
+  "code-server --version" \
+  "Install code-server now? (runs the official install script)" \
+  "curl -fsSL https://code-server.dev/install.sh | sh" \
+  "https://coder.com/docs/code-server/latest/install" \
+  "Continue runner install without code-server? (VS Code web viewer will be unavailable)"
 
 RUNNER_MACHINE_NAME="\${ROOTGRID_MACHINE_NAME:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo runner)}"
 RUNNER_MACHINE_ID="\${ROOTGRID_MACHINE_ID:-$("$NODE_BIN" -e "console.log(require('node:crypto').randomUUID())")}"

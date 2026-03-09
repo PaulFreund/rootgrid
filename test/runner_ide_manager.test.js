@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { buildCodeServerEnv, buildCodeServerLaunchSpec } from '../src/runner/ideManager.js'
+import { buildCodeServerEnv, buildCodeServerLaunchSpec, listCodeServerCommandCandidates } from '../src/runner/ideManager.js'
 
 test('buildCodeServerLaunchSpec uses a per-IDE user-data dir and base path', () => {
   const spec = buildCodeServerLaunchSpec({
@@ -45,4 +45,22 @@ test('buildCodeServerEnv strips VS Code session handoff variables', () => {
   assert.equal(env.HOME, '/home/test')
   assert.equal('VSCODE_IPC_HOOK_CLI' in env, false)
   assert.equal('CODE_SERVER_SESSION_SOCKET' in env, false)
+})
+
+test('listCodeServerCommandCandidates includes PATH and common fallback locations', () => {
+  const candidates = listCodeServerCommandCandidates({
+    HOME: '/home/test',
+    PATH: '/custom/bin:/usr/bin',
+    ROOTGRID_CODE_SERVER_BIN: '/special/code-server'
+  })
+
+  assert.deepEqual(candidates.slice(0, 6), [
+    '/special/code-server',
+    '/custom/bin/code-server',
+    '/usr/bin/code-server',
+    '/home/test/.local/bin/code-server',
+    '/usr/local/bin/code-server',
+    '/opt/homebrew/bin/code-server'
+  ])
+  assert.ok(candidates.includes('/home/linuxbrew/.linuxbrew/bin/code-server'))
 })
