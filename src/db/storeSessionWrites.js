@@ -29,6 +29,7 @@ export function buildCreateSessionRow({
     cwd,
     null,
     null,
+    'auto',
     null,
     status,
     'idle',
@@ -51,6 +52,7 @@ export function buildUpdateSessionStatement({
   codexThreadId,
   projectLabel,
   title,
+  titleSource,
   preview,
   turnState,
   pendingApprovals,
@@ -68,6 +70,7 @@ export function buildUpdateSessionStatement({
   if (codexThreadId !== undefined) { sets.push('codex_thread_id=?'); params.push(codexThreadId) }
   if (projectLabel !== undefined) { sets.push('project_label=?'); params.push(projectLabel) }
   if (title !== undefined) { sets.push('title=?'); params.push(title) }
+  if (titleSource !== undefined) { sets.push('title_source=?'); params.push(titleSource) }
   if (preview !== undefined) { sets.push('preview=?'); params.push(preview) }
   if (turnState !== undefined) { sets.push('turn_state=?'); params.push(turnState) }
   if (pendingApprovals !== undefined) { sets.push('pending_approvals=?'); params.push(pendingApprovals) }
@@ -111,7 +114,7 @@ export function buildDerivedSessionEventUpdate({ type, payload, tsMs, seq }) {
       params.push(text)
     }
     if (payload?.isInitial && text) {
-      sets.push(`title = CASE WHEN title IS NULL OR title='' THEN ? ELSE title END`)
+      sets.push(`title = CASE WHEN COALESCE(title_source, 'auto')='user' THEN title WHEN title IS NULL OR title='' THEN ? ELSE title END`)
       params.push(text)
     }
   }
@@ -127,6 +130,8 @@ export function buildDerivedSessionEventUpdate({ type, payload, tsMs, seq }) {
     const preview = summarizeTextSnippet(payload?.preview)
     if (preview) {
       sets.push('preview=?')
+      params.push(preview)
+      sets.push(`title = CASE WHEN COALESCE(title_source, 'auto')='user' THEN title ELSE ? END`)
       params.push(preview)
     }
   }
@@ -148,6 +153,27 @@ export function buildDerivedSessionEventUpdate({ type, payload, tsMs, seq }) {
     if (threadId && typeof threadId === 'string') {
       sets.push('codex_thread_id=?')
       params.push(threadId)
+    }
+
+    const threadPreview = summarizeTextSnippet(
+      payload?.threadPreview
+      ?? payload?.previewSuggestion
+      ?? payload?.preview
+    )
+    if (threadPreview) {
+      sets.push('preview=?')
+      params.push(threadPreview)
+    }
+
+    const titleSuggestion = summarizeTextSnippet(
+      payload?.threadName
+      ?? payload?.titleSuggestion
+      ?? payload?.threadPreview
+      ?? payload?.previewSuggestion
+    )
+    if (titleSuggestion) {
+      sets.push(`title = CASE WHEN COALESCE(title_source, 'auto')='user' THEN title ELSE ? END`)
+      params.push(titleSuggestion)
     }
   }
 

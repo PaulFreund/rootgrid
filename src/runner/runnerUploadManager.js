@@ -24,6 +24,8 @@ export class RunnerUploadManager {
     this.uploadsDir = uploadsDir
     /** @type {Map<string, { sessionId: string, path: string, filename: string, mimeType: string, sizeBytes: number, file: import('node:fs/promises').FileHandle, queue: Promise<void> }>} */
     this.uploadStreams = new Map()
+    /** @type {Map<string, Promise<any>>} */
+    this.uploadOpQueues = new Map()
   }
 
   #sessionScope(sessionId) {
@@ -80,25 +82,27 @@ export class RunnerUploadManager {
 
     if (!sessionId || typeof sessionId !== 'string') return
 
-    await this.#closeStream(uploadId, { removeFile: true })
+    await this.#enqueueUploadOp(uploadId, async () => {
+      await this.#closeStream(uploadId, { removeFile: true })
 
-    try {
-      const dir = join(this.uploadsDir, sessionId)
-      await mkdir(dir, { recursive: true, mode: 0o700 })
-      const path = join(dir, `${uploadId}-${filename}`)
-      const file = await open(path, 'w', 0o600)
-      this.uploadStreams.set(uploadId, {
-        sessionId,
-        path,
-        filename,
-        mimeType,
-        sizeBytes: 0,
-        file,
-        queue: Promise.resolve()
-      })
-    } catch (err) {
-      this.#emitUploadFailed(sessionId, uploadId, err?.message ?? err)
-    }
+      try {
+        const dir = join(this.uploadsDir, sessionId)
+        await mkdir(dir, { recursive: true, mode: 0o700 })
+        const path = join(dir, `${uploadId}-${filename}`)
+        const file = await open(path, 'w', 0o600)
+        this.uploadStreams.set(uploadId, {
+          sessionId,
+          path,
+          filename,
+          mimeType,
+          sizeBytes: 0,
+          file,
+          queue: Promise.resolve()
+        })
+      } catch (err) {
+        this.#emitUploadFailed(sessionId, uploadId, err?.message ?? err)
+      }
+    })
   }
 
   async chunk(payload) {
@@ -109,24 +113,26 @@ export class RunnerUploadManager {
     if (!uploadId || typeof uploadId !== 'string') return
     if (!chunkBase64 || typeof chunkBase64 !== 'string') return
 
-    const state = this.uploadStreams.get(uploadId)
-    if (!state) {
-      this.#emitUploadFailed(sessionId, uploadId, 'upload stream not found')
-      return
-    }
+    await this.#enqueueUploadOp(uploadId, async () => {
+      const state = this.uploadStreams.get(uploadId)
+      if (!state) {
+        this.#emitUploadFailed(sessionId, uploadId, 'upload stream not found')
+        return
+      }
 
-    const buf = Buffer.from(chunkBase64, 'base64')
-    state.queue = state.queue.then(async () => {
-      await state.file.write(buf, 0, buf.length, null)
-      state.sizeBytes += buf.length
+      const buf = Buffer.from(chunkBase64, 'base64')
+      state.queue = state.queue.then(async () => {
+        await state.file.write(buf, 0, buf.length, state.sizeBytes)
+        state.sizeBytes += buf.length
+      })
+
+      try {
+        await state.queue
+      } catch (err) {
+        await this.#closeStream(uploadId, { removeFile: true })
+        this.#emitUploadFailed(sessionId, uploadId, err?.message ?? err)
+      }
     })
-
-    try {
-      await state.queue
-    } catch (err) {
-      await this.#closeStream(uploadId, { removeFile: true })
-      this.#emitUploadFailed(sessionId, uploadId, err?.message ?? err)
-    }
   }
 
   async end(payload) {
@@ -135,29 +141,31 @@ export class RunnerUploadManager {
     if (!sessionId || typeof sessionId !== 'string') return
     if (!uploadId || typeof uploadId !== 'string') return
 
-    const state = this.uploadStreams.get(uploadId)
-    if (!state) {
-      this.#emitUploadFailed(sessionId, uploadId, 'upload stream not found')
-      return
-    }
+    await this.#enqueueUploadOp(uploadId, async () => {
+      const state = this.uploadStreams.get(uploadId)
+      if (!state) {
+        this.#emitUploadFailed(sessionId, uploadId, 'upload stream not found')
+        return
+      }
 
-    try {
-      await state.queue
-      await state.file.close()
-      this.uploadStreams.delete(uploadId)
+      try {
+        await state.queue
+        await state.file.close()
+        this.uploadStreams.delete(uploadId)
 
-      this.emit('session.uploaded', this.#sessionScope(sessionId), {
-        sessionId,
-        uploadId,
-        path: state.path,
-        filename: state.filename,
-        mimeType: state.mimeType,
-        sizeBytes: state.sizeBytes
-      })
-    } catch (err) {
-      await this.#closeStream(uploadId, { removeFile: true })
-      this.#emitUploadFailed(sessionId, uploadId, err?.message ?? err)
-    }
+        this.emit('session.uploaded', this.#sessionScope(sessionId), {
+          sessionId,
+          uploadId,
+          path: state.path,
+          filename: state.filename,
+          mimeType: state.mimeType,
+          sizeBytes: state.sizeBytes
+        })
+      } catch (err) {
+        await this.#closeStream(uploadId, { removeFile: true })
+        this.#emitUploadFailed(sessionId, uploadId, err?.message ?? err)
+      }
+    })
   }
 
   async abort(payload) {
@@ -165,7 +173,9 @@ export class RunnerUploadManager {
     const uploadId = payload?.uploadId
     if (!sessionId || typeof sessionId !== 'string') return
     if (!uploadId || typeof uploadId !== 'string') return
-    await this.#closeStream(uploadId, { removeFile: true })
+    await this.#enqueueUploadOp(uploadId, async () => {
+      await this.#closeStream(uploadId, { removeFile: true })
+    })
   }
 
   async delete(payload) {
@@ -174,24 +184,26 @@ export class RunnerUploadManager {
     if (!sessionId || typeof sessionId !== 'string') return
     if (!uploadId || typeof uploadId !== 'string') return
 
-    const dir = join(this.uploadsDir, sessionId)
-    let entries = []
-    try {
-      entries = await readdir(dir, { withFileTypes: true })
-    } catch {
-      return
-    }
-
-    const prefix = `${uploadId}-`
-    for (const ent of entries) {
-      const name = ent?.name
-      if (!name || typeof name !== 'string') continue
-      if (!name.startsWith(prefix)) continue
+    await this.#enqueueUploadOp(uploadId, async () => {
+      const dir = join(this.uploadsDir, sessionId)
+      let entries = []
       try {
-        await rm(join(dir, name), { force: true })
+        entries = await readdir(dir, { withFileTypes: true })
       } catch {
+        return
       }
-    }
+
+      const prefix = `${uploadId}-`
+      for (const ent of entries) {
+        const name = ent?.name
+        if (!name || typeof name !== 'string') continue
+        if (!name.startsWith(prefix)) continue
+        try {
+          await rm(join(dir, name), { force: true })
+        } catch {
+        }
+      }
+    })
   }
 
   async cleanupSession(sessionId) {
@@ -216,6 +228,21 @@ export class RunnerUploadManager {
     try { await state.file.close() } catch { }
     if (removeFile) {
       try { await rm(state.path, { force: true }) } catch { }
+    }
+  }
+
+  async #enqueueUploadOp(uploadId, task) {
+    const key = String(uploadId ?? '').trim()
+    if (!key) return await task()
+    const prev = this.uploadOpQueues.get(key) ?? Promise.resolve()
+    const next = prev.catch(() => {}).then(task)
+    this.uploadOpQueues.set(key, next)
+    try {
+      return await next
+    } finally {
+      if (this.uploadOpQueues.get(key) === next) {
+        this.uploadOpQueues.delete(key)
+      }
     }
   }
 }

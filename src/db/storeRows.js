@@ -34,6 +34,7 @@ export function sessionRowToRecord(row) {
     cwd: row.cwd,
     projectLabel: row.project_label ?? null,
     title: row.title ?? null,
+    titleSource: row.title_source ?? 'auto',
     preview: row.preview ?? null,
     status: row.status,
     turnState: row.turn_state,

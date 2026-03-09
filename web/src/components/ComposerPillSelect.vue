@@ -1,6 +1,8 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, useAttrs, watch } from 'vue'
 import { Check, ChevronDown } from 'lucide-vue-next'
+
+defineOptions({ inheritAttrs: false })
 
 const props = defineProps({
   modelValue: {
@@ -26,6 +28,7 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['update:modelValue'])
+const attrs = useAttrs()
 
 const rootEl = ref(null)
 const menuEl = ref(null)
@@ -159,7 +162,11 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="rootEl" class="relative inline-flex max-w-full align-middle">
+  <div
+    ref="rootEl"
+    class="relative inline-flex max-w-full align-middle"
+    v-bind="attrs"
+  >
     <button
       type="button"
       :disabled="disabled"

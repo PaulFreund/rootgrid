@@ -7,6 +7,7 @@ const SESSION_SELECT_SQL = `
     cwd,
     project_label,
     title,
+    title_source,
     preview,
     status,
     turn_state,

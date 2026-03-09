@@ -161,7 +161,7 @@ export function createSessionDialogActions({
   function openRenameSession(session, { focus = 'title' } = {}) {
     renameError.value = ''
     renameSessionId.value = session?.sessionId ?? null
-    renameTitleValue.value = String(session?.title ?? sessionListTitle(session) ?? '')
+    renameTitleValue.value = String(session?.title ?? '')
     renameProjectValue.value = String(session?.projectLabel ?? '')
     renameFocus.value = focus
     renameOpen.value = true
@@ -188,6 +188,11 @@ export function createSessionDialogActions({
     }
 
     const data = await res.json().catch(() => null)
+    if (Array.isArray(data?.sessions)) {
+      for (const session of data.sessions) {
+        if (session) upsertSessionRow(session)
+      }
+    }
     if (data?.session) upsertSessionRow(data.session)
     renameOpen.value = false
     return true

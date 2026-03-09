@@ -40,6 +40,7 @@ test('buildCreateSessionRow fills the expected session defaults', () => {
     '/repo',
     null,
     null,
+    'auto',
     null,
     'starting',
     'idle',
@@ -101,27 +102,42 @@ test('buildDerivedSessionEventUpdate captures preview/title/status/approval deri
     tsMs: 10,
     seq: 1
   }), {
-    sets: ['updated_ms=?', 'last_seq=?', 'preview=?', "title = CASE WHEN title IS NULL OR title='' THEN ? ELSE title END"],
+    sets: ['updated_ms=?', 'last_seq=?', 'preview=?', "title = CASE WHEN COALESCE(title_source, 'auto')='user' THEN title WHEN title IS NULL OR title='' THEN ? ELSE title END"],
     params: [10, 1, 'first message', 'first message']
   })
 
   assert.deepEqual(buildDerivedSessionEventUpdate({
     type: 'session.status',
-    payload: { status: 'failed', codexThreadId: 'thread-1' },
+    payload: {
+      status: 'running',
+      codexThreadId: 'thread-1',
+      threadName: 'Repo overview',
+      threadPreview: 'Summarize this repository'
+    },
     tsMs: 20,
     seq: 2
   }), {
-    sets: ['updated_ms=?', 'last_seq=?', 'status=?', 'turn_state=?', 'codex_thread_id=?'],
-    params: [20, 2, 'failed', 'idle', 'thread-1']
+    sets: ['updated_ms=?', 'last_seq=?', 'status=?', 'codex_thread_id=?', 'preview=?', "title = CASE WHEN COALESCE(title_source, 'auto')='user' THEN title ELSE ? END"],
+    params: [20, 2, 'running', 'thread-1', 'Summarize this repository', 'Repo overview']
+  })
+
+  assert.deepEqual(buildDerivedSessionEventUpdate({
+    type: 'turn.completed',
+    payload: { preview: 'Final repository summary' },
+    tsMs: 25,
+    seq: 3
+  }), {
+    sets: ['updated_ms=?', 'last_seq=?', 'turn_state=?', 'preview=?', "title = CASE WHEN COALESCE(title_source, 'auto')='user' THEN title ELSE ? END"],
+    params: [25, 3, 'idle', 'Final repository summary', 'Final repository summary']
   })
 
   assert.deepEqual(buildDerivedSessionEventUpdate({
     type: 'approval.resolved',
     payload: {},
     tsMs: 30,
-    seq: 3
+    seq: 4
   }), {
     sets: ['updated_ms=?', 'last_seq=?', 'pending_approvals = MAX(pending_approvals - 1, 0)'],
-    params: [30, 3]
+    params: [30, 4]
   })
 })

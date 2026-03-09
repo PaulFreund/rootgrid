@@ -1,5 +1,5 @@
 export const DEFAULT_SESSION_SIDEBAR_WIDTH = 300
-export const MIN_SESSION_SIDEBAR_WIDTH = 180
+export const MIN_SESSION_SIDEBAR_WIDTH = 220
 export const MAX_SESSION_SIDEBAR_WIDTH = 420
 
 export function clampSessionSidebarWidth(value, viewportWidth = 0) {
@@ -19,6 +19,10 @@ export function clampSessionSidebarWidth(value, viewportWidth = 0) {
 export function readStoredSessionSidebarWidth(storage = globalThis.localStorage, viewportWidth = 0) {
   try {
     const raw = storage?.getItem?.('rootgrid.sessionSidebarWidth')
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed) && parsed < MIN_SESSION_SIDEBAR_WIDTH) {
+      return clampSessionSidebarWidth(DEFAULT_SESSION_SIDEBAR_WIDTH, viewportWidth)
+    }
     return clampSessionSidebarWidth(raw, viewportWidth)
   } catch {
     return clampSessionSidebarWidth(DEFAULT_SESSION_SIDEBAR_WIDTH, viewportWidth)

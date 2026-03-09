@@ -47,6 +47,26 @@ test('storeSessionMeta helpers update session metadata fields in place', () => {
   assert.equal(session?.lastReadSeq, session?.lastSeq)
   assert.equal(session?.projectLabel, 'Project X')
   assert.equal(session?.title, 'Thread Title')
+  assert.equal(session?.titleSource, 'user')
+})
+
+test('clearing a session title restores auto title mode from preview', () => {
+  const store = buildStore()
+
+  store.appendEvent({
+    eventId: 'e-1',
+    sessionId: 's-1',
+    tsMs: 1,
+    type: 'turn.completed',
+    payload: { preview: 'Auto summary' }
+  })
+
+  assert.equal(setSessionTitle(store.db, 's-1', 'Pinned title'), true)
+  assert.equal(setSessionTitle(store.db, 's-1', null), true)
+
+  const session = store.getSession('s-1')
+  assert.equal(session?.title, 'Auto summary')
+  assert.equal(session?.titleSource, 'auto')
 })
 
 test('archive/unarchive/delete session helpers change visibility and existence', () => {

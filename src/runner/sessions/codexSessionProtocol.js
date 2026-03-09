@@ -72,15 +72,15 @@ export function sandboxPolicyCandidates(input, cwd) {
   }
 
   const out = []
-  for (const mode of modes) out.push(mode)
   for (const mode of modes) {
     const type = toType(mode)
     if (!type) continue
-    out.push({ type })
     if (type === 'workspaceWrite' && typeof cwd === 'string' && cwd) {
       out.push({ type, writableRoots: [cwd] })
     }
+    out.push({ type })
   }
+  for (const mode of modes) out.push(mode)
 
   return dedupeJsonObjects(out)
 }
@@ -203,7 +203,12 @@ export function buildStartTurnAttempts({
     input: Array.isArray(input) ? input : []
   }
   const approvalVals = approvalPolicies.length ? approvalPolicies : [null]
-  const sandboxPolicyVals = sandboxPolicies.length ? sandboxPolicies : [null]
+  const sandboxPolicyVals = sandboxPolicies.length
+    ? [
+        ...sandboxPolicies.filter((value) => value && typeof value === 'object'),
+        ...sandboxPolicies.filter((value) => typeof value === 'string' && value.trim())
+      ]
+    : [null]
   const sandboxVals = sandboxes.length ? sandboxes : [null]
   const out = []
 

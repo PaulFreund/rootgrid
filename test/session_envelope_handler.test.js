@@ -26,6 +26,7 @@ test('session envelope handler keeps registry maps in sync for snapshot/update/d
   const backfills = []
   const snapshotPageInfo = []
   let postVisibilityCalls = 0
+  const deletedSelections = []
   const toasts = { value: [] }
   const tokenUpdates = []
   const addedEvents = []
@@ -51,6 +52,7 @@ test('session envelope handler keeps registry maps in sync for snapshot/update/d
       backfills.push({ sessionId, afterSeq })
       return Promise.resolve()
     },
+    onSelectedSessionDeleted: (session) => deletedSelections.push(session),
     upsertMachineRow: (row) => upsertMachineRowInList(machines.value, row, machineRowsById),
     removeMachineLocal: () => {},
     removeSessionRow: (sessionId) => removeSessionRowInList(sessions.value, sessionId, sessionRowsById),
@@ -71,7 +73,7 @@ test('session envelope handler keeps registry maps in sync for snapshot/update/d
     payload: {
       connectionId: 'conn-1',
       machines: [{ machineId: 'm-1', machineName: 'runner-a' }],
-      sessions: [{ sessionId: 's-1', machineId: 'm-1', lastSeq: 5 }],
+      sessions: [{ sessionId: 's-1', machineId: 'm-1', lastSeq: 5, titleSource: 'auto' }],
       sessionsHasMore: true,
       sessionsNextBeforeUpdatedMs: 4,
       sessionsNextBeforeSessionId: 's-1',
@@ -92,6 +94,19 @@ test('session envelope handler keeps registry maps in sync for snapshot/update/d
     payload: { machineId: 'm-1', machineName: 'runner-b' }
   })
   assert.equal(machineRowsById.get('m-1')?.machineName, 'runner-b')
+
+  handleEnvelope({
+    type: 'session.status',
+    scope: { sessionId: 's-1' },
+    payload: {
+      status: 'running',
+      codexThreadId: 'thread-1',
+      threadName: 'Repository overview',
+      threadPreview: 'Summarize the repo'
+    }
+  })
+  assert.equal(sessionRowsById.get('s-1')?.title, 'Repository overview')
+  assert.equal(sessionRowsById.get('s-1')?.preview, 'Summarize the repo')
 
   handleEnvelope({
     type: 'approval.request',
@@ -170,11 +185,29 @@ test('session envelope handler keeps registry maps in sync for snapshot/update/d
   assert.equal(sessionStores.get('s-1').queueSending, false)
 
   handleEnvelope({
+    type: 'turn.completed',
+    scope: { sessionId: 's-1' },
+    payload: { preview: 'Final repository summary' }
+  })
+  assert.equal(sessionRowsById.get('s-1')?.title, 'Final repository summary')
+
+  sessionRowsById.get('s-1').titleSource = 'user'
+  sessionRowsById.get('s-1').title = 'Pinned title'
+  handleEnvelope({
+    type: 'turn.completed',
+    scope: { sessionId: 's-1' },
+    payload: { preview: 'Should not overwrite pinned title' }
+  })
+  assert.equal(sessionRowsById.get('s-1')?.title, 'Pinned title')
+
+  handleEnvelope({
     type: 'registry.session.delete',
     payload: { sessionId: 's-1' }
   })
   assert.equal(sessionRowsById.has('s-1'), false)
   assert.equal(selectedSessionId.value, null)
+  assert.equal(deletedSelections.length, 1)
+  assert.equal(deletedSelections[0]?.sessionId, 's-1')
 
   handleEnvelope({
     type: 'registry.hello',

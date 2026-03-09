@@ -108,3 +108,76 @@ test('runner release manager installs a received bundle and emits restart state'
     'machine.upgrade.state'
   ])
 })
+
+test('runner release manager accepts multi-chunk bundles beyond 64KB', async (t) => {
+  const base = await mkdtemp(join(tmpdir(), 'rootgrid-release-'))
+  t.after(async () => {
+    await rm(base, { recursive: true, force: true })
+  })
+
+  const rootgridHome = join(base, 'home', '.rootgrid')
+  const previousHome = process.env.ROOTGRID_HOME_DIR
+  process.env.ROOTGRID_HOME_DIR = rootgridHome
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.ROOTGRID_HOME_DIR
+    else process.env.ROOTGRID_HOME_DIR = previousHome
+  })
+  await mkdir(join(rootgridHome, 'releases'), { recursive: true })
+  const currentRelease = join(rootgridHome, 'releases', 'current-old')
+  await mkdir(join(currentRelease, 'src'), { recursive: true })
+  await writeFile(join(currentRelease, 'src', 'cli.js'), 'console.log("old")\n')
+  await switchCurrentRelease(currentRelease)
+
+  const sourceRoot = await createFakeSourceRoot(base, '9.9.10')
+  await writeFile(join(sourceRoot, 'web', 'dist', 'large.bin'), Buffer.alloc(200_000, 0x63))
+  const bundle = await createManagedReleaseBundle({
+    sourceRoot,
+    version: '9.9.10',
+    outDir: join(base, 'bundles'),
+    source: 'test'
+  })
+
+  const manager = new RunnerReleaseManager({
+    machineId: 'machine-1',
+    autostart: { enabled: true, method: 'systemd-user' },
+    upgrade: { enabled: true, keepReleases: 2 },
+    restartService() {
+      return true
+    },
+    emit() {}
+  })
+
+  const originalArgv1 = process.argv[1]
+  process.argv[1] = join(currentRelease, 'src', 'cli.js')
+  t.after(() => {
+    process.argv[1] = originalArgv1
+  })
+
+  const data = await readFile(bundle.bundlePath)
+  await manager.begin({
+    requestId: 'req-2',
+    releaseId: bundle.releaseId,
+    version: bundle.version,
+    sha256: bundle.sha256,
+    sizeBytes: bundle.sizeBytes
+  })
+  await manager.chunk({
+    requestId: 'req-2',
+    chunkBase64: data.subarray(0, 65_536).toString('base64')
+  })
+  await manager.chunk({
+    requestId: 'req-2',
+    chunkBase64: data.subarray(65_536, 131_072).toString('base64')
+  })
+  await manager.chunk({
+    requestId: 'req-2',
+    chunkBase64: data.subarray(131_072).toString('base64')
+  })
+  await manager.end({ requestId: 'req-2' })
+
+  const manifest = await waitFor(async () => {
+    const raw = await readFile(join(rootgridHome, 'current', 'release.json'), 'utf8').catch(() => null)
+    return raw ? JSON.parse(raw) : null
+  })
+  assert.equal(manifest.version, '9.9.10')
+})

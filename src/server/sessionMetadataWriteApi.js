@@ -29,7 +29,8 @@ export function createSessionMetadataWriteApi({
       if (parts[0] === 'api' && parts[1] === 'sessions' && parts.length === 3 && parts[2] && req.method === 'PUT') {
         if (!auth.requireAuth(req, res)) return true
         const sessionId = parts[2]
-        if (!getSessionOr404(res, sessionId)) return true
+        const currentSession = getSessionOr404(res, sessionId)
+        if (!currentSession) return true
 
         const body = await readJsonBody(req)
         const projectLabelRaw = body?.projectLabel
@@ -46,11 +47,36 @@ export function createSessionMetadataWriteApi({
         const projectLabel = (typeof projectLabelRaw === 'string') ? projectLabelRaw.trim() : null
         const title = (typeof titleRaw === 'string') ? titleRaw.trim() : null
 
-        if (projectLabelRaw !== undefined) store.setSessionProjectLabel(sessionId, projectLabel || null)
-        if (titleRaw !== undefined) store.setSessionTitle(sessionId, title || null)
+        const updatedSessionIds = new Set()
+        if (projectLabelRaw !== undefined) {
+          for (const updatedId of store.setWorkspaceProjectLabelBySessionId(sessionId, projectLabel || null)) {
+            if (updatedId) updatedSessionIds.add(updatedId)
+          }
+        }
+        if (titleRaw !== undefined) {
+          const currentTitle = (typeof currentSession?.title === 'string' && currentSession.title.trim()) ? currentSession.title.trim() : null
+          const currentTitleSource = String(currentSession?.titleSource ?? 'auto').trim() || 'auto'
+          const nextTitle = title || null
+          if (!(currentTitleSource === 'auto' && nextTitle === currentTitle)) {
+            store.setSessionTitle(sessionId, nextTitle)
+            updatedSessionIds.add(sessionId)
+          }
+        }
+
+        const updatedSessions = [...updatedSessionIds]
+          .map((updatedId) => store.getSession(updatedId))
+          .filter(Boolean)
+
+        for (const updatedSession of updatedSessions) {
+          sendSessionUpsert(updatedSession)
+        }
+
         const updated = store.getSession(sessionId)
-        sendSessionUpsert(updated)
-        json(res, 200, { ok: true, session: updated })
+        json(res, 200, {
+          ok: true,
+          session: updated,
+          sessions: updatedSessions
+        })
         return true
       }
 

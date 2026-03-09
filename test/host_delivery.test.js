@@ -891,6 +891,122 @@ test('session metadata routes rename, patch options, archive, unarchive, and del
   assert.equal(afterDelete.res.status, 404)
 })
 
+test('auto-managed session titles update from runner signals until explicitly overridden', async (t) => {
+  const svc = await startHostProcess({ cwd: process.cwd() })
+  t.after(async () => {
+    await svc.stop()
+  })
+
+  const port = svc.config.host.listen.port
+  const cookie = await login({ port, token: svc.config.host.auth.clientToken })
+  const machineId = 'machine-session-title-1'
+  const runner = await connectRunner({
+    port,
+    token: svc.config.host.auth.runnerToken,
+    machineId
+  })
+  t.after(() => {
+    try { runner.close() } catch {}
+  })
+
+  const draft = await apiJson({
+    port,
+    path: '/api/sessions/draft',
+    method: 'POST',
+    cookie,
+    body: {
+      machineId,
+      cwd: process.cwd()
+    }
+  })
+  assert.equal(draft.res.status, 200)
+  const sessionId = draft.data?.sessionId
+  assert.ok(sessionId)
+
+  runner.send(JSON.stringify({
+    v: 1,
+    type: 'session.status',
+    ts: Date.now(),
+    id: crypto.randomUUID(),
+    scope: { machineId, sessionId },
+    payload: {
+      sessionId,
+      status: 'running',
+      codexThreadId: 'thread-title-1',
+      threadName: 'Repository overview',
+      threadPreview: 'Summarize the repo'
+    }
+  }))
+
+  await waitFor(async () => {
+    const out = await apiJson({ port, path: `/api/sessions/${sessionId}`, cookie })
+    return out.data?.session?.title === 'Repository overview' ? out.data.session : null
+  }, { timeoutMs: 5_000, intervalMs: 50 })
+
+  const preserveAuto = await apiJson({
+    port,
+    path: `/api/sessions/${sessionId}`,
+    method: 'PUT',
+    cookie,
+    body: {
+      title: 'Repository overview',
+      projectLabel: 'Project Alias'
+    }
+  })
+  assert.equal(preserveAuto.res.status, 200)
+  assert.equal(preserveAuto.data?.session?.titleSource, 'auto')
+  assert.equal(preserveAuto.data?.session?.projectLabel, 'Project Alias')
+
+  runner.send(JSON.stringify({
+    v: 1,
+    type: 'turn.completed',
+    ts: Date.now(),
+    id: crypto.randomUUID(),
+    scope: { machineId, sessionId },
+    payload: {
+      sessionId,
+      status: 'completed',
+      preview: 'Final repository summary'
+    }
+  }))
+
+  const updated = await waitFor(async () => {
+    const out = await apiJson({ port, path: `/api/sessions/${sessionId}`, cookie })
+    return out.data?.session?.title === 'Final repository summary' ? out.data.session : null
+  }, { timeoutMs: 5_000, intervalMs: 50 })
+  assert.equal(updated?.titleSource, 'auto')
+
+  const manual = await apiJson({
+    port,
+    path: `/api/sessions/${sessionId}`,
+    method: 'PUT',
+    cookie,
+    body: {
+      title: 'Pinned title'
+    }
+  })
+  assert.equal(manual.res.status, 200)
+  assert.equal(manual.data?.session?.titleSource, 'user')
+
+  runner.send(JSON.stringify({
+    v: 1,
+    type: 'turn.completed',
+    ts: Date.now(),
+    id: crypto.randomUUID(),
+    scope: { machineId, sessionId },
+    payload: {
+      sessionId,
+      status: 'completed',
+      preview: 'Should not overwrite pinned title'
+    }
+  }))
+
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  const final = await apiJson({ port, path: `/api/sessions/${sessionId}`, cookie })
+  assert.equal(final.data?.session?.title, 'Pinned title')
+  assert.equal(final.data?.session?.titleSource, 'user')
+})
+
 test('machine delete requires a disconnected runner and removes machine sessions', async (t) => {
   const svc = await startHostProcess({ cwd: process.cwd() })
   t.after(async () => {

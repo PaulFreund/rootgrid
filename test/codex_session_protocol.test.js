@@ -16,10 +16,10 @@ import {
 test('approval and sandbox compatibility helpers preserve useful fallback variants', () => {
   assert.deepEqual(approvalPolicyCandidates('on-failure'), ['onFailure', 'on-failure'])
   assert.deepEqual(sandboxPolicyCandidates('workspace-write', '/repo'), [
-    'workspaceWrite',
-    'workspace-write',
+    { type: 'workspaceWrite', writableRoots: ['/repo'] },
     { type: 'workspaceWrite' },
-    { type: 'workspaceWrite', writableRoots: ['/repo'] }
+    'workspaceWrite',
+    'workspace-write'
   ])
 })
 
@@ -55,7 +55,7 @@ test('buildStartTurnAttempts prefers sandboxPolicy variants before sandbox fallb
     sandboxPolicies: ['workspaceWrite', { type: 'workspaceWrite', writableRoots: ['/repo'] }]
   })
 
-  assert.equal(attempts[0]?.sandboxPolicy, 'workspaceWrite')
+  assert.deepEqual(attempts[0]?.sandboxPolicy, { type: 'workspaceWrite', writableRoots: ['/repo'] })
   assert.equal('sandbox' in attempts[0], false)
   assert.ok(attempts.some((params) => params.sandbox === 'workspaceWrite'))
   assert.deepEqual(attempts.at(-1), {

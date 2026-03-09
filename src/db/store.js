@@ -32,6 +32,7 @@ import {
   deleteSession as deleteSessionRow,
   markSessionRead as markSessionReadRow,
   setSessionProjectLabel as setSessionProjectLabelRow,
+  setWorkspaceProjectLabelBySessionId as setWorkspaceProjectLabelBySessionIdRow,
   setSessionTitle as setSessionTitleRow,
   unarchiveSession as unarchiveSessionRow
 } from './storeSessionMeta.js'
@@ -294,6 +295,23 @@ export class Store {
         continue
       }
 
+      if (v === 9) {
+        // v9 -> v10: explicit title source for auto-managed Codex titles.
+        try { this.db.exec(`ALTER TABLE sessions ADD COLUMN title_source TEXT NOT NULL DEFAULT 'auto'`) } catch { }
+        this.db.exec(`
+          UPDATE sessions
+          SET title_source = CASE
+            WHEN title IS NULL OR TRIM(title)='' THEN 'auto'
+            ELSE 'user'
+          END
+          WHERE title_source IS NULL OR TRIM(title_source)=''
+        `)
+
+        v = 10
+        this.db.exec(`PRAGMA user_version = ${v}`)
+        continue
+      }
+
       throw new Error(`No migration available: ${v} -> ${v + 1}`)
     }
   }
@@ -366,6 +384,7 @@ export class Store {
         cwd,
         project_label,
         title,
+        title_source,
         preview,
         status,
         turn_state,
@@ -381,7 +400,7 @@ export class Store {
         sandbox_mode,
         archived_ms
       )
-      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(...buildCreateSessionRow({
       sessionId,
       machineId,
@@ -400,6 +419,7 @@ export class Store {
    *   codexThreadId?: string|null,
    *   projectLabel?: string|null,
    *   title?: string|null,
+   *   titleSource?: 'auto'|'user',
    *   preview?: string|null,
    *   turnState?: 'idle'|'running',
    *   pendingApprovals?: number,
@@ -416,6 +436,7 @@ export class Store {
     codexThreadId,
     projectLabel,
     title,
+    titleSource,
     preview,
     turnState,
     pendingApprovals,
@@ -431,6 +452,7 @@ export class Store {
       codexThreadId,
       projectLabel,
       title,
+      titleSource,
       preview,
       turnState,
       pendingApprovals,
@@ -459,6 +481,7 @@ export class Store {
         cwd,
         project_label,
         title,
+        title_source,
         preview,
         status,
         turn_state,
@@ -707,6 +730,17 @@ export class Store {
    */
   setSessionProjectLabel(sessionId, projectLabel) {
     return setSessionProjectLabelRow(this.db, sessionId, projectLabel)
+  }
+
+  /**
+   * Set/clear the project label for all sessions sharing the same machine + cwd as the given session.
+   * Returns the affected session ids.
+   * @param {string} sessionId
+   * @param {string|null} projectLabel
+   * @returns {string[]}
+   */
+  setWorkspaceProjectLabelBySessionId(sessionId, projectLabel) {
+    return setWorkspaceProjectLabelBySessionIdRow(this.db, sessionId, projectLabel)
   }
 
   /**

@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 9
+export const SCHEMA_VERSION = 10
 
 export const CREATE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS machines (
@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   cwd TEXT NOT NULL,
   project_label TEXT,
   title TEXT,
+  title_source TEXT NOT NULL DEFAULT 'auto',
   preview TEXT,
   status TEXT NOT NULL,
   turn_state TEXT NOT NULL DEFAULT 'idle',

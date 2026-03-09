@@ -289,6 +289,36 @@ test('buildChatMessages keeps an empty Thinking group visible while a turn is st
   assert.deepEqual(messages[1].timeline, [])
 })
 
+test('buildChatMessages falls back to the latest turn.started when store.currentTurnId is missing', () => {
+  const store = createSessionStoreState()
+
+  store.events.push(
+    {
+      eventId: 'u-1',
+      type: 'session.input',
+      payload: {
+        text: 'what is in the image',
+        attachments: [{ uploadId: 'up-1', url: '/image.jpg', filename: 'image.jpg', mimeType: 'image/jpeg' }]
+      }
+    },
+    {
+      eventId: 't-1',
+      seq: 2,
+      tsMs: 2,
+      type: 'turn.started',
+      payload: { turnId: 'turn-live' }
+    }
+  )
+
+  const messages = buildChatMessages(store)
+  assert.equal(messages.length, 2)
+  assert.equal(messages[0].role, 'user')
+  assert.equal(messages[0].attachments.length, 1)
+  assert.equal(messages[1].stepKind, 'background')
+  assert.equal(messages[1].active, true)
+  assert.equal(messages[1].title, 'Thinking')
+})
+
 test('buildChatMessages keeps live commentary inside Thinking and hides the final answer until the turn completes', () => {
   const store = createSessionStoreState()
   store.currentTurnId = 'turn-live'

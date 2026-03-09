@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Archive, ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FileText, FolderClosed, GitBranch, Loader2, MoreHorizontal, Pencil, Plus, Settings, SlidersHorizontal, Square, Terminal, Trash2, X } from 'lucide-vue-next'
+import { Archive, ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FileText, FolderClosed, GitBranch, Loader2, MoreHorizontal, Pencil, Plus, Settings, Square, Terminal, Trash2, X } from 'lucide-vue-next'
 
 import MarkdownView from './components/MarkdownView.vue'
 import ComposerPillSelect from './components/ComposerPillSelect.vue'
@@ -62,6 +62,9 @@ import {
 import {
   createComposerSessionActions
 } from './lib/composerSessionActions.js'
+import {
+  isImageMimeType
+} from './lib/composerAttachments.js'
 import {
   createMachineControlActions
 } from './lib/machineControls.js'
@@ -133,6 +136,10 @@ import {
   preferredMobilePane
 } from './lib/mobileLayout.js'
 import {
+  resolveMainPaneMode,
+  shouldAutoOpenNewThreadScreen
+} from './lib/mainPaneMode.js'
+import {
   computeVirtualWindowVariable
 } from './lib/virtualList.js'
 
@@ -201,6 +208,10 @@ const composerContextPopoverHover = ref(false)
 const composerMachinePopoverOpen = ref(false)
 const composerMachinePopoverHover = ref(false)
 
+function isImageType(mimeType) {
+  return isImageMimeType(mimeType)
+}
+
 // sessionId -> { events: [], diff: string, seen: Set<string> }
 const sessionStores = reactive(new Map())
 // sessionId -> { tokenUsage?: any, info?: any }
@@ -227,8 +238,9 @@ const defaults = reactive({
   sandbox: 'workspace-write'
 })
 
-// New thread dialog (Codex-style "pick machine + workspace" before starting).
+// New thread screen (pick machine + workspace before starting).
 const newThreadOpen = ref(false)
+const suppressAutoNewThreadScreen = ref(false)
 const newThreadMachineId = ref('')
 const newThreadCwd = ref('')
 const newThreadError = ref('')
@@ -241,7 +253,8 @@ const newThreadBrowseEntries = ref([]) // [{ name, path, kind }]
 const newThreadBrowseLoading = ref(false)
 const newThreadBrowseError = ref('')
 
-const settingsTab = ref('defaults') // defaults|machines|system
+const settingsTab = ref('defaults') // defaults|machines|threads|system
+const forceEmptyHomeScreen = ref(false)
 
 const machinesForSelect = computed(() => {
   return machines.value
@@ -269,6 +282,9 @@ const defaultsSelectedMachine = computed(() => {
   const mid = String(defaults.machineId ?? '').trim()
   if (!mid) return null
   return machineRowsById.get(mid) ?? null
+})
+const hasCompleteDefaultWorkspaceSelection = computed(() => {
+  return Boolean(String(defaults.cwd ?? '').trim() && defaultsSelectedMachine.value)
 })
 
 const deleteMachineRow = computed(() => {
@@ -565,9 +581,20 @@ function showMobileSessionList() {
   mobilePane.value = 'list'
 }
 
+function closeMainPaneScreen() {
+  if (newThreadOpen.value) closeNewThreadDialogBase()
+  if (defaultsOpen.value) defaultsOpen.value = false
+  if (!String(selectedSessionId.value ?? '').trim()) forceEmptyHomeScreen.value = true
+  if (isMobileLayout.value) showMobileSessionList()
+}
+
 function openSession(sessionId) {
   const sid = String(sessionId ?? '').trim()
   if (!sid) return
+  forceEmptyHomeScreen.value = false
+  suppressAutoNewThreadScreen.value = true
+  newThreadOpen.value = false
+  defaultsOpen.value = false
   selectedSessionId.value = sid
   if (isMobileLayout.value) mobilePane.value = 'session'
 }
@@ -622,7 +649,7 @@ const {
   enablePush,
   autoEnablePushOnLoad,
   disablePush,
-  openSettings
+  openSettings: openSettingsBase
 } = createSystemSettingsActions({
   apiFetch,
   authed,
@@ -632,6 +659,18 @@ const {
   settingsTab,
   defaultsOpen
 })
+
+function openSettings(tab = 'defaults') {
+  forceEmptyHomeScreen.value = false
+  suppressAutoNewThreadScreen.value = true
+  newThreadOpen.value = false
+  workspacePaneOpen.value = false
+  openSettingsBase(tab)
+  if (tab === 'threads') {
+    loadArchivedSessions().catch(() => {})
+  }
+  if (isMobileLayout.value) mobilePane.value = 'session'
+}
 
 function dismissToast(id) {
   dismissToastById(toasts.value, id)
@@ -982,6 +1021,27 @@ async function backfillSessionAfter(sessionId, { afterSeq, limit = 500 } = {}) {
 let handleEnvelope = () => {}
 let schedulePostVisibility = () => {}
 
+function handleSelectedSessionDeleted(session = null) {
+  const deletedCwd = String(session?.cwd ?? '').trim()
+  if (deletedCwd && String(defaults.cwd ?? '').trim() === deletedCwd) {
+    defaults.cwd = ''
+  }
+  suppressAutoNewThreadScreen.value = true
+  forceEmptyHomeScreen.value = true
+  newThreadOpen.value = false
+  defaultsOpen.value = false
+  messageDraft.value = ''
+  queuedPromptEditingId.value = null
+  queuedPromptEditDraft.value = ''
+  composerContextPopoverOpen.value = false
+  composerContextPopoverHover.value = false
+  workspacePaneOpen.value = false
+  activeIdeSession.value = null
+  ideFrameLoading.value = false
+  try { clearComposerAttachments?.() } catch {}
+  if (isMobileLayout.value) showMobileSessionList()
+}
+
 const baseHandleEnvelope = createSessionEnvelopeHandler({
   currentVisibility,
   notificationPermission,
@@ -1003,6 +1063,7 @@ const baseHandleEnvelope = createSessionEnvelopeHandler({
   selectedSessionId,
   sessionStores,
   backfillSessionAfter,
+  onSelectedSessionDeleted: handleSelectedSessionDeleted,
   upsertMachineRow,
   removeMachineLocal,
   removeSessionRow,
@@ -1136,10 +1197,12 @@ onLoginConnect = () => {
   autoEnablePushOnLoad().catch(() => {})
 }
 
-watch(selectedSessionId, async (sid) => {
+watch(selectedSessionId, async (sid, prevSid) => {
   closeSessionMenu()
   composerContextPopoverOpen.value = false
   composerContextPopoverHover.value = false
+  if (!String(sid ?? '').trim() && String(prevSid ?? '').trim()) suppressAutoNewThreadScreen.value = true
+  if (String(sid ?? '').trim()) forceEmptyHomeScreen.value = false
   if (!sid) {
     replaceUrlSessionParam(null)
     if (authed.value) schedulePostVisibility()
@@ -1196,6 +1259,9 @@ watch(defaultsOpen, (open) => {
   if (settingsTab.value === 'system') refreshPushSubscription().catch(() => {})
   if (settingsTab.value === 'machines' && (!runnerInstallCommand.value || Number(runnerInstallExpiresAtMs.value ?? 0) <= nowMs.value)) {
     loadRunnerInstallBootstrap().catch(() => {})
+  }
+  if (settingsTab.value === 'threads') {
+    loadArchivedSessions().catch(() => {})
   }
 })
 
@@ -1313,8 +1379,22 @@ const runnerInstallNeedsReachableUrl = computed(() => {
     return false
   }
 })
+const mainPaneMode = computed(() => {
+  return resolveMainPaneMode({
+    newThreadOpen: newThreadOpen.value,
+    defaultsOpen: defaultsOpen.value,
+    authed: authed.value,
+    suppressAutoNewThreadScreen: suppressAutoNewThreadScreen.value,
+    selectedSessionId: selectedSessionId.value,
+    deepLinkSessionId: deepLinkSessionId.value,
+    hasCompleteDefaultWorkspaceSelection: hasCompleteDefaultWorkspaceSelection.value,
+    isMobileLayout: isMobileLayout.value,
+    forceEmptyHomeScreen: forceEmptyHomeScreen.value
+  })
+})
 const showWorkspacePane = computed(() => {
   if (isMobileLayout.value) return false
+  if (mainPaneMode.value !== 'chat') return false
   return workspacePaneOpen.value
 })
 const composerContextUsage = computed(() => buildContextUsageSummary(selectedTokenUsage.value))
@@ -1628,8 +1708,8 @@ const {
 })
 
 const {
-  openNewThreadDialog,
-  closeNewThreadDialog,
+  openNewThreadDialog: openNewThreadDialogBase,
+  closeNewThreadDialog: closeNewThreadDialogBase,
   loadNewThreadBrowse,
   openNewThreadBrowse,
   selectNewThreadBrowseFolder,
@@ -1657,6 +1737,59 @@ const {
   clearComposerAttachments,
   selectedSessionId
 })
+
+function openNewThreadDialog() {
+  forceEmptyHomeScreen.value = false
+  suppressAutoNewThreadScreen.value = false
+  defaultsOpen.value = false
+  workspacePaneOpen.value = false
+  openNewThreadDialogBase()
+  if (isMobileLayout.value) mobilePane.value = 'session'
+}
+
+function closeNewThreadDialog() {
+  suppressAutoNewThreadScreen.value = true
+  if (!String(selectedSessionId.value ?? '').trim()) forceEmptyHomeScreen.value = true
+  closeNewThreadDialogBase()
+  if (isMobileLayout.value) showMobileSessionList()
+}
+
+function showInitialNewThreadIfNeeded() {
+  if (!shouldAutoOpenNewThreadScreen({
+    authed: authed.value,
+    suppressAutoNewThreadScreen: suppressAutoNewThreadScreen.value,
+    selectedSessionId: selectedSessionId.value,
+    deepLinkSessionId: deepLinkSessionId.value,
+    hasCompleteDefaultWorkspaceSelection: hasCompleteDefaultWorkspaceSelection.value,
+    isMobileLayout: isMobileLayout.value,
+    forceEmptyHomeScreen: forceEmptyHomeScreen.value
+  })) return
+  if (newThreadOpen.value || defaultsOpen.value) return
+  openNewThreadDialogBase()
+  if (isMobileLayout.value) mobilePane.value = 'session'
+}
+
+onLoginConnect = () => {
+  connectSse()
+  autoEnablePushOnLoad().catch(() => {})
+  if (deepLinkSessionId.value) {
+    openSession(deepLinkSessionId.value)
+    deepLinkSessionId.value = null
+    return
+  }
+  showInitialNewThreadIfNeeded()
+}
+
+watch(
+  () => mainPaneMode.value,
+  (mode) => {
+    if (mode !== 'new-thread') return
+    if (newThreadOpen.value) return
+    openNewThreadDialogBase()
+    if (isMobileLayout.value) mobilePane.value = 'session'
+  },
+  { immediate: true, flush: 'post' }
+)
 
 watch(newThreadMachineId, onNewThreadMachineChanged)
 
@@ -1704,6 +1837,17 @@ async function waitForNextPaint() {
   })
 }
 
+async function onChatAssetLoad() {
+  if (!stickToBottom.value) return
+  await nextTick()
+  await waitForNextPaint()
+  const el = chatScrollEl.value
+  if (!el) return
+  el.scrollTop = el.scrollHeight
+  await waitForNextPaint()
+  el.scrollTop = el.scrollHeight
+}
+
 watch(
   () => [selectedSessionId.value, Number(selectedStore.value?.messageViewVersion ?? 0)],
   async ([sessionId]) => {
@@ -1726,7 +1870,6 @@ const {
   unarchiveSessionById,
   unarchiveFromArchiveModal,
   loadArchivedSessions,
-  openArchiveModal,
   openDeleteModal,
   confirmDeleteSession,
   openDeleteMachineModal,
@@ -1738,6 +1881,7 @@ const {
   machineRowsById,
   removeMachineLocal,
   removeSessionRow,
+  onSelectedSessionDeleted: handleSelectedSessionDeleted,
   upsertSessionRow,
   selectedSessionId,
   sessions,
@@ -1756,14 +1900,9 @@ const {
   deleteMachineError
 })
 
-function openSessionMenuRenameTitle(session) {
+function openSessionMenuEdit(session) {
   closeSessionMenu()
-  openRenameSession(session, { focus: 'title' })
-}
-
-function openSessionMenuRenameProject(session) {
-  closeSessionMenu()
-  openRenameSession(session, { focus: 'project' })
+  openRenameSession(session)
 }
 
 function openSessionMenuDelete(sessionId) {
@@ -2267,6 +2406,10 @@ onMounted(async () => {
     if (raw) Object.assign(defaults, JSON.parse(raw))
   } catch {
   }
+  // Transient panes should never persist across a fresh app load.
+  newThreadOpen.value = false
+  defaultsOpen.value = false
+  workspacePaneOpen.value = false
   refreshMobileLayout()
   sessionSidebarWidth.value = readSessionSidebarWidth()
 
@@ -2311,10 +2454,10 @@ onMounted(async () => {
       else if (workspacePaneOpen.value) closeWorkspacePane()
       if (sessionMenuId.value) closeSessionMenu()
       else if (renameOpen.value) renameOpen.value = false
+      else if (newThreadOpen.value) closeNewThreadDialog()
       else if (defaultsOpen.value) defaultsOpen.value = false
       else if (deleteOpen.value) deleteOpen.value = false
       else if (deleteMachineOpen.value) deleteMachineOpen.value = false
-      else if (archiveOpen.value) archiveOpen.value = false
     }
   }
   keydownHandler = onKeyDown
@@ -2372,12 +2515,7 @@ onMounted(async () => {
 
   await checkAuth()
   if (authed.value) {
-    connectSse()
-    autoEnablePushOnLoad().catch(() => {})
-    if (deepLinkSessionId.value) {
-      openSession(deepLinkSessionId.value)
-      deepLinkSessionId.value = null
-    }
+    onLoginConnect()
   }
 })
 
@@ -2544,24 +2682,15 @@ watch(
           <div class="shrink-0 px-2 pb-2 pt-3">
             <div class="flex items-center justify-between gap-2 px-2">
               <div class="flex h-7 items-center text-[11px] text-slate-400">Threads</div>
-              <div class="flex items-center gap-1">
-                <button
-                  class="inline-flex h-7 items-center justify-center gap-1 rounded-md px-2 text-[11px] text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                  :class="sessionListGroupingMode === 'project' ? 'bg-black/[0.05] text-slate-700' : ''"
-                  :title="sessionListGroupingMode === 'project' ? 'Show a flat thread list' : 'Group by host + project'"
-                  @click="toggleSessionListGrouping"
-                >
-                  <FolderClosed class="h-3.5 w-3.5" />
-                  {{ sessionListGroupingMode === 'project' ? 'Grouped' : 'Flat' }}
-                </button>
-                <button
-                  class="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                  @click="openArchiveModal"
-                  title="Thread filters / archived threads"
-                >
-                  <SlidersHorizontal class="h-3.5 w-3.5" />
-                </button>
-              </div>
+              <button
+                class="inline-flex h-7 items-center justify-center gap-1 rounded-md px-2 text-[11px] text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                :class="sessionListGroupingMode === 'project' ? 'bg-black/[0.05] text-slate-700' : ''"
+                :title="sessionListGroupingMode === 'project' ? 'Show a flat thread list' : 'Group by host + project'"
+                @click="toggleSessionListGrouping"
+              >
+                <FolderClosed class="h-3.5 w-3.5" />
+                {{ sessionListGroupingMode === 'project' ? 'Grouped' : 'Flat' }}
+              </button>
             </div>
           </div>
 
@@ -2625,7 +2754,7 @@ watch(
                             <div class="relative shrink-0" data-session-menu-root="true">
                               <button
                                 class="inline-flex h-6 w-6 items-center justify-center rounded-md text-slate-300 transition-colors hover:bg-black/[0.05] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                                :class="sessionMenuId === entry.session.sessionId ? 'bg-black/[0.05] text-slate-600 opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'"
+                                :class="sessionMenuId === entry.session.sessionId ? 'bg-black/[0.05] text-slate-600 opacity-100' : (isMobileLayout ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100')"
                                 title="Thread actions"
                                 @click.stop="toggleSessionMenu(entry.session.sessionId)"
                               >
@@ -2638,15 +2767,9 @@ watch(
                               >
                                 <button
                                   class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
-                                  @click.stop="openSessionMenuRenameTitle(entry.session)"
+                                  @click.stop="openSessionMenuEdit(entry.session)"
                                 >
-                                  Rename thread
-                                </button>
-                                <button
-                                  class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
-                                  @click.stop="openSessionMenuRenameProject(entry.session)"
-                                >
-                                  Edit project
+                                  Edit
                                 </button>
                                 <button
                                   class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
@@ -2730,14 +2853,14 @@ watch(
           :class="isMobileLayout ? 'w-full rounded-none shadow-none' : 'rounded-[16px] shadow-[0_1px_2px_rgba(0,0,0,0.03)]'"
         >
           <header class="bg-white px-4 py-2.5">
-            <div class="flex items-start justify-between gap-4">
+            <div v-if="mainPaneMode === 'chat'" class="flex items-start justify-between gap-4">
               <div class="min-w-0">
                 <div class="flex min-w-0 items-center gap-2">
                   <button
                     v-if="isMobileLayout"
                     class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
                     title="Back to threads"
-                  @click="showMobileSessionList"
+                    @click="showMobileSessionList"
                   >
                     <ArrowLeft class="h-4 w-4" />
                   </button>
@@ -2791,12 +2914,58 @@ watch(
                 </button>
               </div>
             </div>
+
+            <div v-else-if="mainPaneMode === 'new-thread' || mainPaneMode === 'settings'" class="flex items-start justify-between gap-4">
+              <div class="min-w-0 flex items-start gap-2">
+                <button
+                  v-if="isMobileLayout"
+                  class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  title="Back to threads"
+                  @click="closeMainPaneScreen"
+                >
+                  <ArrowLeft class="h-4 w-4" />
+                </button>
+                <div class="min-w-0">
+                  <div class="truncate text-[13px] font-semibold text-slate-800">
+                    {{ mainPaneMode === 'new-thread' ? 'New thread' : 'Settings' }}
+                  </div>
+                  <div class="mt-0.5 truncate text-[11px] text-slate-500">
+                    {{ mainPaneMode === 'new-thread' ? 'Choose a machine and workspace before starting.' : 'Defaults, machines, threads, and system settings.' }}
+                  </div>
+                </div>
+              </div>
+
+              <button
+                v-if="!isMobileLayout"
+                class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                title="Close"
+                @click="closeMainPaneScreen"
+              >
+                <X class="h-4 w-4" />
+              </button>
+            </div>
+
+            <div v-else-if="mainPaneMode === 'empty'" class="flex items-start justify-between gap-4">
+              <div class="min-w-0 flex items-start gap-2">
+                <button
+                  v-if="isMobileLayout"
+                  class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  title="Back to threads"
+                  @click="showMobileSessionList"
+                >
+                  <ArrowLeft class="h-4 w-4" />
+                </button>
+                <div class="min-w-0">
+                  <div class="truncate text-[13px] font-semibold text-slate-800">Rootgrid</div>
+                </div>
+              </div>
+            </div>
           </header>
 
-          <div class="relative flex-1 min-h-0">
+          <div v-if="mainPaneMode === 'chat'" class="relative flex-1 min-h-0">
             <div
               ref="chatScrollEl"
-              class="absolute inset-0 overflow-auto px-4 py-6 sm:px-6 sm:py-8"
+              class="absolute inset-0 overflow-auto px-3 py-6 sm:px-4 sm:py-8 lg:px-6"
               @scroll="onChatScroll"
             >
               <div class="mx-auto w-full max-w-[700px]">
@@ -3252,10 +3421,10 @@ watch(
                   <!-- User + assistant bubbles -->
                   <div
                     v-else
-                    class="max-w-[640px] text-sm leading-7 text-slate-700 transition-colors"
+                    class="text-sm leading-7 text-slate-700 transition-colors"
                     :class="m.role === 'user'
-                      ? 'rounded-2xl bg-[#efefec] px-4 py-3 text-slate-700 shadow-sm'
-                      : 'px-0 py-0 text-slate-700'"
+                      ? 'max-w-[640px] rounded-2xl bg-[#efefec] px-4 py-3 text-slate-700 shadow-sm'
+                      : 'w-full max-w-[640px] px-0 py-0 text-slate-700'"
                   >
                     <div v-if="m.role === 'assistant'">
                       <div v-if="String(m.text ?? '').trim()">
@@ -3268,17 +3437,22 @@ watch(
                           v-for="a in m.attachments"
                           :key="a.uploadId ?? a.url ?? a.filename"
                           :href="a.url"
-                          class="block"
+                          class="block max-w-[240px] sm:max-w-[320px]"
                           target="_blank"
                           rel="noopener noreferrer"
                           :title="a.filename"
                         >
-                          <img
+                          <div
                             v-if="isImageType(a.mimeType)"
-                            :src="a.url"
-                            :alt="a.filename"
-                            class="h-20 w-20 rounded-xl object-cover ring-1 ring-slate-200 hover:ring-slate-300"
-                          />
+                            class="inline-flex max-w-full rounded-2xl bg-white p-1 ring-1 ring-slate-200 transition-colors hover:ring-slate-300"
+                          >
+                            <img
+                              :src="a.url"
+                              :alt="a.filename"
+                              class="block max-h-44 max-w-full rounded-xl object-contain"
+                              @load="onChatAssetLoad"
+                            />
+                          </div>
                           <div
                             v-else
                             class="flex h-12 max-w-[220px] items-center justify-center rounded-xl bg-white px-3 text-xs text-slate-800 ring-1 ring-slate-200 hover:ring-slate-300"
@@ -3353,8 +3527,36 @@ watch(
             </div>
           </div>
 
+          <div v-else-if="mainPaneMode === 'empty'" class="min-h-0 flex-1 overflow-auto px-4 py-6 sm:px-6 sm:py-8">
+            <div class="mx-auto flex h-full w-full max-w-2xl flex-col items-center justify-center text-center">
+              <div class="text-lg font-semibold text-slate-800">No thread selected</div>
+              <div class="mt-2 max-w-md text-sm text-slate-500">
+                Choose a thread from the sidebar or start a new one.
+              </div>
+              <div class="mt-5 flex flex-wrap items-center justify-center gap-2">
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-2 rounded-full bg-slate-900 px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/30"
+                  @click="openNewThreadDialog"
+                >
+                  <Plus class="h-4 w-4" />
+                  New thread
+                </button>
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-2 rounded-full border border-black/[0.08] bg-white px-3.5 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-black/[0.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  @click="openSettings('machines')"
+                >
+                  <Settings class="h-4 w-4" />
+                  Settings
+                </button>
+              </div>
+            </div>
+          </div>
+
           <footer
-            class="relative bg-white px-4 pb-3 pt-2 sm:px-6 sm:pb-4"
+            v-if="mainPaneMode === 'chat'"
+            class="relative bg-white px-3 pb-3 pt-2 sm:px-4 sm:pb-4 lg:px-6"
             @dragenter.prevent="onComposerDragEnter"
             @dragleave.prevent="onComposerDragLeave"
             @dragover.prevent
@@ -3492,7 +3694,7 @@ watch(
                       v-if="a.previewUrl"
                       :src="a.previewUrl"
                       :alt="a.filename"
-                      class="h-14 w-14 rounded-xl object-cover"
+                      class="block max-h-16 max-w-[72px] rounded-xl object-contain"
                     />
                     <div v-else class="flex h-14 w-40 items-center justify-center rounded-xl bg-slate-50 px-2 text-xs text-slate-800">
                       <div class="truncate" :title="a.filename">{{ a.filename }}</div>
@@ -3501,7 +3703,7 @@ watch(
                 </div>
 
                 <div class="mt-2 flex items-center justify-between gap-2">
-                  <div class="flex min-w-0 items-center gap-1 overflow-x-auto pb-1 sm:gap-1.5">
+                  <div class="flex min-w-0 items-center gap-0.5 overflow-x-auto pb-1 sm:gap-1">
                     <input
                       ref="fileInputEl"
                       type="file"
@@ -3553,7 +3755,7 @@ watch(
               </div>
 
               <div class="mt-2 flex flex-wrap items-center justify-between gap-2 px-1 text-[11px] text-slate-400">
-                <div class="flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
+                <div class="flex min-w-0 flex-wrap items-center gap-1 sm:gap-1.5">
                   <div
                     class="relative shrink-0"
                     data-machine-upgrade-root="true"
@@ -3705,6 +3907,532 @@ watch(
               </div>
             </div>
           </footer>
+
+          <div v-else-if="mainPaneMode === 'new-thread' || mainPaneMode === 'settings'" class="min-h-0 flex-1 overflow-auto px-4 py-4 sm:px-6 sm:py-6">
+            <div :class="mainPaneMode === 'new-thread' ? 'mx-auto w-full max-w-xl' : 'mx-auto w-full max-w-3xl'">
+              <div v-if="mainPaneMode === 'new-thread'" class="space-y-4">
+                <div>
+                  <div class="text-xs uppercase tracking-wider text-slate-500">1) Machine</div>
+                  <select
+                    v-model="newThreadMachineId"
+                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+                    :disabled="!machinesForSelect.length"
+                  >
+                    <option value="" disabled>(select a machine)</option>
+                    <option v-for="m in machinesForSelect" :key="m.machineId" :value="m.machineId">
+                      {{ m.machineName }} · {{ m.platform }} · {{ machineStatusLabel(m) }} · {{ String(m.machineId).slice(0, 8) }}
+                    </option>
+                  </select>
+                  <div v-if="!machines.length" class="mt-2 text-xs text-slate-600">
+                    No machines yet.
+                  </div>
+                  <div v-else-if="newThreadSelectedMachine" class="mt-2 flex items-center gap-2 text-xs" :class="newThreadSelectedMachineOnline ? 'text-emerald-700' : 'text-slate-700'">
+                    <span class="h-2.5 w-2.5 rounded-full" :class="newThreadSelectedMachineOnline ? 'bg-emerald-500' : 'bg-slate-400'" />
+                    <span>{{ machineStatusLabel(newThreadSelectedMachine) }}</span>
+                  </div>
+                </div>
+
+                <div>
+                  <div class="flex items-end justify-between gap-3">
+                    <div class="text-xs uppercase tracking-wider text-slate-500">2) Workspace</div>
+                    <button
+                      class="rounded-md bg-slate-100 px-3 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                      @click="openNewThreadBrowse"
+                      :disabled="!newThreadMachineId || !newThreadSelectedMachineOnline"
+                    >
+                      Browse…
+                    </button>
+                  </div>
+                  <input
+                    v-model="newThreadCwd"
+                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+                    placeholder="/home/me/project"
+                  />
+
+                  <div v-if="newThreadRecentWorkspaces.length" class="mt-3">
+                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Recent projects</div>
+                    <div class="mt-2 space-y-1">
+                      <button
+                        v-for="p in newThreadRecentWorkspaces"
+                        :key="p.cwd"
+                        class="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-left transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 active:scale-[0.99]"
+                        @click="newThreadCwd = p.cwd"
+                        :title="p.cwd"
+                      >
+                        <div class="truncate text-sm font-medium text-slate-900">{{ p.label }}</div>
+                        <div class="mt-0.5 truncate text-xs text-slate-600">{{ p.cwd }}</div>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-if="newThreadBrowseOpen" class="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Folder browser</div>
+                    <button
+                      class="rounded-md bg-white px-2.5 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                      @click="newThreadBrowseOpen = false"
+                    >
+                      Close
+                    </button>
+                  </div>
+
+                  <div class="mt-2 flex items-center gap-2">
+                    <button
+                      class="rounded-md bg-white px-2.5 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                      @click="newThreadBrowseParent ? loadNewThreadBrowse(newThreadBrowseParent) : null"
+                      :disabled="!newThreadBrowseParent || newThreadBrowseLoading"
+                    >
+                      Up
+                    </button>
+                    <div class="min-w-0 flex-1 truncate rounded-md bg-white px-3 py-1.5 text-xs text-slate-700 ring-1 ring-slate-200" :title="newThreadBrowsePath">
+                      {{ newThreadBrowsePath || (newThreadBrowseLoading ? 'Loading…' : '—') }}
+                    </div>
+                    <button
+                      class="rounded-md bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                      @click="selectNewThreadBrowseFolder"
+                      :disabled="!newThreadBrowsePath"
+                    >
+                      Use folder
+                    </button>
+                  </div>
+
+                  <div v-if="newThreadBrowseError" class="mt-2 text-sm text-red-600">{{ newThreadBrowseError }}</div>
+
+                  <div class="mt-3 max-h-64 overflow-auto rounded-lg border border-slate-200 bg-white">
+                    <div v-if="newThreadBrowseLoading" class="px-3 py-4 text-sm text-slate-600">Loading…</div>
+                    <div v-else-if="!newThreadBrowseEntries.length" class="px-3 py-4 text-sm text-slate-600">No folders.</div>
+                    <button
+                      v-for="entry in newThreadBrowseEntries"
+                      v-else
+                      :key="entry.path"
+                      class="flex w-full items-center justify-between gap-3 border-b border-slate-100 px-3 py-2 text-left text-sm transition-colors last:border-b-0 hover:bg-slate-50"
+                      @click="loadNewThreadBrowse(entry.path)"
+                    >
+                      <div class="min-w-0">
+                        <div class="truncate font-medium text-slate-900">{{ entry.name }}</div>
+                        <div class="truncate text-xs text-slate-500">{{ entry.path }}</div>
+                      </div>
+                      <div class="shrink-0 text-xs text-slate-400">{{ entry.kind }}</div>
+                    </button>
+                  </div>
+                </div>
+
+                <div v-if="newThreadError" class="text-sm text-red-600">{{ newThreadError }}</div>
+
+                <div class="flex items-center justify-end gap-2">
+                  <button
+                    class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                    @click="closeNewThreadDialog"
+                    :disabled="newThreadCreating"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    class="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
+                    @click="confirmNewThreadDialog"
+                    :disabled="newThreadCreating"
+                  >
+                    <Loader2 v-if="newThreadCreating" class="h-4 w-4 animate-spin" />
+                    Start
+                  </button>
+                </div>
+              </div>
+
+              <div v-else class="space-y-4">
+                <div class="flex items-center gap-2 text-xs">
+                  <button
+                    class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                    :class="settingsTab === 'defaults' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
+                    @click="settingsTab = 'defaults'"
+                  >
+                    Defaults
+                  </button>
+                  <button
+                    class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                    :class="settingsTab === 'machines' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
+                    @click="settingsTab = 'machines'"
+                  >
+                    Machines
+                  </button>
+                  <button
+                    class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                    :class="settingsTab === 'threads' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
+                    @click="settingsTab = 'threads'; loadArchivedSessions()"
+                  >
+                    Threads
+                  </button>
+                  <button
+                    class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                    :class="settingsTab === 'system' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
+                    @click="settingsTab = 'system'"
+                  >
+                    System
+                  </button>
+                </div>
+
+                <div v-if="settingsTab === 'defaults'" class="space-y-3">
+                  <div>
+                    <div class="text-xs uppercase tracking-wider text-slate-500">Workspace (cwd)</div>
+                    <input
+                      v-model="defaults.cwd"
+                      class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+                      placeholder="/home/me/project"
+                    />
+                  </div>
+
+                  <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <div>
+                      <div class="text-xs uppercase tracking-wider text-slate-500">Machine</div>
+                      <select
+                        v-model="defaults.machineId"
+                        class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+                      >
+                        <option value="">(auto)</option>
+                        <option v-for="m in machinesForSelect" :key="m.machineId" :value="m.machineId">
+                          {{ m.machineName }} · {{ m.platform }} · {{ machineStatusLabel(m) }} · {{ String(m.machineId).slice(0, 8) }}
+                        </option>
+                      </select>
+                      <div v-if="defaultsSelectedMachine" class="mt-2 flex items-center gap-2 text-xs" :class="machineIsOnline(defaultsSelectedMachine) ? 'text-emerald-700' : 'text-slate-700'">
+                        <span class="h-2.5 w-2.5 rounded-full" :class="machineIsOnline(defaultsSelectedMachine) ? 'bg-emerald-500' : 'bg-slate-400'" />
+                        <span>{{ machineStatusLabel(defaultsSelectedMachine) }}</span>
+                      </div>
+                    </div>
+
+                    <div>
+                      <div class="text-xs uppercase tracking-wider text-slate-500">Model</div>
+                      <input
+                        v-model="defaults.model"
+                        class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+                        placeholder="(optional)"
+                      />
+                    </div>
+                  </div>
+
+                  <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <div>
+                      <div class="text-xs uppercase tracking-wider text-slate-500">Approval policy</div>
+                      <select
+                        v-model="defaults.approvalPolicy"
+                        class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+                      >
+                        <option value="untrusted">untrusted</option>
+                        <option value="on-request">on-request</option>
+                        <option value="never">never</option>
+                        <option value="on-failure">on-failure</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <div class="text-xs uppercase tracking-wider text-slate-500">Sandbox</div>
+                      <select
+                        v-model="defaults.sandbox"
+                        class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+                      >
+                        <option value="read-only">read-only</option>
+                        <option value="workspace-write">workspace-write</option>
+                        <option value="danger-full-access">danger-full-access</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div v-if="defaultsError" class="text-sm text-red-600">{{ defaultsError }}</div>
+                </div>
+
+                <div v-else-if="settingsTab === 'machines'" class="space-y-3">
+                  <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                    <div class="flex items-start justify-between gap-3">
+                      <div class="min-w-0">
+                        <div class="text-sm font-medium text-slate-900">Add machine</div>
+                        <div class="mt-1 text-xs text-slate-500">
+                          Install a runner with a one-liner. The target machine only needs
+                          <span class="font-medium text-slate-700">curl</span>,
+                          <span class="font-medium text-slate-700">node</span>, and
+                          <span class="font-medium text-slate-700">tar</span>.
+                        </div>
+                      </div>
+                      <div v-if="runnerInstallExpiryLabel" class="shrink-0 text-[11px] text-slate-500">
+                        {{ runnerInstallExpiryLabel }}
+                      </div>
+                    </div>
+
+                    <div class="mt-3 flex flex-wrap items-center gap-2">
+                      <button
+                        class="inline-flex items-center gap-2 rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                        :disabled="runnerInstallLoading"
+                        @click="loadRunnerInstallBootstrap({ force: true })"
+                      >
+                        <Loader2 v-if="runnerInstallLoading" class="h-3.5 w-3.5 animate-spin" />
+                        {{ runnerInstallCommand ? 'Regenerate command' : 'Generate command' }}
+                      </button>
+                      <button
+                        class="rounded-md bg-white px-3 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                        :disabled="!runnerInstallCommand"
+                        @click="copyRunnerInstallCommand"
+                      >
+                        Copy command
+                      </button>
+                      <button
+                        class="rounded-md bg-white px-3 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                        :disabled="!runnerInstallUrl"
+                        @click="copyRunnerInstallUrl"
+                      >
+                        Copy URL
+                      </button>
+                    </div>
+
+                    <div
+                      v-if="runnerInstallCommand"
+                      class="mt-3 overflow-x-auto rounded-xl bg-slate-950 px-3 py-3 text-[11px] text-slate-100"
+                    >
+                      <code class="font-mono break-all">{{ runnerInstallCommand }}</code>
+                    </div>
+                    <div v-if="runnerInstallUrl" class="mt-2 break-all text-[11px] text-slate-500">
+                      URL: <span class="font-mono text-slate-700">{{ runnerInstallUrl }}</span>
+                    </div>
+                    <div v-if="runnerInstallNeedsReachableUrl" class="mt-2 text-[11px] text-amber-700">
+                      This command currently points at localhost. Set <span class="font-mono">host.publicUrl</span> if the runner is being installed on another machine.
+                    </div>
+                    <div v-if="runnerInstallError" class="mt-2 text-sm text-red-600">{{ runnerInstallError }}</div>
+                  </div>
+
+                  <div v-if="!machines.length" class="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
+                    No machines connected yet.
+                  </div>
+
+                  <div v-else class="space-y-2">
+                    <div v-if="machineDisconnectError" class="text-sm text-red-600">{{ machineDisconnectError }}</div>
+                    <div v-if="machineUpgradeError" class="text-sm text-red-600">{{ machineUpgradeError }}</div>
+                    <div
+                      v-for="m in machinesForSelect"
+                      :key="m.machineId"
+                      class="rounded-xl border border-slate-200 bg-white p-3"
+                    >
+                      <div class="flex items-center justify-between gap-3">
+                        <div class="min-w-0 flex items-center gap-2">
+                          <span class="h-2.5 w-2.5 rounded-full" :class="machineIsOnline(m) ? 'bg-emerald-500' : 'bg-slate-400'" />
+                          <div class="truncate text-sm font-medium text-slate-900">{{ m.machineName }}</div>
+                          <div class="shrink-0 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-600">
+                            {{ m.platform }}
+                          </div>
+                        </div>
+                        <div class="shrink-0 flex items-center gap-2">
+                          <button
+                            v-if="machineIsOnline(m) && ((machineHasVersionMismatch(m) && machineSupportsWebUpgrade(m)) || machineHasUnknownVersion(m))"
+                            class="inline-flex items-center gap-2 rounded-md bg-indigo-50 px-2.5 py-1.5 text-xs text-indigo-700 transition-colors hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                            @click="upgradeMachine(m.machineId)"
+                            :disabled="machineUpgradeWorkingId === m.machineId || ['starting', 'updating', 'restarting'].includes(String(m.upgrade?.state ?? ''))"
+                            :title="machineHasUnknownVersion(m) ? 'Try a remote runner upgrade. If this legacy runner does not support it, update it manually.' : 'Pull, rebuild, and restart this runner using its configured upgrade commands.'"
+                          >
+                            <Loader2 v-if="machineUpgradeWorkingId === m.machineId" class="h-3.5 w-3.5 animate-spin" />
+                            {{ machineHasUnknownVersion(m) ? 'Try upgrade' : 'Upgrade' }}
+                          </button>
+                          <button
+                            v-if="machineIsOnline(m)"
+                            class="inline-flex items-center gap-2 rounded-md bg-slate-100 px-2.5 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                            @click="disconnectMachine(m.machineId)"
+                            :disabled="machineDisconnectWorkingId === m.machineId"
+                            title="Disconnect the runner (it may reconnect if the runner process is still running)."
+                          >
+                            <Loader2 v-if="machineDisconnectWorkingId === m.machineId" class="h-3.5 w-3.5 animate-spin" />
+                            Disconnect
+                          </button>
+                          <button
+                            v-else
+                            class="inline-flex items-center gap-2 rounded-md bg-red-50 px-2.5 py-1.5 text-xs text-red-700 transition-colors hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
+                            @click="openDeleteMachineModal(m.machineId)"
+                            title="Delete this machine and all its sessions."
+                          >
+                            <Trash2 class="h-3.5 w-3.5" />
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                      <div class="mt-2 flex items-center justify-between gap-3">
+                        <div class="min-w-0 truncate text-xs font-mono text-slate-500" :title="m.machineId">{{ m.machineId }}</div>
+                        <div class="shrink-0 text-[11px]" :class="machineIsOnline(m) ? 'text-emerald-600' : 'text-slate-500'">
+                          {{ machineStatusLabel(m) }}
+                        </div>
+                      </div>
+                      <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+                        <div>
+                          Runner:
+                          <span class="font-mono text-slate-700">{{ machineRootgridVersion(m) ?? 'unknown' }}</span>
+                        </div>
+                        <div v-if="appSettings.appVersion">
+                          Host:
+                          <span class="font-mono text-slate-700">{{ appSettings.appVersion }}</span>
+                        </div>
+                        <div v-if="machineHasVersionMismatch(m)" class="text-amber-700">
+                          Version mismatch
+                        </div>
+                        <div v-else-if="machineHasUnknownVersion(m)" class="text-red-700">
+                          Runner version unknown
+                        </div>
+                      </div>
+                      <div v-if="machineUpgradeStatusText(m)" class="mt-2 text-xs" :class="m.upgrade?.state === 'failed' ? 'text-red-600' : 'text-slate-500'">
+                        {{ machineUpgradeStatusText(m) }}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-else-if="settingsTab === 'threads'" class="space-y-3">
+                  <div class="text-xs text-slate-500">Archived threads are hidden from the main thread list until restored.</div>
+                  <div v-if="archiveError" class="text-sm text-red-600">{{ archiveError }}</div>
+                  <div v-if="archiveLoading" class="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
+                    Loading archived threads…
+                  </div>
+                  <div v-else-if="!archivedSessions.length" class="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
+                    No archived threads.
+                  </div>
+                  <div v-else class="space-y-2">
+                    <div
+                      v-for="s in archivedSessions"
+                      :key="s.sessionId"
+                      class="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3"
+                    >
+                      <button class="min-w-0 flex-1 text-left" @click="openSession(s.sessionId); defaultsOpen = false">
+                        <div class="truncate text-sm font-medium text-slate-900">{{ sessionListTitle(s) }}</div>
+                        <div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                          <span class="inline-flex min-w-0 max-w-full items-center rounded-full border border-black/[0.08] px-2 py-0.5 text-[10px] font-medium text-slate-500" :title="`${sessionHostName(s)} / ${sessionProject(s)}`">
+                            <span class="truncate">{{ sessionHostName(s) }} / {{ sessionProject(s) }}</span>
+                          </span>
+                          <span>{{ formatAgeShort(s.updatedMs) }}</span>
+                        </div>
+                      </button>
+                      <button
+                        class="rounded-md bg-slate-100 px-3 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200"
+                        @click="unarchiveFromArchiveModal(s.sessionId)"
+                      >
+                        Restore
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-else class="space-y-3">
+                  <div>
+                    <div class="text-xs uppercase tracking-wider text-slate-500">Retention (days)</div>
+                    <input
+                      v-model="retentionDraft"
+                      type="number"
+                      min="1"
+                      max="3650"
+                      class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+                    />
+                    <div class="mt-2 text-xs text-slate-500">Rootgrid prunes its own sessions/events beyond this window.</div>
+                  </div>
+
+                  <div>
+                    <div class="text-xs uppercase tracking-wider text-slate-500">SSE notifications</div>
+                    <select
+                      v-model="sseToastsDraft"
+                      class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+                    >
+                      <option value="if-not-visible">If not visible</option>
+                      <option value="always">Always</option>
+                      <option value="never">Never</option>
+                    </select>
+                    <div class="mt-2 text-xs text-slate-500">Controls toast/desktop notifications emitted over SSE (approvals, ready, failures).</div>
+
+                    <div class="mt-3 flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <div class="min-w-0">
+                        <div class="text-[11px] uppercase tracking-wider text-slate-500">Browser notifications</div>
+                        <div class="mt-1 text-xs text-slate-700">Permission: {{ notificationPermission }}</div>
+                        <div class="mt-1 text-xs text-slate-500">Needed to alert you while the tab/app is not visible.</div>
+                      </div>
+                      <button
+                        class="shrink-0 rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                        @click="requestNotificationPermission"
+                        :disabled="!notificationSupported || notificationPermission === 'granted'"
+                      >
+                        Enable
+                      </button>
+                    </div>
+
+                    <div class="mt-3">
+                      <div class="text-xs uppercase tracking-wider text-slate-500">Web Push notifications</div>
+                      <select
+                        v-model="webPushDraft"
+                        class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+                      >
+                        <option value="if-not-visible">If not visible</option>
+                        <option value="always">Always</option>
+                        <option value="never">Never</option>
+                      </select>
+                      <div class="mt-2 text-xs text-slate-500">Uses the PWA service worker + VAPID. Requires a secure context (localhost/https) and subscription. “If not visible” means the relevant session isn’t currently open in a visible Rootgrid tab.</div>
+
+                      <div class="mt-3 flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                        <div class="min-w-0">
+                          <div class="text-[11px] uppercase tracking-wider text-slate-500">Push subscription</div>
+                          <div class="mt-1 text-xs text-slate-700">Status: {{ pushStatus }}</div>
+                          <div v-if="pushEndpoint" class="mt-1 truncate text-[11px] text-slate-500" :title="pushEndpoint">endpoint: {{ pushEndpoint }}</div>
+                          <div v-if="pushError" class="mt-1 text-xs text-red-600">{{ pushError }}</div>
+                        </div>
+                        <div class="shrink-0 flex items-center gap-2">
+                          <button
+                            class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                            @click="enablePush"
+                            :disabled="pushWorking || pushStatus === 'subscribed' || pushStatus === 'unsupported' || pushStatus === 'insecure'"
+                          >
+                            Enable
+                          </button>
+                          <button
+                            class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                            @click="disablePush"
+                            :disabled="pushWorking || pushStatus !== 'subscribed'"
+                          >
+                            Disable
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <div class="text-[11px] uppercase tracking-wider text-slate-500">Host</div>
+                      <div class="mt-2 font-mono text-xs text-slate-900">
+                        {{ appSettings.host?.listen?.host ?? '—' }}:{{ appSettings.host?.listen?.port ?? '—' }}
+                      </div>
+                      <div class="mt-2 text-xs text-slate-500">trustProxy: {{ appSettings.host?.trustProxy ? 'true' : 'false' }}</div>
+                      <div v-if="appSettings.host?.publicUrl" class="mt-2 truncate text-xs text-slate-500" :title="appSettings.host.publicUrl">
+                        publicUrl: <span class="text-slate-700">{{ appSettings.host.publicUrl }}</span>
+                      </div>
+                    </div>
+
+                    <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <div class="text-[11px] uppercase tracking-wider text-slate-500">Runner</div>
+                      <div class="mt-2 text-xs text-slate-900">
+                        {{ appSettings.runner?.enabled ? 'enabled' : 'disabled' }}
+                      </div>
+                      <div class="mt-2 truncate text-xs text-slate-500" :title="appSettings.runner?.machineId ?? ''">
+                        machineId: <span class="font-mono text-slate-700">{{ appSettings.runner?.machineId ? appSettings.runner.machineId.slice(0, 12) + '…' : '—' }}</span>
+                      </div>
+                      <div class="mt-2 truncate text-xs text-slate-500" :title="appSettings.runner?.machineName ?? ''">
+                        machineName: <span class="text-slate-700">{{ appSettings.runner?.machineName ?? '—' }}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div v-if="appSettingsError" class="text-sm text-red-600">{{ appSettingsError }}</div>
+
+                  <div class="flex items-center justify-end">
+                    <button
+                      class="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60"
+                      @click="saveRetentionDays"
+                      :disabled="appSettingsSaving"
+                    >
+                      <Loader2 v-if="appSettingsSaving" class="h-4 w-4 animate-spin" />
+                      Save
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div v-else class="min-h-0 flex-1 bg-white" />
         </section>
         <section
           v-else
@@ -3990,592 +4718,8 @@ watch(
 
       </div>
       </div>
-	
-	      <!-- New thread modal -->
-	      <transition name="rg-fade">
-	        <div v-if="newThreadOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-	          <div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
-	            <div class="flex items-start justify-between gap-4">
-	              <div class="min-w-0">
-	                <div class="text-sm font-semibold text-slate-900">New thread</div>
-	                <div class="mt-1 text-xs text-slate-600">Choose a machine and workspace before starting.</div>
-	              </div>
-	              <button
-	                class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-	                @click="closeNewThreadDialog"
-	              >
-	                Close
-	              </button>
-	            </div>
 
-	            <div class="mt-4 space-y-4">
-	              <div>
-	                <div class="text-xs uppercase tracking-wider text-slate-500">1) Machine</div>
-	                <select
-	                  v-model="newThreadMachineId"
-	                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-	                  :disabled="!machinesForSelect.length"
-	                >
-	                  <option value="" disabled>(select a machine)</option>
-	                  <option v-for="m in machinesForSelect" :key="m.machineId" :value="m.machineId">
-	                    {{ m.machineName }} · {{ m.platform }} · {{ machineStatusLabel(m) }} · {{ String(m.machineId).slice(0, 8) }}
-	                  </option>
-	                </select>
-	                <div v-if="!machines.length" class="mt-2 text-xs text-slate-600">
-	                  No machines yet.
-	                </div>
-	                <div v-else-if="newThreadSelectedMachine" class="mt-2 flex items-center gap-2 text-xs" :class="newThreadSelectedMachineOnline ? 'text-emerald-700' : 'text-slate-700'">
-	                  <span class="h-2.5 w-2.5 rounded-full" :class="newThreadSelectedMachineOnline ? 'bg-emerald-500' : 'bg-slate-400'" />
-	                  <span>{{ machineStatusLabel(newThreadSelectedMachine) }}</span>
-	                </div>
-	              </div>
-
-	              <div>
-	                <div class="flex items-end justify-between gap-3">
-	                  <div class="text-xs uppercase tracking-wider text-slate-500">2) Workspace</div>
-	                  <button
-	                    class="rounded-md bg-slate-100 px-3 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-	                    @click="openNewThreadBrowse"
-	                    :disabled="!newThreadMachineId || !newThreadSelectedMachineOnline"
-	                  >
-	                    Browse…
-	                  </button>
-	                </div>
-	                <input
-	                  v-model="newThreadCwd"
-	                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-	                  placeholder="/home/me/project"
-	                />
-
-	                <div v-if="newThreadRecentWorkspaces.length" class="mt-3">
-	                  <div class="text-[11px] uppercase tracking-wider text-slate-500">Recent projects</div>
-	                  <div class="mt-2 space-y-1">
-	                    <button
-	                      v-for="p in newThreadRecentWorkspaces"
-	                      :key="p.cwd"
-	                      class="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-left transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 active:scale-[0.99]"
-	                      @click="newThreadCwd = p.cwd"
-	                      :title="p.cwd"
-	                    >
-	                      <div class="truncate text-sm font-medium text-slate-900">{{ p.label }}</div>
-	                      <div class="mt-0.5 truncate text-xs text-slate-600">{{ p.cwd }}</div>
-	                    </button>
-	                  </div>
-	                </div>
-	              </div>
-
-	              <div v-if="newThreadBrowseOpen" class="rounded-xl border border-slate-200 bg-slate-50 p-3">
-	                <div class="flex items-center justify-between gap-3">
-	                  <div class="text-[11px] uppercase tracking-wider text-slate-500">Folder browser</div>
-	                  <button
-	                    class="rounded-md bg-white px-2.5 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-	                    @click="newThreadBrowseOpen = false"
-	                  >
-	                    Close
-	                  </button>
-	                </div>
-
-	                <div class="mt-2 flex items-center gap-2">
-	                  <button
-	                    class="rounded-md bg-white px-2.5 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed"
-	                    @click="newThreadBrowseParent ? loadNewThreadBrowse(newThreadBrowseParent) : null"
-	                    :disabled="!newThreadBrowseParent || newThreadBrowseLoading"
-	                  >
-	                    Up
-	                  </button>
-	                  <div class="min-w-0 flex-1 truncate rounded-md bg-white px-3 py-1.5 text-xs text-slate-700 ring-1 ring-slate-200" :title="newThreadBrowsePath">
-	                    {{ newThreadBrowsePath || (newThreadBrowseLoading ? 'Loading…' : '—') }}
-	                  </div>
-	                  <button
-	                    class="rounded-md bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
-	                    @click="selectNewThreadBrowseFolder"
-	                    :disabled="!newThreadBrowsePath"
-	                  >
-	                    Select
-	                  </button>
-	                </div>
-
-	                <div v-if="newThreadBrowseError" class="mt-2 text-xs text-red-600">{{ newThreadBrowseError }}</div>
-	                <div v-else-if="newThreadBrowseLoading" class="mt-2 text-xs text-slate-600">Loading…</div>
-
-	                <div v-else class="mt-3 max-h-64 overflow-auto space-y-1">
-	                  <button
-	                    v-for="e in newThreadBrowseEntries"
-	                    :key="e.path"
-	                    class="w-full rounded-lg bg-white px-3 py-2 text-left text-sm text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-	                    @click="loadNewThreadBrowse(e.path)"
-	                    :title="e.path"
-	                  >
-	                    {{ e.name }}
-	                  </button>
-	                  <div v-if="!newThreadBrowseEntries.length" class="px-3 py-6 text-center text-xs text-slate-600">(empty)</div>
-	                </div>
-	              </div>
-
-	              <div v-if="newThreadError" class="text-sm text-red-600">{{ newThreadError }}</div>
-
-	              <div class="mt-5 flex items-center justify-end gap-2">
-	                <button
-	                  class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-	                  @click="closeNewThreadDialog"
-	                  :disabled="newThreadCreating"
-	                >
-	                  Cancel
-	                </button>
-	                <button
-	                  class="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
-	                  @click="confirmNewThreadDialog"
-	                  :disabled="newThreadCreating"
-	                >
-	                  <Loader2 v-if="newThreadCreating" class="h-4 w-4 animate-spin" />
-	                  Start
-	                </button>
-	              </div>
-	            </div>
-	          </div>
-	        </div>
-	      </transition>
-
-	      <!-- Workspace & defaults modal -->
-		      <transition name="rg-fade">
-		        <div v-if="defaultsOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-		          <div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
-		            <div class="flex items-start justify-between gap-4">
-		              <div class="min-w-0">
-		                <div class="text-sm font-semibold text-slate-900">Settings</div>
-		                <div class="mt-1 text-xs text-slate-600">Defaults, machines, and system settings.</div>
-		              </div>
-		              <button
-		                class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                @click="defaultsOpen = false"
-		              >
-		                Close
-		              </button>
-		            </div>
-
-		            <div class="mt-4 flex items-center gap-2 text-xs">
-		              <button
-		                class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                :class="settingsTab === 'defaults' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
-		                @click="settingsTab = 'defaults'"
-		              >
-		                Defaults
-		              </button>
-		              <button
-		                class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                :class="settingsTab === 'machines' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
-		                @click="settingsTab = 'machines'"
-		              >
-		                Machines
-		              </button>
-		              <button
-		                class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                :class="settingsTab === 'system' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
-		                @click="settingsTab = 'system'"
-		              >
-		                System
-		              </button>
-		            </div>
-		
-		            <div v-if="settingsTab === 'defaults'" class="mt-4 space-y-3">
-		              <div>
-		                <div class="text-xs uppercase tracking-wider text-slate-500">Workspace (cwd)</div>
-		                <input
-		                  v-model="defaults.cwd"
-	                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-	                  placeholder="/home/me/project"
-	                />
-	              </div>
-	
-	              <div class="grid grid-cols-2 gap-2">
-	                <div>
-	                  <div class="text-xs uppercase tracking-wider text-slate-500">Machine</div>
-	                  <select
-	                    v-model="defaults.machineId"
-	                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-	                  >
-	                    <option value="">(auto)</option>
-	                    <option v-for="m in machinesForSelect" :key="m.machineId" :value="m.machineId">
-	                      {{ m.machineName }} · {{ m.platform }} · {{ machineStatusLabel(m) }} · {{ String(m.machineId).slice(0, 8) }}
-	                    </option>
-	                  </select>
-	                  <div v-if="defaultsSelectedMachine" class="mt-2 flex items-center gap-2 text-xs" :class="machineIsOnline(defaultsSelectedMachine) ? 'text-emerald-700' : 'text-slate-700'">
-	                    <span class="h-2.5 w-2.5 rounded-full" :class="machineIsOnline(defaultsSelectedMachine) ? 'bg-emerald-500' : 'bg-slate-400'" />
-	                    <span>{{ machineStatusLabel(defaultsSelectedMachine) }}</span>
-	                  </div>
-	                </div>
-	
-	                <div>
-	                  <div class="text-xs uppercase tracking-wider text-slate-500">Model</div>
-	                  <input
-	                    v-model="defaults.model"
-	                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-	                    placeholder="(optional)"
-	                  />
-	                </div>
-	              </div>
-	
-	              <div class="grid grid-cols-2 gap-2">
-	                <div>
-	                  <div class="text-xs uppercase tracking-wider text-slate-500">Approval policy</div>
-	                  <select
-	                    v-model="defaults.approvalPolicy"
-	                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-	                  >
-	                    <option value="untrusted">untrusted</option>
-	                    <option value="on-request">on-request</option>
-	                    <option value="never">never</option>
-	                    <option value="on-failure">on-failure</option>
-	                  </select>
-	                </div>
-	
-	                <div>
-	                  <div class="text-xs uppercase tracking-wider text-slate-500">Sandbox</div>
-	                  <select
-	                    v-model="defaults.sandbox"
-	                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-	                  >
-	                    <option value="read-only">read-only</option>
-	                    <option value="workspace-write">workspace-write</option>
-	                    <option value="danger-full-access">danger-full-access</option>
-	                  </select>
-	                </div>
-		              </div>
-		
-		              <div v-if="defaultsError" class="text-sm text-red-600">{{ defaultsError }}</div>
-		            </div>
-
-		            <div v-else-if="settingsTab === 'machines'" class="mt-4 space-y-3">
-		              <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
-		                <div class="flex items-start justify-between gap-3">
-		                  <div class="min-w-0">
-		                    <div class="text-sm font-medium text-slate-900">Add machine</div>
-		                    <div class="mt-1 text-xs text-slate-500">
-		                      Install a runner with a one-liner. The target machine only needs
-		                      <span class="font-medium text-slate-700">curl</span>,
-		                      <span class="font-medium text-slate-700">node</span>, and
-		                      <span class="font-medium text-slate-700">tar</span>.
-		                    </div>
-		                  </div>
-		                  <div v-if="runnerInstallExpiryLabel" class="shrink-0 text-[11px] text-slate-500">
-		                    {{ runnerInstallExpiryLabel }}
-		                  </div>
-		                </div>
-
-		                <div class="mt-3 flex flex-wrap items-center gap-2">
-		                  <button
-		                    class="inline-flex items-center gap-2 rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                    :disabled="runnerInstallLoading"
-		                    @click="loadRunnerInstallBootstrap({ force: true })"
-		                  >
-		                    <Loader2 v-if="runnerInstallLoading" class="h-3.5 w-3.5 animate-spin" />
-		                    {{ runnerInstallCommand ? 'Regenerate command' : 'Generate command' }}
-		                  </button>
-		                  <button
-		                    class="rounded-md bg-white px-3 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                    :disabled="!runnerInstallCommand"
-		                    @click="copyRunnerInstallCommand"
-		                  >
-		                    Copy command
-		                  </button>
-		                  <button
-		                    class="rounded-md bg-white px-3 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                    :disabled="!runnerInstallUrl"
-		                    @click="copyRunnerInstallUrl"
-		                  >
-		                    Copy URL
-		                  </button>
-		                </div>
-
-		                <div
-		                  v-if="runnerInstallCommand"
-		                  class="mt-3 overflow-x-auto rounded-xl bg-slate-950 px-3 py-3 text-[11px] text-slate-100"
-		                >
-		                  <code class="font-mono break-all">{{ runnerInstallCommand }}</code>
-		                </div>
-		                <div v-if="runnerInstallUrl" class="mt-2 text-[11px] text-slate-500 break-all">
-		                  URL: <span class="font-mono text-slate-700">{{ runnerInstallUrl }}</span>
-		                </div>
-		                <div v-if="runnerInstallNeedsReachableUrl" class="mt-2 text-[11px] text-amber-700">
-		                  This command currently points at localhost. Set <span class="font-mono">host.publicUrl</span> if the runner is being installed on another machine.
-		                </div>
-		                <div v-if="runnerInstallError" class="mt-2 text-sm text-red-600">{{ runnerInstallError }}</div>
-		              </div>
-
-		              <div v-if="!machines.length" class="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
-		                No machines connected yet.
-		              </div>
-
-		              <div v-else class="space-y-2">
-		                <div v-if="machineDisconnectError" class="text-sm text-red-600">{{ machineDisconnectError }}</div>
-		                <div v-if="machineUpgradeError" class="text-sm text-red-600">{{ machineUpgradeError }}</div>
-		                <div
-		                  v-for="m in machinesForSelect"
-		                  :key="m.machineId"
-		                  class="rounded-xl border border-slate-200 bg-white p-3"
-		                >
-		                  <div class="flex items-center justify-between gap-3">
-		                    <div class="min-w-0 flex items-center gap-2">
-		                      <span class="h-2.5 w-2.5 rounded-full" :class="machineIsOnline(m) ? 'bg-emerald-500' : 'bg-slate-400'" />
-		                      <div class="truncate text-sm font-medium text-slate-900">{{ m.machineName }}</div>
-		                      <div class="shrink-0 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-600">
-		                        {{ m.platform }}
-		                      </div>
-		                    </div>
-		                    <div class="shrink-0 flex items-center gap-2">
-		                      <button
-		                        v-if="machineIsOnline(m) && ((machineHasVersionMismatch(m) && machineSupportsWebUpgrade(m)) || machineHasUnknownVersion(m))"
-		                        class="inline-flex items-center gap-2 rounded-md bg-indigo-50 px-2.5 py-1.5 text-xs text-indigo-700 transition-colors hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                        @click="upgradeMachine(m.machineId)"
-		                        :disabled="machineUpgradeWorkingId === m.machineId || ['starting', 'updating', 'restarting'].includes(String(m.upgrade?.state ?? ''))"
-		                        :title="machineHasUnknownVersion(m) ? 'Try a remote runner upgrade. If this legacy runner does not support it, update it manually.' : 'Pull, rebuild, and restart this runner using its configured upgrade commands.'"
-		                      >
-		                        <Loader2 v-if="machineUpgradeWorkingId === m.machineId" class="h-3.5 w-3.5 animate-spin" />
-		                        {{ machineHasUnknownVersion(m) ? 'Try upgrade' : 'Upgrade' }}
-		                      </button>
-		                      <button
-		                        v-if="machineIsOnline(m)"
-		                        class="inline-flex items-center gap-2 rounded-md bg-slate-100 px-2.5 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                        @click="disconnectMachine(m.machineId)"
-		                        :disabled="machineDisconnectWorkingId === m.machineId"
-		                        title="Disconnect the runner (it may reconnect if the runner process is still running)."
-		                      >
-		                        <Loader2 v-if="machineDisconnectWorkingId === m.machineId" class="h-3.5 w-3.5 animate-spin" />
-		                        Disconnect
-		                      </button>
-		                      <button
-		                        v-else
-		                        class="inline-flex items-center gap-2 rounded-md bg-red-50 px-2.5 py-1.5 text-xs text-red-700 transition-colors hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
-		                        @click="openDeleteMachineModal(m.machineId)"
-		                        title="Delete this machine and all its sessions."
-		                      >
-		                        <Trash2 class="h-3.5 w-3.5" />
-		                        Delete
-		                      </button>
-		                    </div>
-		                  </div>
-		                  <div class="mt-2 flex items-center justify-between gap-3">
-		                    <div class="min-w-0 truncate text-xs font-mono text-slate-500" :title="m.machineId">{{ m.machineId }}</div>
-		                    <div class="shrink-0 text-[11px]" :class="machineIsOnline(m) ? 'text-emerald-600' : 'text-slate-500'">
-		                      {{ machineStatusLabel(m) }}
-		                    </div>
-		                  </div>
-		                  <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
-		                    <div>
-		                      Runner:
-		                      <span class="font-mono text-slate-700">{{ machineRootgridVersion(m) ?? 'unknown' }}</span>
-		                    </div>
-		                    <div v-if="appSettings.appVersion">
-		                      Host:
-		                      <span class="font-mono text-slate-700">{{ appSettings.appVersion }}</span>
-		                    </div>
-		                    <div v-if="machineHasVersionMismatch(m)" class="text-amber-700">
-		                      Version mismatch
-		                    </div>
-		                    <div v-else-if="machineHasUnknownVersion(m)" class="text-red-700">
-		                      Runner version unknown
-		                    </div>
-		                  </div>
-		                  <div v-if="machineUpgradeStatusText(m)" class="mt-2 text-xs" :class="m.upgrade?.state === 'failed' ? 'text-red-600' : 'text-slate-500'">
-		                    {{ machineUpgradeStatusText(m) }}
-		                  </div>
-		                </div>
-		              </div>
-		            </div>
-
-		            <div v-else-if="settingsTab === 'system'" class="mt-4 space-y-3">
-		              <div>
-		                <div class="text-xs uppercase tracking-wider text-slate-500">Retention (days)</div>
-		                <input
-		                  v-model="retentionDraft"
-		                  type="number"
-		                  min="1"
-		                  max="3650"
-		                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-		                />
-		                <div class="mt-2 text-xs text-slate-500">Rootgrid prunes its own sessions/events beyond this window.</div>
-		              </div>
-
-		              <div>
-		                <div class="text-xs uppercase tracking-wider text-slate-500">SSE notifications</div>
-		                <select
-		                  v-model="sseToastsDraft"
-		                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-		                >
-		                  <option value="if-not-visible">If not visible</option>
-		                  <option value="always">Always</option>
-		                  <option value="never">Never</option>
-		                </select>
-		                <div class="mt-2 text-xs text-slate-500">Controls toast/desktop notifications emitted over SSE (approvals, ready, failures).</div>
-
-		                <div class="mt-3 flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
-		                  <div class="min-w-0">
-		                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Browser notifications</div>
-		                    <div class="mt-1 text-xs text-slate-700">Permission: {{ notificationPermission }}</div>
-		                    <div class="mt-1 text-xs text-slate-500">Needed to alert you while the tab/app is not visible.</div>
-		                  </div>
-		                  <button
-		                    class="shrink-0 rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                    @click="requestNotificationPermission"
-		                    :disabled="!notificationSupported || notificationPermission === 'granted'"
-		                  >
-		                    Enable
-		                  </button>
-		                </div>
-
-		                <div class="mt-3">
-		                  <div class="text-xs uppercase tracking-wider text-slate-500">Web Push notifications</div>
-		                  <select
-		                    v-model="webPushDraft"
-		                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-		                  >
-		                    <option value="if-not-visible">If not visible</option>
-		                    <option value="always">Always</option>
-		                    <option value="never">Never</option>
-		                  </select>
-		                  <div class="mt-2 text-xs text-slate-500">Uses the PWA service worker + VAPID. Requires a secure context (localhost/https) and subscription. “If not visible” means the relevant session isn’t currently open in a visible Rootgrid tab.</div>
-
-		                  <div class="mt-3 flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
-		                    <div class="min-w-0">
-		                      <div class="text-[11px] uppercase tracking-wider text-slate-500">Push subscription</div>
-		                      <div class="mt-1 text-xs text-slate-700">Status: {{ pushStatus }}</div>
-		                      <div v-if="pushEndpoint" class="mt-1 truncate text-[11px] text-slate-500" :title="pushEndpoint">endpoint: {{ pushEndpoint }}</div>
-		                      <div v-if="pushError" class="mt-1 text-xs text-red-600">{{ pushError }}</div>
-		                    </div>
-		                    <div class="shrink-0 flex items-center gap-2">
-		                      <button
-		                        class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                        @click="enablePush"
-		                        :disabled="pushWorking || pushStatus === 'subscribed' || pushStatus === 'unsupported' || pushStatus === 'insecure'"
-		                      >
-		                        Enable
-		                      </button>
-		                      <button
-		                        class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-		                        @click="disablePush"
-		                        :disabled="pushWorking || pushStatus !== 'subscribed'"
-		                      >
-		                        Disable
-		                      </button>
-		                    </div>
-		                  </div>
-		                </div>
-		              </div>
-
-		              <div class="grid grid-cols-2 gap-2">
-		                <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
-		                  <div class="text-[11px] uppercase tracking-wider text-slate-500">Host</div>
-		                  <div class="mt-2 text-xs text-slate-900 font-mono">
-		                    {{ appSettings.host?.listen?.host ?? '—' }}:{{ appSettings.host?.listen?.port ?? '—' }}
-		                  </div>
-		                  <div class="mt-2 text-xs text-slate-500">trustProxy: {{ appSettings.host?.trustProxy ? 'true' : 'false' }}</div>
-		                  <div v-if="appSettings.host?.publicUrl" class="mt-2 text-xs text-slate-500 truncate" :title="appSettings.host.publicUrl">
-		                    publicUrl: <span class="text-slate-700">{{ appSettings.host.publicUrl }}</span>
-		                  </div>
-		                </div>
-
-		                <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
-		                  <div class="text-[11px] uppercase tracking-wider text-slate-500">Runner</div>
-		                  <div class="mt-2 text-xs text-slate-900">
-		                    {{ appSettings.runner?.enabled ? 'enabled' : 'disabled' }}
-		                  </div>
-		                  <div class="mt-2 text-xs text-slate-500 truncate" :title="appSettings.runner?.machineId ?? ''">
-		                    machineId: <span class="text-slate-700 font-mono">{{ appSettings.runner?.machineId ? appSettings.runner.machineId.slice(0, 12) + '…' : '—' }}</span>
-		                  </div>
-		                  <div class="mt-2 text-xs text-slate-500 truncate" :title="appSettings.runner?.machineName ?? ''">
-		                    machineName: <span class="text-slate-700">{{ appSettings.runner?.machineName ?? '—' }}</span>
-		                  </div>
-		                </div>
-		              </div>
-
-		              <div v-if="appSettingsError" class="text-sm text-red-600">{{ appSettingsError }}</div>
-
-		              <div class="flex items-center justify-end">
-		                <button
-		                  class="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/60"
-		                  @click="saveRetentionDays"
-		                  :disabled="appSettingsSaving"
-		                >
-		                  <Loader2 v-if="appSettingsSaving" class="h-4 w-4 animate-spin" />
-		                  Save
-		                </button>
-		              </div>
-		            </div>
-		          </div>
-		        </div>
-		      </transition>
-
-	      <!-- Archived chats modal -->
-	      <transition name="rg-fade">
-	        <div v-if="archiveOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-	          <div class="w-full max-w-3xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
-	            <div class="flex items-start justify-between gap-4">
-	              <div class="min-w-0">
-	                <div class="text-sm font-semibold text-slate-900">Archived threads</div>
-	                <div class="mt-1 text-xs text-slate-600">Hidden from the main thread list.</div>
-	              </div>
-	              <button
-	                class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-	                @click="archiveOpen = false"
-	              >
-	                Close
-	              </button>
-	            </div>
-
-	            <div class="mt-4">
-	              <div v-if="archiveLoading" class="space-y-2">
-	                <div v-for="i in 6" :key="i" class="h-12 rounded-xl bg-slate-100 animate-pulse" />
-	              </div>
-
-	              <div v-else-if="archiveError" class="text-sm text-red-600">{{ archiveError }}</div>
-
-	              <div v-else-if="!archivedSessions.length" class="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
-	                No archived threads.
-	              </div>
-
-	              <div v-else class="max-h-[65vh] overflow-auto space-y-2 pr-1">
-	                <button
-	                  v-for="s in archivedSessions"
-	                  :key="s.sessionId"
-	                  class="group w-full rounded-xl border border-slate-200 bg-white p-3 text-left transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-	                  @click="openSession(s.sessionId); archiveOpen = false"
-	                  :title="sessionTooltip(s)"
-	                >
-	                  <div class="flex items-start justify-between gap-3">
-	                    <div class="min-w-0">
-	                      <div class="truncate text-sm font-medium text-slate-900">{{ sessionListTitle(s) }}</div>
-	                      <div class="mt-1 flex items-center gap-2 text-[11px] text-slate-500">
-	                        <span class="truncate" :title="s.cwd">{{ sessionProject(s) }}</span>
-	                        <span class="text-slate-300">·</span>
-	                        <span>{{ sessionHostName(s) }}</span>
-	                      </div>
-	                      <div class="mt-1 truncate text-xs text-slate-600">{{ s.preview ?? '' }}</div>
-	                    </div>
-
-	                    <div class="shrink-0 flex items-center gap-2">
-	                      <button
-	                        class="rounded-md bg-slate-100 px-2.5 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-	                        @click.stop="unarchiveFromArchiveModal(s.sessionId)"
-	                      >
-	                        Unarchive
-	                      </button>
-	                      <button
-	                        class="inline-flex items-center gap-2 rounded-md bg-red-50 px-2.5 py-1.5 text-xs text-red-700 transition-colors hover:bg-red-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
-	                        @click.stop="openDeleteModal(s.sessionId)"
-	                      >
-	                        <Trash2 class="h-3.5 w-3.5" />
-	                        Delete
-	                      </button>
-	                    </div>
-	                  </div>
-	                </button>
-	              </div>
-	            </div>
-	          </div>
-	        </div>
-	      </transition>
-
-	      <!-- Delete machine modal -->
+      <!-- Delete machine modal -->
 	      <transition name="rg-fade">
 	        <div v-if="deleteMachineOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
 	          <div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
@@ -4653,8 +4797,8 @@ watch(
 	      <transition name="rg-fade">
 	        <div v-if="renameOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
 	          <div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
-	            <div class="text-sm font-semibold text-slate-900">Rename thread</div>
-	            <div class="mt-1 text-xs text-slate-600">Update the thread title and/or project label.</div>
+	            <div class="text-sm font-semibold text-slate-900">Edit thread</div>
+	            <div class="mt-1 text-xs text-slate-600">Update the thread title and/or project alias. Project alias changes apply to all sessions for this workspace on this machine.</div>
 	
 	            <div class="mt-4 space-y-3">
 	              <div>
@@ -4669,7 +4813,7 @@ watch(
 	              </div>
 	
 	              <div>
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Project label</div>
+	                <div class="text-xs uppercase tracking-wider text-slate-500">Project Alias</div>
 	                <input
 	                  v-model="renameProjectValue"
 	                  class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"

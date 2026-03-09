@@ -1147,7 +1147,8 @@ function buildChatMessagesSlow(store) {
     const state = turnStateById.get(String(msg.turnId ?? ''))
     if (!state) return false
 
-    const isCurrentTurn = String(store?.currentTurnId ?? '').trim() === state.turnId
+    const currentTurnId = String(store?.currentTurnId ?? activeTurnId ?? '').trim()
+    const isCurrentTurn = currentTurnId === state.turnId
     const toolCalls = Array.from(state.toolByItemId.values())
     const explore = {
       files: state.exploreFileKeys.size,
@@ -1197,7 +1198,7 @@ function buildChatMessagesSlow(store) {
     return true
   })
 
-  const currentTurnId = String(store?.currentTurnId ?? '').trim()
+  const currentTurnId = String(store?.currentTurnId ?? activeTurnId ?? '').trim()
   const visible = currentTurnId
     ? filtered.filter((msg) => !(msg?.role === 'assistant' && String(msg?.turnId ?? '').trim() === currentTurnId))
     : filtered

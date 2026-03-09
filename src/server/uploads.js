@@ -186,6 +186,7 @@ export function createUploadService({ runnerWs, store, makeEnvelope, httpError }
     const fh = await open(path, 'w', 0o600)
 
     let total = 0
+    let writeOffset = 0
     try {
       const contentLength = Number(req.headers['content-length'] ?? 0)
       if (Number.isFinite(contentLength) && contentLength > maxBytes) {
@@ -198,7 +199,8 @@ export function createUploadService({ runnerWs, store, makeEnvelope, httpError }
         if (total > maxBytes) {
           throw httpError(413, `attachment too large: ${filename} (${total} bytes)`)
         }
-        await fh.write(buf, 0, buf.length, null)
+        await fh.write(buf, 0, buf.length, writeOffset)
+        writeOffset += buf.length
       }
 
       await fh.close()

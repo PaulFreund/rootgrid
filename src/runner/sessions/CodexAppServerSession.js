@@ -285,6 +285,39 @@ export class CodexAppServerSession {
     return normalizeAgentMessagePhase(phase) === 'commentary' ? 'commentary' : 'normalized'
   }
 
+  #isCompatibilityFallbackError(error) {
+    const message = safeString(error instanceof Error ? error.message : error)
+    if (!message) return false
+    return (
+      message.startsWith('Invalid request:') ||
+      message.includes('expected internally tagged enum') ||
+      message.includes('unknown field') ||
+      message.includes('missing field')
+    )
+  }
+
+  #emitCompatibilityRetryWarning({ operation, error }) {
+    const details = safeString(error instanceof Error ? error.message : error)
+    if (!details) return
+    this.emit('session.error', {
+      sessionId: this.sessionId,
+      message: `Retrying ${String(operation ?? 'request')} with Codex compatibility fallback`,
+      details,
+      willRetry: true
+    })
+  }
+
+  #emitRequestFailure({ operation, error }) {
+    const details = safeString(error instanceof Error ? error.message : error)
+    if (!details) return
+    this.emit('session.error', {
+      sessionId: this.sessionId,
+      message: `Codex rejected ${String(operation ?? 'request')}`,
+      details,
+      willRetry: false
+    })
+  }
+
   nextSeq() {
     this.outputSeq += 1
     return this.outputSeq
@@ -367,11 +400,15 @@ export class CodexAppServerSession {
     }
 
     this.threadId = effectiveThreadId
+    const threadName = safeString(threadRes?.thread?.name ?? threadRes?.name)
+    const threadPreview = safeString(threadRes?.thread?.preview ?? threadRes?.preview)
 
     this.emit('session.status', {
       sessionId: this.sessionId,
       status: 'running',
-      ...(effectiveThreadId ? { codexThreadId: effectiveThreadId } : {})
+      ...(effectiveThreadId ? { codexThreadId: effectiveThreadId } : {}),
+      ...(threadName ? { threadName } : {}),
+      ...(threadPreview ? { threadPreview } : {})
     })
 
     await this.#startTurn(input)
@@ -482,15 +519,25 @@ export class CodexAppServerSession {
     })
 
     let lastErr = null
-    for (const params of attempts) {
+    let warnedCompatibilityRetry = false
+    for (let i = 0; i < attempts.length; i += 1) {
+      const params = attempts[i]
       try {
         await this.rpc.sendRequest('turn/start', params)
         return
       } catch (err) {
         lastErr = err
+        if (!warnedCompatibilityRetry && i < (attempts.length - 1) && this.#isCompatibilityFallbackError(err)) {
+          warnedCompatibilityRetry = true
+          this.#emitCompatibilityRetryWarning({
+            operation: 'turn start',
+            error: err
+          })
+        }
       }
     }
 
+    this.#emitRequestFailure({ operation: 'turn start', error: lastErr })
     throw lastErr ?? new Error('turn/start failed')
   }
 

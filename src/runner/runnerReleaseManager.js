@@ -117,7 +117,7 @@ export class RunnerReleaseManager {
 
     const buf = Buffer.from(chunkBase64, 'base64')
     this.transfer.queue = this.transfer.queue.then(async () => {
-      await this.transfer.file.write(buf, 0, buf.length, null)
+      await this.transfer.file.write(buf, 0, buf.length, this.transfer.receivedBytes)
       this.transfer.hash.update(buf)
       this.transfer.receivedBytes += buf.length
     })

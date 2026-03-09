@@ -32,6 +32,7 @@ export function createSessionEnvelopeHandler({
   selectedSessionId,
   sessionStores,
   backfillSessionAfter,
+  onSelectedSessionDeleted = null,
   upsertMachineRow,
   removeMachineLocal,
   removeSessionRow,
@@ -47,6 +48,18 @@ export function createSessionEnvelopeHandler({
   let toastSeq = 0
   const seenToastIds = new Set()
   const seenToastOrder = []
+
+  function allowsAutoTitle(session) {
+    return String(session?.titleSource ?? 'auto').trim() !== 'user'
+  }
+
+  function applyAutoTitle(session, value) {
+    if (!session || !allowsAutoTitle(session)) return
+    const next = truncatePreview(value)
+    if (!next) return
+    session.title = next
+    session.titleSource = 'auto'
+  }
 
   function rememberToast(toastId, maxSize = 500) {
     const id = String(toastId ?? '').trim()
@@ -134,8 +147,12 @@ export function createSessionEnvelopeHandler({
     if (env.type === 'registry.session.delete') {
       const sid = env.payload?.sessionId
       if (sid) {
+        const deletedSession = sessionRowsById?.get?.(sid) ?? null
         removeSessionRow(sid)
-        if (selectedSessionId.value === sid) selectedSessionId.value = null
+        if (selectedSessionId.value === sid) {
+          try { onSelectedSessionDeleted?.(deletedSession) } catch {}
+          selectedSessionId.value = null
+        }
         try { sessionStores.delete(sid) } catch {}
       }
       return
@@ -170,13 +187,26 @@ export function createSessionEnvelopeHandler({
       if (env.type === 'session.status' && env.payload?.status) {
         session.status = env.payload.status
         if (env.payload.codexThreadId) session.codexThreadId = env.payload.codexThreadId
+        const threadPreview = truncatePreview(
+          env.payload?.threadPreview
+          ?? env.payload?.previewSuggestion
+          ?? env.payload?.preview
+        )
+        if (threadPreview) session.preview = threadPreview
+        applyAutoTitle(
+          session,
+          env.payload?.threadName
+          ?? env.payload?.titleSuggestion
+          ?? env.payload?.threadPreview
+          ?? env.payload?.previewSuggestion
+        )
       }
 
       if (env.type === 'session.input') {
         const preview = truncatePreview(env.payload?.text)
         if (preview) session.preview = preview
         if (env.payload?.isInitial && !String(session.title ?? '').trim()) {
-          session.title = session.preview
+          applyAutoTitle(session, session.preview)
         }
       }
 
@@ -186,6 +216,7 @@ export function createSessionEnvelopeHandler({
         session.turnState = 'idle'
         const preview = truncatePreview(env.payload?.preview)
         if (preview) session.preview = preview
+        applyAutoTitle(session, preview)
       }
 
       if (env.type === 'approval.request') {

@@ -9,7 +9,7 @@ import {
 } from '../web/src/lib/sidebarResize.js'
 
 test('clampSessionSidebarWidth keeps the session sidebar within min/max bounds', () => {
-  assert.equal(clampSessionSidebarWidth(50, 1200), 180)
+  assert.equal(clampSessionSidebarWidth(50, 1200), 220)
   assert.equal(clampSessionSidebarWidth(999, 1200), 420)
   assert.equal(clampSessionSidebarWidth(999, 500), 225)
   assert.equal(clampSessionSidebarWidth('bad', 1200), DEFAULT_SESSION_SIDEBAR_WIDTH)
@@ -31,4 +31,7 @@ test('stored session sidebar width is read and persisted safely', () => {
   assert.equal(width, 312)
   assert.equal(values.get('rootgrid.sessionSidebarWidth'), '312')
   assert.equal(readStoredSessionSidebarWidth(storage, 900), 312)
+
+  values.set('rootgrid.sessionSidebarWidth', '169')
+  assert.equal(readStoredSessionSidebarWidth(storage, 900), DEFAULT_SESSION_SIDEBAR_WIDTH)
 })

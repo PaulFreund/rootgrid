@@ -16,12 +16,51 @@ export function setSessionProjectLabel(db, sessionId, projectLabel) {
   return res.changes > 0
 }
 
-export function setSessionTitle(db, sessionId, title) {
-  const res = db.prepare(`
-    UPDATE sessions
-    SET title=?
+export function setWorkspaceProjectLabelBySessionId(db, sessionId, projectLabel) {
+  const target = db.prepare(`
+    SELECT machine_id, cwd
+    FROM sessions
     WHERE session_id=?
-  `).run(title, sessionId)
+  `).get(sessionId)
+  if (!target) return []
+
+  const machineId = String(target.machine_id ?? '').trim()
+  const cwd = String(target.cwd ?? '').trim()
+  if (!machineId || !cwd) {
+    setSessionProjectLabel(db, sessionId, projectLabel)
+    return [sessionId]
+  }
+
+  const rows = db.prepare(`
+    SELECT session_id
+    FROM sessions
+    WHERE machine_id=? AND cwd=?
+  `).all(machineId, cwd)
+
+  db.prepare(`
+    UPDATE sessions
+    SET project_label=?
+    WHERE machine_id=? AND cwd=?
+  `).run(projectLabel, machineId, cwd)
+
+  return rows.map((row) => row?.session_id).filter((value) => typeof value === 'string' && value)
+}
+
+export function setSessionTitle(db, sessionId, title) {
+  const nextTitle = (typeof title === 'string' && title.trim()) ? title.trim() : null
+  const res = nextTitle
+    ? db.prepare(`
+      UPDATE sessions
+      SET title=?, title_source='user'
+      WHERE session_id=?
+    `).run(nextTitle, sessionId)
+    : db.prepare(`
+      UPDATE sessions
+      SET
+        title = CASE WHEN preview IS NULL OR TRIM(preview)='' THEN NULL ELSE preview END,
+        title_source='auto'
+      WHERE session_id=?
+    `).run(sessionId)
   return res.changes > 0
 }
 

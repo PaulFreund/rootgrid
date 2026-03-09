@@ -12,6 +12,7 @@ export function createSessionAdminActions({
   machineRowsById = null,
   removeMachineLocal,
   removeSessionRow = null,
+  onSelectedSessionDeleted = null,
   upsertSessionRow,
   selectedSessionId,
   sessions,
@@ -108,6 +109,9 @@ export function createSessionAdminActions({
     if (deleteWorking.value) return
     deleteWorking.value = true
     try {
+      const deletedSession = sessions.value.find((s) => s?.sessionId === sessionId)
+        ?? archivedSessions.value.find((s) => s?.sessionId === sessionId)
+        ?? null
       const res = await apiFetch(`/api/sessions/${sessionId}`, { method: 'DELETE' })
       if (!res.ok) {
         const err = await res.json().catch(() => null)
@@ -115,7 +119,10 @@ export function createSessionAdminActions({
         return
       }
       deleteOpen.value = false
-      if (selectedSessionId.value === sessionId) selectedSessionId.value = null
+      if (selectedSessionId.value === sessionId) {
+        try { onSelectedSessionDeleted?.(deletedSession) } catch {}
+        selectedSessionId.value = null
+      }
       if (typeof removeSessionRow === 'function') removeSessionRow(sessionId)
       else {
         const liveIdx = sessions.value.findIndex((s) => s?.sessionId === sessionId)
