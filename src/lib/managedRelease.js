@@ -203,7 +203,11 @@ export async function createManagedReleaseBundle({
     for (const entry of RUNTIME_COPY_ENTRIES) {
       if (await pathExists(join(sourceRoot, entry))) entries.push(entry)
     }
-    await runCommand('tar', ['-czf', bundlePath, '-C', sourceRoot, ...entries, '-C', manifestDir, RELEASE_MANIFEST_FILENAME], { cwd: outDir })
+    await runCommand(
+      'tar',
+      ['-czf', bundlePath, '-C', sourceRoot, ...entries, '-C', manifestDir, RELEASE_MANIFEST_FILENAME],
+      { cwd: outDir, timeoutMs: 5 * 60_000 }
+    )
     const sha256 = await hashFileSha256(bundlePath)
     const info = await stat(bundlePath)
     return {

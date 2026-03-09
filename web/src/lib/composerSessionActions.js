@@ -38,6 +38,7 @@ export function createComposerSessionActions({
   sendError,
   messageDraft,
   sending,
+  getSessionStore,
   selectedSession,
   selectedSessionId
 }) {
@@ -120,16 +121,16 @@ export function createComposerSessionActions({
     attachments.value.splice(idx, 1)
   }
 
-  async function uploadComposerAttachments(sessionId) {
+  async function uploadComposerAttachments(sessionId, attachmentList = attachments.value) {
     return await uploadComposerAttachmentRefs({
       sessionId,
-      attachments: attachments.value,
+      attachments: attachmentList,
       apiFetch
     })
   }
 
-  async function sendComposerMessage(sessionId, text) {
-    const uploaded = attachments.value.length ? await uploadComposerAttachments(sessionId) : []
+  async function sendComposerMessage(sessionId, text, attachmentList = attachments.value) {
+    const uploaded = attachmentList.length ? await uploadComposerAttachments(sessionId, attachmentList) : []
     const res = await apiFetch(`/api/sessions/${sessionId}/messages`, {
       method: 'POST',
       body: JSON.stringify(buildComposerMessageBody({
@@ -142,6 +143,121 @@ export function createComposerSessionActions({
       throw new Error(err?.error ?? `HTTP ${res.status}`)
     }
     return uploaded
+  }
+
+  function getQueuedPromptStore(sessionId) {
+    if (!sessionId || typeof getSessionStore !== 'function') return null
+    const store = getSessionStore(sessionId)
+    if (!Array.isArray(store?.queuedPrompts)) store.queuedPrompts = []
+    if (typeof store?.queueSending !== 'boolean') store.queueSending = false
+    return store
+  }
+
+  function replaceQueuedPrompts(store, queuedPrompts) {
+    if (!store) return
+    store.queuedPrompts = Array.isArray(queuedPrompts) ? queuedPrompts : []
+  }
+
+  async function removeQueuedPrompt(sessionId, promptId) {
+    const store = getQueuedPromptStore(sessionId)
+    if (!store) return false
+    store.queueSending = true
+    try {
+      const res = await apiFetch(`/api/sessions/${encodeURIComponent(String(sessionId))}/queued-prompts/${encodeURIComponent(String(promptId ?? ''))}`, {
+        method: 'DELETE'
+      })
+      const data = await res.json().catch(() => null)
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+      replaceQueuedPrompts(store, data?.queuedPrompts)
+      return true
+    } catch (err) {
+      sendError.value = String(err?.message ?? err)
+      return false
+    } finally {
+      store.queueSending = false
+    }
+  }
+
+  async function queueCurrentDraftForSession(sessionId) {
+    const sid = String(sessionId ?? '').trim()
+    if (!sid) return false
+    const text = String(messageDraft.value ?? '').trim()
+    const currentAttachments = Array.isArray(attachments.value) ? attachments.value : []
+    if (!text && !currentAttachments.length) return false
+    const store = getQueuedPromptStore(sid)
+    if (!store) return false
+    store.queueSending = true
+    sendError.value = ''
+    try {
+      const uploaded = currentAttachments.length ? await uploadComposerAttachments(sid, currentAttachments) : []
+      const res = await apiFetch(`/api/sessions/${encodeURIComponent(sid)}/queued-prompts`, {
+        method: 'POST',
+        body: JSON.stringify(buildComposerMessageBody({
+          text,
+          uploadedAttachments: uploaded
+        }))
+      })
+      const data = await res.json().catch(() => null)
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+      replaceQueuedPrompts(store, data?.queuedPrompts)
+      messageDraft.value = ''
+      clearComposerAttachments()
+      return true
+    } catch (err) {
+      sendError.value = String(err?.message ?? err)
+      return false
+    } finally {
+      store.queueSending = false
+    }
+  }
+
+  async function sendQueuedPromptNow(sessionId, promptId = null) {
+    const sid = String(sessionId ?? '').trim()
+    if (!sid) return false
+    const store = getQueuedPromptStore(sid)
+    if (!store || store.queueSending) return false
+
+    store.queueSending = true
+    sendError.value = ''
+    try {
+      const targetPromptId = String(promptId ?? store.queuedPrompts[0]?.promptId ?? store.queuedPrompts[0]?.id ?? '').trim()
+      if (!targetPromptId) return false
+      const res = await apiFetch(`/api/sessions/${encodeURIComponent(sid)}/queued-prompts/${encodeURIComponent(targetPromptId)}/send`, {
+        method: 'POST'
+      })
+      const data = await res.json().catch(() => null)
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+      replaceQueuedPrompts(store, data?.queuedPrompts)
+      return true
+    } catch (err) {
+      sendError.value = String(err?.message ?? err)
+      return false
+    } finally {
+      store.queueSending = false
+    }
+  }
+
+  async function updateQueuedPromptText(sessionId, promptId, text) {
+    const sid = String(sessionId ?? '').trim()
+    if (!sid) return false
+    const store = getQueuedPromptStore(sid)
+    if (!store || store.queueSending) return false
+    store.queueSending = true
+    try {
+      const res = await apiFetch(`/api/sessions/${encodeURIComponent(sid)}/queued-prompts/${encodeURIComponent(String(promptId ?? ''))}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ text: String(text ?? '') })
+      })
+      const data = await res.json().catch(() => null)
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+      replaceQueuedPrompts(store, data?.queuedPrompts)
+      return true
+    } catch (err) {
+      sendError.value = String(err?.message ?? err)
+      return false
+    } finally {
+      store.queueSending = false
+    }
   }
 
   async function createSessionFromDraft(prompt) {
@@ -197,6 +313,7 @@ export function createComposerSessionActions({
   async function submit() {
     sendError.value = ''
     if (selectedSession.value?.turnState === 'running') {
+      if (await queueCurrentDraftForSession(selectedSessionId.value)) return
       await stopGenerating()
       return
     }
@@ -237,6 +354,10 @@ export function createComposerSessionActions({
     removeAttachment,
     uploadComposerAttachments,
     createSessionFromDraft,
+    queueCurrentDraftForSession,
+    sendQueuedPromptNow,
+    updateQueuedPromptText,
+    removeQueuedPrompt,
     submit,
     stopSession,
     stopGenerating

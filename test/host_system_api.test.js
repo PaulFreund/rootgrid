@@ -21,7 +21,8 @@ class FakeResponse extends EventEmitter {
     return true
   }
 
-  end() {
+  end(chunk) {
+    if (chunk !== undefined) this.write(chunk)
     this.emit('close')
   }
 }
@@ -157,4 +158,110 @@ test('host system SSE falls back to full registry.snapshot when lightweight resu
   assert.equal(sent[0]?.envelope?.payload?.sessionsNextBeforeUpdatedMs, 123)
   assert.equal(sent[0]?.envelope?.payload?.sessionsNextBeforeSessionId, 's-1')
   assert.equal(sent[0]?.envelope?.payload?.approvals?.[0]?.approvalId, 'a-1')
+})
+
+test('host system exposes authenticated runner install bootstrap payloads', async () => {
+  const api = createHostSystemApi({
+    auth: {
+      requireAuth() { return true }
+    },
+    store: {
+      listMachines() { return [] },
+      listSessionsPage() { return { sessions: [], hasMoreBefore: false, nextBeforeUpdatedMs: null, nextBeforeSessionId: null } },
+      listApprovals() { return [] }
+    },
+    runnerWs: {
+      listConnectedMachineIds() {
+        return []
+      }
+    },
+    sse: {
+      canReplayFrom() { return false },
+      addClient() {},
+      sendDirect() { return true },
+      activateClient() { return true }
+    },
+    push: null,
+    config: {},
+    runnerInstall: {
+      async createBootstrap() {
+        return {
+          installToken: 'install-token',
+          expiresAtMs: 1234,
+          baseUrl: 'https://rootgrid.example.test',
+          installUrl: 'https://rootgrid.example.test/api/install/runner.sh?installToken=install-token',
+          installCommand: "curl -fsSL 'https://rootgrid.example.test/api/install/runner.sh?installToken=install-token' | bash",
+          version: '0.0.1',
+          releaseId: 'rootgrid-0.0.1-test'
+        }
+      }
+    },
+    readJsonBody: async () => ({}),
+    json(res, code, payload) {
+      res.statusCode = code
+      res.setHeader('content-type', 'application/json; charset=utf-8')
+      res.payload = payload
+      res.end()
+    }
+  })
+
+  const req = {
+    method: 'POST',
+    headers: {}
+  }
+  const res = new FakeResponse()
+  const url = new URL('http://127.0.0.1/api/install/runner-bootstrap')
+
+  const handled = await api.handle(req, res, url, [])
+  assert.equal(handled, true)
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.payload?.installToken, 'install-token')
+  assert.match(res.payload?.installCommand ?? '', /curl -fsSL/)
+})
+
+test('host system serves a runner bootstrap shell script by install token', async () => {
+  const api = createHostSystemApi({
+    auth: {
+      requireAuth() { return true }
+    },
+    store: {
+      listMachines() { return [] },
+      listSessionsPage() { return { sessions: [], hasMoreBefore: false, nextBeforeUpdatedMs: null, nextBeforeSessionId: null } },
+      listApprovals() { return [] }
+    },
+    runnerWs: {
+      listConnectedMachineIds() {
+        return []
+      }
+    },
+    sse: {
+      canReplayFrom() { return false },
+      addClient() {},
+      sendDirect() { return true },
+      activateClient() { return true }
+    },
+    push: null,
+    config: {},
+    runnerInstall: {
+      async renderInstallScript(_req, installToken) {
+        if (installToken !== 'ok') return null
+        return '#!/usr/bin/env bash\necho rootgrid\n'
+      }
+    },
+    readJsonBody: async () => ({}),
+    json() {}
+  })
+
+  const req = {
+    method: 'GET',
+    headers: {}
+  }
+  const res = new FakeResponse()
+  const url = new URL('http://127.0.0.1/api/install/runner.sh?installToken=ok')
+
+  const handled = await api.handle(req, res, url, [])
+  assert.equal(handled, true)
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.headers.get('content-type'), 'text/x-shellscript; charset=utf-8')
+  assert.equal(res.writes.join(''), '#!/usr/bin/env bash\necho rootgrid\n')
 })

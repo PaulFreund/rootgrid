@@ -55,6 +55,35 @@ test('normalizeWrappedNotification remaps wrapped deltas and token counts', () =
       rateLimits: { reset_seconds: 9 }
     }
   })
+
+  const wrappedError = normalizeWrappedNotification({
+    method: 'codex/event/message',
+    params: {
+      msg: {
+        type: 'error',
+        turn_id: 'turn-1',
+        will_retry: true,
+        message: 'Reconnecting... 2/5',
+        additional_details: 'stream disconnected',
+        codex_error_info: { response_stream_disconnected: { http_status_code: null } }
+      }
+    },
+    sessionId: 'session-1'
+  })
+  assert.deepEqual(wrappedError, {
+    kind: 'forward',
+    notifications: [{
+      method: 'error',
+      params: {
+        __rgFromWrapped: true,
+        turnId: 'turn-1',
+        willRetry: true,
+        message: 'Reconnecting... 2/5',
+        details: 'stream disconnected',
+        codexErrorInfo: { response_stream_disconnected: { http_status_code: null } }
+      }
+    }]
+  })
 })
 
 test('notification helpers build stderr/plan/thread/tool payloads', () => {

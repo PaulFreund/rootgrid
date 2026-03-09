@@ -21,6 +21,8 @@ export function createSessionStoreState() {
     pendingAfter: [],
     lastRealtimeSeqSeen: 0,
     messageViewVersion: 0,
+    queuedPrompts: [],
+    queueSending: false,
     toolOutputByItemId: new Map(),
     toolExpanded: new Map(),
     diffExpandedByEventId: new Map(),

@@ -114,6 +114,11 @@ export async function installSystemdUserService({
     return { ok: false, step: 'enable', unitPath, error: enable.stderr || enable.stdout || 'systemctl enable failed' }
   }
 
+  const restart = await runCommandCapture('systemctl', ['--user', 'restart', `${serviceName}.service`])
+  if (!restart.ok) {
+    return { ok: false, step: 'restart', unitPath, error: restart.stderr || restart.stdout || 'systemctl restart failed' }
+  }
+
   return { ok: true, unitPath }
 }
 

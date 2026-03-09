@@ -86,6 +86,7 @@ export function createSessionReadApi({
   store,
   json,
   uploadService,
+  listQueuedPromptPayloads = () => [],
   getSessionOr404
 }) {
   const { isImageMimeType } = uploadService
@@ -126,6 +127,7 @@ export function createSessionReadApi({
           const prefetchUntilInput = url.searchParams.get('prefetchUntilInput') !== '0'
           json(res, 200, {
             session,
+            queuedPrompts: listQueuedPromptPayloads(sessionId),
             ...buildSessionBootstrapPayload(store, sessionId, {
               limit,
               prefetchPages,
@@ -137,6 +139,7 @@ export function createSessionReadApi({
         }
         json(res, 200, {
           session,
+          queuedPrompts: listQueuedPromptPayloads(sessionId),
           ...(includeEvents ? { events: store.listSessionEvents(sessionId, { limit: 500 }) } : {})
         })
         return true

@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { createReadStream } from 'node:fs'
 import { chmod, rename, writeFile } from 'node:fs/promises'
 
 import { RootgridConfigSchema } from '../config/schema.js'
@@ -36,11 +37,59 @@ export function createHostSystemApi({
   sse,
   push,
   config,
+  runnerInstall = null,
   readJsonBody,
   json
 }) {
   return {
     async handle(req, res, url, parts) {
+      if ((url.pathname === '/install/runner.sh' || url.pathname === '/api/install/runner.sh') && req.method === 'GET') {
+        const installToken = url.searchParams.get('installToken')
+        const script = await runnerInstall?.renderInstallScript?.(req, installToken)
+        if (!script) {
+          res.statusCode = 404
+          res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+          res.setHeader('Cache-Control', 'no-store')
+          res.end('invalid or expired install token\n')
+          return true
+        }
+        res.statusCode = 200
+        res.setHeader('Content-Type', 'text/x-shellscript; charset=utf-8')
+        res.setHeader('Cache-Control', 'no-store')
+        res.end(script)
+        return true
+      }
+
+      if (url.pathname === '/api/install/runner-bundle' && req.method === 'GET') {
+        const installToken = url.searchParams.get('installToken')
+        const bundle = await runnerInstall?.getBundleForToken?.(installToken)
+        if (!bundle?.bundlePath) {
+          res.statusCode = 404
+          res.setHeader('Content-Type', 'application/json; charset=utf-8')
+          res.setHeader('Cache-Control', 'no-store')
+          res.end(JSON.stringify({ error: 'invalid or expired install token' }))
+          return true
+        }
+
+        res.statusCode = 200
+        res.setHeader('Content-Type', 'application/gzip')
+        res.setHeader('Cache-Control', 'no-store')
+        res.setHeader('Content-Disposition', `attachment; filename="${String(bundle.filename ?? 'rootgrid-runner.tgz').replaceAll('"', '')}"`)
+        if (Number.isFinite(Number(bundle.sizeBytes)) && Number(bundle.sizeBytes) > 0) {
+          res.setHeader('Content-Length', String(Number(bundle.sizeBytes)))
+        }
+        const stream = createReadStream(bundle.bundlePath)
+        stream.on('error', () => {
+          try {
+            if (!res.headersSent) res.statusCode = 500
+            res.end()
+          } catch {
+          }
+        })
+        stream.pipe(res)
+        return true
+      }
+
       if (url.pathname === '/api/auth' && req.method === 'POST') {
         const body = await readJsonBody(req)
         auth.handleAuth(req, res, body)
@@ -298,6 +347,21 @@ export function createHostSystemApi({
       if (url.pathname === '/api/settings' && req.method === 'GET') {
         if (!auth.requireAuth(req, res)) return true
         json(res, 200, buildSettingsPayload(config))
+        return true
+      }
+
+      if (url.pathname === '/api/install/runner-bootstrap' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        try {
+          const payload = await runnerInstall?.createBootstrap?.(req)
+          if (!payload) {
+            json(res, 503, { error: 'runner install is unavailable' })
+            return true
+          }
+          json(res, 200, payload)
+        } catch (err) {
+          json(res, 500, { error: String(err?.message ?? err) })
+        }
         return true
       }
 

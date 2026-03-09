@@ -144,6 +144,15 @@ export function createSessionEnvelopeHandler({
     const sessionId = env.scope?.sessionId ?? env.payload?.sessionId ?? null
     if (!sessionId) return
 
+    if (env.type === 'session.queuedPrompts.updated') {
+      const store = sessionStores.get(sessionId) ?? (selectedSessionId.value === sessionId ? getSessionStore(sessionId) : null)
+      if (!store) return
+      store.queuedPrompts = Array.isArray(env.payload?.queuedPrompts) ? env.payload.queuedPrompts : []
+      store.queueSending = false
+      store.messageViewVersion = Number(store.messageViewVersion ?? 0) + 1
+      return
+    }
+
     const realtimeSeq = Number(env.eventSeq ?? env.seq ?? 0)
     const knownStore = sessionStores.get(sessionId)
     if (knownStore && Number.isFinite(realtimeSeq) && realtimeSeq > 0) {
@@ -193,10 +202,11 @@ export function createSessionEnvelopeHandler({
         scheduleMarkRead(sessionId)
       }
 
-      const stream = env.type === 'session.output' ? (env.payload?.stream ?? 'normalized') : null
-      const shouldBump = !(env.type === 'session.output' && stream !== 'normalized')
-        && env.type !== 'thread.tokenUsage.updated'
-        && env.type !== 'token.count'
+      const shouldBump = (
+        env.type === 'session.input'
+        || env.type === 'turn.completed'
+        || env.type === 'approval.request'
+      )
       if (shouldBump) bumpSessionToTop(sessionId)
     } else if (env.type === 'approval.request') {
       enqueueApproval(approvalQueue.value, env.payload, approvalIds)

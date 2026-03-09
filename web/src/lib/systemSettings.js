@@ -14,6 +14,7 @@ export function urlBase64ToUint8Array(base64String, {
 export function createSystemSettingsActions({
   apiFetch,
   authed,
+  appSettings = null,
   appSettingsLoaded,
   loadAppSettings,
   settingsTab,
@@ -33,6 +34,7 @@ export function createSystemSettingsActions({
   const pushEndpoint = ref(null)
   const pushWorking = ref(false)
   const pushError = ref('')
+  let autoEnablePushAttempted = false
 
   function refreshNotificationPermission() {
     if (!notificationSupported.value) {
@@ -87,30 +89,36 @@ export function createSystemSettingsActions({
     }
   }
 
-  async function enablePush() {
-    pushError.value = ''
+  async function enablePush({ silent = false } = {}) {
+    if (!silent) pushError.value = ''
     if (!pushSupported.value) return false
 
     pushWorking.value = true
     try {
+      if (windowObj && !windowObj.isSecureContext) {
+        pushStatus.value = 'insecure'
+        if (!silent) pushError.value = 'Push notifications require a secure context.'
+        return false
+      }
+
       if (notificationPermission.value !== 'granted') {
         await requestNotificationPermission()
       }
       if (notificationPermission.value !== 'granted') {
-        pushError.value = 'Notification permission not granted.'
+        if (!silent) pushError.value = 'Notification permission not granted.'
         return false
       }
 
       const keyRes = await apiFetch('/api/push/vapid-public-key')
       if (!keyRes.ok) {
         const err = await keyRes.json().catch(() => null)
-        pushError.value = err?.error ?? `HTTP ${keyRes.status}`
+        if (!silent) pushError.value = err?.error ?? `HTTP ${keyRes.status}`
         return false
       }
       const keyData = await keyRes.json().catch(() => null)
       const publicKey = keyData?.publicKey
       if (!publicKey || typeof publicKey !== 'string') {
-        pushError.value = 'Invalid VAPID public key.'
+        if (!silent) pushError.value = 'Invalid VAPID public key.'
         return false
       }
 
@@ -127,18 +135,36 @@ export function createSystemSettingsActions({
       })
       if (!res.ok) {
         const err = await res.json().catch(() => null)
-        pushError.value = err?.error ?? `HTTP ${res.status}`
+        if (!silent) pushError.value = err?.error ?? `HTTP ${res.status}`
         return false
       }
 
       await refreshPushSubscription()
       return true
     } catch (err) {
-      pushError.value = String(err?.message ?? err)
+      if (!silent) pushError.value = String(err?.message ?? err)
       return false
     } finally {
       pushWorking.value = false
     }
+  }
+
+  function currentWebPushPolicy() {
+    return String(appSettings?.notifications?.webPush ?? 'if-not-visible').trim() || 'if-not-visible'
+  }
+
+  async function autoEnablePushOnLoad({ force = false } = {}) {
+    if (!authed.value || !appSettingsLoaded.value) return false
+    if (currentWebPushPolicy() === 'never') return false
+    if (autoEnablePushAttempted && !force) return false
+    autoEnablePushAttempted = true
+
+    await refreshPushSubscription()
+    if (pushStatus.value === 'subscribed') return true
+    if (pushStatus.value === 'unsupported' || pushStatus.value === 'insecure') return false
+    if (notificationPermission.value === 'denied') return false
+
+    return await enablePush({ silent: true })
   }
 
   async function disablePush() {
@@ -193,6 +219,7 @@ export function createSystemSettingsActions({
     requestNotificationPermission,
     refreshPushSubscription,
     enablePush,
+    autoEnablePushOnLoad,
     disablePush,
     openSettings
   }

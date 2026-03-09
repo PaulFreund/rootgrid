@@ -112,3 +112,15 @@ export function pushSubscriptionRowToRecord(row) {
     updatedMs: row.updated_ms
   }
 }
+
+export function queuedPromptRowToRecord(row) {
+  if (!row) return null
+  return {
+    promptId: row.prompt_id,
+    sessionId: row.session_id,
+    text: row.text,
+    attachmentIds: parseJsonCell(row.attachments_json, []),
+    createdMs: row.created_ms,
+    updatedMs: row.updated_ms
+  }
+}

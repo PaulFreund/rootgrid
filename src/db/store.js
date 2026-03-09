@@ -44,17 +44,21 @@ import {
   deleteApproval as deleteApprovalRow,
   deleteIdeSession as deleteIdeSessionRow,
   deletePushSubscription as deletePushSubscriptionRow,
+  deleteQueuedPrompt as deleteQueuedPromptRow,
   deleteUpload as deleteUploadRow,
   getApproval as getApprovalRow,
   getIdeSession as getIdeSessionRow,
+  getQueuedPrompt as getQueuedPromptRow,
   getUpload as getUploadRow,
   listApprovals as listApprovalsRows,
   listIdeSessions as listIdeSessionsRows,
   listPushSubscriptions as listPushSubscriptionsRows,
+  listQueuedPrompts as listQueuedPromptsRows,
   listSessionUploads as listSessionUploadsRows,
   upsertApproval as upsertApprovalRow,
   upsertIdeSession as upsertIdeSessionRow,
   upsertPushSubscription as upsertPushSubscriptionRow,
+  upsertQueuedPrompt as upsertQueuedPromptRow,
   upsertUpload as upsertUploadRow
 } from './storeSideTables.js'
 
@@ -265,6 +269,27 @@ export class Store {
         `)
 
         v = 8
+        this.db.exec(`PRAGMA user_version = ${v}`)
+        continue
+      }
+
+      if (v === 8) {
+        // v8 -> v9: persisted queued follow-up prompts.
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS queued_prompts (
+            prompt_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            attachments_json TEXT NOT NULL,
+            created_ms INTEGER NOT NULL,
+            updated_ms INTEGER NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+          );
+
+          CREATE INDEX IF NOT EXISTS queued_prompts_by_session ON queued_prompts(session_id, created_ms);
+        `)
+
+        v = 9
         this.db.exec(`PRAGMA user_version = ${v}`)
         continue
       }
@@ -918,6 +943,31 @@ export class Store {
    */
   deleteUpload({ sessionId, uploadId }) {
     return deleteUploadRow(this.db, { sessionId, uploadId })
+  }
+
+  upsertQueuedPrompt({ promptId, sessionId, text = '', attachmentIds = [], createdMs = Date.now() }) {
+    upsertQueuedPromptRow(this.db, { promptId, sessionId, text, attachmentIds, createdMs })
+  }
+
+  /**
+   * @param {{ sessionId: string, promptId: string }} input
+   */
+  getQueuedPrompt({ sessionId, promptId }) {
+    return getQueuedPromptRow(this.db, { sessionId, promptId })
+  }
+
+  /**
+   * @param {string} sessionId
+   */
+  listQueuedPrompts(sessionId) {
+    return listQueuedPromptsRows(this.db, sessionId)
+  }
+
+  /**
+   * @param {{ sessionId: string, promptId: string }} input
+   */
+  deleteQueuedPrompt({ sessionId, promptId }) {
+    return deleteQueuedPromptRow(this.db, { sessionId, promptId })
   }
 
   /**

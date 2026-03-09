@@ -130,3 +130,120 @@ test('enablePush requests permission, subscribes, and persists the subscription'
     '/api/push/subscribe'
   ])
 })
+
+test('autoEnablePushOnLoad silently subscribes when push is preferred', async () => {
+  let subscription = null
+  let subscribeCalls = 0
+
+  const actions = createSystemSettingsActions({
+    apiFetch: async (path) => {
+      if (path === '/api/push/vapid-public-key') {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { publicKey: 'SGVsbG8td29ybGQ' }
+          }
+        }
+      }
+      if (path === '/api/push/subscribe') {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { ok: true }
+          }
+        }
+      }
+      throw new Error(`unexpected request: ${path}`)
+    },
+    authed: ref(true),
+    appSettings: {
+      notifications: {
+        webPush: 'if-not-visible'
+      }
+    },
+    appSettingsLoaded: ref(true),
+    loadAppSettings: async () => {},
+    settingsTab: ref('defaults'),
+    defaultsOpen: ref(false),
+    windowObj: { isSecureContext: true, PushManager: function PushManager() {} },
+    navigatorObj: {
+      serviceWorker: {
+        ready: Promise.resolve({
+          pushManager: {
+            async getSubscription() {
+              return subscription
+            },
+            async subscribe() {
+              subscribeCalls += 1
+              subscription = {
+                endpoint: 'https://push.example.test/sub/auto',
+                keys: {
+                  p256dh: 'p256dh-key',
+                  auth: 'auth-key'
+                }
+              }
+              return subscription
+            }
+          }
+        })
+      }
+    },
+    notificationCtor: {
+      permission: 'granted',
+      async requestPermission() {
+        return 'granted'
+      }
+    }
+  })
+
+  const ok = await actions.autoEnablePushOnLoad()
+  assert.equal(ok, true)
+  assert.equal(subscribeCalls, 1)
+  assert.equal(actions.pushStatus.value, 'subscribed')
+  assert.equal(actions.pushError.value, '')
+})
+
+test('autoEnablePushOnLoad does nothing when web push policy is never', async () => {
+  let apiCalls = 0
+
+  const actions = createSystemSettingsActions({
+    apiFetch: async () => {
+      apiCalls += 1
+      throw new Error('should not be called')
+    },
+    authed: ref(true),
+    appSettings: {
+      notifications: {
+        webPush: 'never'
+      }
+    },
+    appSettingsLoaded: ref(true),
+    loadAppSettings: async () => {},
+    settingsTab: ref('defaults'),
+    defaultsOpen: ref(false),
+    windowObj: { isSecureContext: true, PushManager: function PushManager() {} },
+    navigatorObj: {
+      serviceWorker: {
+        ready: Promise.resolve({
+          pushManager: {
+            async getSubscription() {
+              return null
+            }
+          }
+        })
+      }
+    },
+    notificationCtor: {
+      permission: 'granted',
+      async requestPermission() {
+        return 'granted'
+      }
+    }
+  })
+
+  const ok = await actions.autoEnablePushOnLoad()
+  assert.equal(ok, false)
+  assert.equal(apiCalls, 0)
+})

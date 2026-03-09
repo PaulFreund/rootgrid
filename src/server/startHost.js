@@ -18,7 +18,9 @@ import { createPendingRequestBook } from './pendingRequestBook.js'
 import { PushService } from './pushService.js'
 import { createReleaseBundleManager } from './releaseBundleManager.js'
 import { recoverAfterRunnerRestart } from './recovery.js'
+import { createRunnerInstallManager } from './runnerInstallManager.js'
 import { createSessionApi } from './sessionApi.js'
+import { buildAttachmentPayload, buildCodexInputItems } from './sessionApiHelpers.js'
 import { SSEManager } from './sseManager.js'
 import { serveWeb } from './static.js'
 import { createUploadService } from './uploads.js'
@@ -58,6 +60,10 @@ export async function startHost({ config }) {
   const pendingModelLists = createPendingRequestBook()
   const pendingRunnerCommands = createPendingRequestBook()
   const releaseBundles = createReleaseBundleManager()
+  const runnerInstall = createRunnerInstallManager({
+    config,
+    releaseBundles
+  })
 
   const tunnelHub = new TunnelHub()
 
@@ -116,7 +122,13 @@ export async function startHost({ config }) {
     pendingModelLists,
     pendingIdeStarts,
     terminalSessions,
-    httpError
+    httpError,
+    onSessionTurnCompleted: ({ sessionId, payload }) => {
+      if (String(payload?.status ?? 'completed') !== 'completed') return
+      queueMicrotask(() => {
+        sendQueuedPromptNowBackend({ sessionId, skipIfBusy: true }).catch(() => {})
+      })
+    }
   })
   const runnerWs = createRunnerWsServer({
     config,
@@ -146,6 +158,7 @@ export async function startHost({ config }) {
     err.statusCode = statusCode
     return err
   }
+
   const persistSessionEvent = (envelope, { sessionId }) => {
     try {
       const seq = store.appendEvent({
@@ -159,6 +172,49 @@ export async function startHost({ config }) {
       sse.send(envelope)
     } catch {
     }
+  }
+
+  const queuedPromptSendLocks = new Set()
+
+  function listQueuedPromptPayloads(sessionId) {
+    const sid = String(sessionId ?? '').trim()
+    if (!sid) return []
+    let rows = []
+    try { rows = store.listQueuedPrompts(sid) } catch { }
+    const formatUploadDescriptor = uploadService?.formatUploadDescriptor
+    return rows.map((row) => {
+      const attachments = []
+      for (const uploadId of (Array.isArray(row?.attachmentIds) ? row.attachmentIds : [])) {
+        try {
+          const upload = store.getUpload({ sessionId: sid, uploadId })
+          if (!upload) continue
+          if (typeof formatUploadDescriptor === 'function') attachments.push(formatUploadDescriptor(sid, upload))
+        } catch {
+        }
+      }
+      return {
+        id: row.promptId,
+        promptId: row.promptId,
+        text: String(row?.text ?? ''),
+        attachments,
+        createdAtMs: Number(row?.createdMs ?? Date.now()) || Date.now(),
+        updatedAtMs: Number(row?.updatedMs ?? Date.now()) || Date.now()
+      }
+    })
+  }
+
+  function sendQueuedPromptsUpdated(sessionId) {
+    const sid = String(sessionId ?? '').trim()
+    if (!sid) return []
+    const session = store.getSession(sid)
+    const queuedPrompts = listQueuedPromptPayloads(sid)
+    if (!session) return queuedPrompts
+    sse.send(makeEnvelope({
+      type: 'session.queuedPrompts.updated',
+      scope: { machineId: session.machineId, sessionId: sid },
+      payload: { sessionId: sid, queuedPrompts }
+    }), { recordHistory: false })
+    return queuedPrompts
   }
 
   async function sendRunnerCommandAndAwait({
@@ -186,6 +242,94 @@ export async function startHost({ config }) {
     }
 
     return await resultP
+  }
+
+  async function sendQueuedPromptNowBackend({ sessionId, promptId = null, skipIfBusy = false } = {}) {
+    const sid = String(sessionId ?? '').trim()
+    if (!sid) throw httpError(400, 'sessionId is required')
+    if (queuedPromptSendLocks.has(sid)) {
+      if (skipIfBusy) return { ok: false, skipped: true, queuedPrompts: listQueuedPromptPayloads(sid) }
+      throw httpError(409, 'queued prompt already sending')
+    }
+
+    const session = store.getSession(sid)
+    if (!session) throw httpError(404, 'not found')
+
+    const pid = String(promptId ?? '').trim()
+    const row = pid
+      ? store.getQueuedPrompt({ sessionId: sid, promptId: pid })
+      : (store.listQueuedPrompts(sid)?.[0] ?? null)
+    if (!row) throw httpError(404, 'queued prompt not found')
+
+    const text = String(row?.text ?? '')
+    const attachments = (Array.isArray(row?.attachmentIds) ? row.attachmentIds : [])
+      .map((uploadId) => ({ uploadId: String(uploadId ?? '').trim() }))
+      .filter((attachment) => attachment.uploadId)
+
+    if (!String(text).trim() && !attachments.length) {
+      try { store.deleteQueuedPrompt({ sessionId: sid, promptId: row.promptId }) } catch { }
+      return {
+        ok: true,
+        sent: false,
+        queuedPrompts: sendQueuedPromptsUpdated(sid)
+      }
+    }
+
+    queuedPromptSendLocks.add(sid)
+    try {
+      const uploaded = await uploadService.resolveAttachmentInputs({
+        machineId: session.machineId,
+        sessionId: sid,
+        attachments
+      })
+      const inputItems = buildCodexInputItems({
+        text,
+        uploads: uploaded,
+        isImageMimeType: uploadService.isImageMimeType
+      })
+      const attachmentPayload = buildAttachmentPayload(uploaded)
+      const input = makeEnvelope({
+        type: 'session.input',
+        scope: { machineId: session.machineId, sessionId: sid },
+        payload: {
+          sessionId: sid,
+          text,
+          ...(attachmentPayload ? { attachments: attachmentPayload } : {})
+        }
+      })
+      const options = {
+        ...(session.model ? { model: session.model } : {}),
+        ...(session.reasoningEffort ? { reasoningEffort: session.reasoningEffort } : {}),
+        ...(session.approvalPolicy ? { approvalPolicy: session.approvalPolicy } : {}),
+        ...(session.sandbox ? { sandbox: session.sandbox } : {})
+      }
+
+      await sendRunnerCommandAndAwait({
+        machineId: session.machineId,
+        sessionId: sid,
+        type: 'session.send',
+        payload: {
+          sessionId: sid,
+          text,
+          input: inputItems,
+          cwd: session.cwd,
+          codexThreadId: session.codexThreadId ?? null,
+          ...(Object.keys(options).length ? { options } : {})
+        },
+        timeoutMs: 10_000
+      })
+
+      persistSessionEvent(input, { sessionId: sid })
+      try { store.deleteQueuedPrompt({ sessionId: sid, promptId: row.promptId }) } catch { }
+      return {
+        ok: true,
+        sent: true,
+        promptId: row.promptId,
+        queuedPrompts: sendQueuedPromptsUpdated(sid)
+      }
+    } finally {
+      queuedPromptSendLocks.delete(sid)
+    }
   }
 
   async function fsListOnRunner({ machineId, path, includeFiles = false }) {
@@ -396,7 +540,10 @@ export async function startHost({ config }) {
     sendRunnerCommandAndAwait,
     uploadService,
     approvals,
-    persistSessionEvent
+    persistSessionEvent,
+    listQueuedPromptPayloads,
+    sendQueuedPromptsUpdated,
+    sendQueuedPromptNowBackend
   })
 
   const hostSystemApi = createHostSystemApi({
@@ -406,6 +553,7 @@ export async function startHost({ config }) {
     sse,
     push,
     config,
+    runnerInstall,
     readJsonBody,
     json
   })

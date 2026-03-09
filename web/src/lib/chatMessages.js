@@ -248,12 +248,13 @@ function exploreCountKey(action) {
   return null
 }
 
-function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, toolCalls, reasoningChunks, commentaryChunks, diffEvents }) {
+function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, toolCalls, reasoningChunks, commentaryChunks, diffEvents, errors }) {
   const calls = Array.isArray(exploreCalls) ? exploreCalls : []
   const tools = Array.isArray(toolCalls) ? toolCalls : []
   const rawReasoningChunks = Array.isArray(reasoningChunks) ? reasoningChunks : []
   const rawCommentaryChunks = Array.isArray(commentaryChunks) ? commentaryChunks : []
   const diffs = Array.isArray(diffEvents) ? diffEvents : []
+  const errorEvents = Array.isArray(errors) ? errors : []
   const hasDiffs = diffs.some((diff) => String(diff?.raw ?? '').trim())
   const reasoningLoaded = Boolean(reasoningState?.loaded)
   const reasoningSections = rawReasoningChunks.length
@@ -304,6 +305,29 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, toolCalls, 
       seq: Number.isFinite(seq) ? seq : null,
       tsMs: Number.isFinite(tsMs) ? tsMs : null,
       text
+    })
+  }
+
+  for (const error of errorEvents) {
+    if (!error) continue
+    const message = String(error.message ?? '').trim()
+    const details = String(error.details ?? '').trim()
+    let meta = ''
+    if (error.codexErrorInfo) {
+      try { meta = JSON.stringify(error.codexErrorInfo) } catch {}
+    }
+    if (!message && !details && !meta) continue
+    const seq = Number(error.seq ?? NaN)
+    const tsMs = Number(error.tsMs ?? NaN)
+    items.push({
+      kind: 'error',
+      id: `error-${String(error.id ?? items.length + 1)}`,
+      seq: Number.isFinite(seq) ? seq : null,
+      tsMs: Number.isFinite(tsMs) ? tsMs : null,
+      message,
+      details,
+      meta,
+      willRetry: Boolean(error.willRetry)
     })
   }
 
@@ -412,6 +436,17 @@ function buildTurnBackgroundTimeline({ exploreCalls, reasoningState, toolCalls, 
         kind: 'commentaryText',
         id: item.id,
         text: item.text
+      })
+      continue
+    }
+    if (item.kind === 'error') {
+      out.push({
+        kind: 'error',
+        id: item.id,
+        message: item.message,
+        details: item.details,
+        meta: item.meta,
+        willRetry: item.willRetry
       })
       continue
     }
@@ -808,7 +843,8 @@ function buildChatMessagesSlow(store) {
       toolByItemId: new Map(),
       diffEvents: [],
       reasoningChunks: [],
-      commentaryChunks: []
+      commentaryChunks: [],
+      errors: []
     }
     turnStateById.set(key, state)
     return state
@@ -871,6 +907,18 @@ function buildChatMessagesSlow(store) {
       const state = getOrCreateTurnState(turnId)
       const completedTs = Number(event.tsMs ?? NaN)
       if (state && Number.isFinite(completedTs) && completedTs > 0) state.completedTsMs = completedTs
+      const errorMessage = String(event.payload?.error ?? '').trim()
+      if (state && errorMessage) {
+        state.errors.push({
+          id: `${event.eventId}-turn-error`,
+          seq: event.seq ?? null,
+          tsMs: event.tsMs ?? null,
+          message: errorMessage,
+          details: '',
+          codexErrorInfo: null,
+          willRetry: false
+        })
+      }
       activeTurnId = null
       continue
     }
@@ -942,6 +990,39 @@ function buildChatMessagesSlow(store) {
       } else if ((stream === 'stderr' || stream === 'stdout') && !event.payload?.itemId) {
         msgs.push({ id: event.eventId, role: 'system', stream, text: String(text ?? '') })
       }
+      continue
+    }
+
+    if (event.type === 'session.error') {
+      const turnId = String(event.payload?.turnId ?? activeTurnId ?? '').trim()
+      const message = String(event.payload?.message ?? '').trim()
+      const details = String(event.payload?.details ?? '').trim()
+      const codexErrorInfo = event.payload?.codexErrorInfo ?? null
+      if (turnId) {
+        const state = ensureTurnBackgroundMessage(turnId)
+        if (state && (message || details || codexErrorInfo)) {
+          state.errors.push({
+            id: event.eventId,
+            seq: event.seq ?? null,
+            tsMs: event.tsMs ?? null,
+            message,
+            details,
+            codexErrorInfo,
+            willRetry: Boolean(event.payload?.willRetry)
+          })
+          continue
+        }
+      }
+      const parts = [message]
+      if (details) parts.push(details)
+      if (codexErrorInfo) {
+        try { parts.push(JSON.stringify(codexErrorInfo)) } catch {}
+      }
+      msgs.push({
+        id: event.eventId,
+        role: 'system',
+        text: parts.filter(Boolean).join('\n') || 'Unknown error'
+      })
       continue
     }
 
@@ -1075,6 +1156,7 @@ function buildChatMessagesSlow(store) {
       active: Boolean(state.exploreActiveItemIds.size)
     }
     const hasCommentary = Array.isArray(state.commentaryChunks) && state.commentaryChunks.length > 0
+    const hasErrors = Array.isArray(state.errors) && state.errors.length > 0
     const hasRunningTool = toolCalls.some((call) => String(call?.status ?? '').toLowerCase() === 'running')
     const active = Boolean(isCurrentTurn || explore.active || hasRunningTool)
     const expanded = active || Boolean(store?.backgroundExpandedByTurnId?.get?.(state.turnId))
@@ -1084,7 +1166,7 @@ function buildChatMessagesSlow(store) {
       Array.isArray(reasoningState?.sections) &&
       reasoningState.sections.length
     )
-    if (!isCurrentTurn && !hasReasoning && !hasCommentary && !explore.files && !explore.searches && !explore.lists && !explore.active && !toolCalls.length && !state.diffEvents.length) {
+    if (!isCurrentTurn && !hasReasoning && !hasCommentary && !hasErrors && !explore.files && !explore.searches && !explore.lists && !explore.active && !toolCalls.length && !state.diffEvents.length) {
       return false
     }
 
@@ -1108,7 +1190,8 @@ function buildChatMessagesSlow(store) {
           toolCalls,
           diffEvents: state.diffEvents,
           reasoningChunks: state.reasoningChunks,
-          commentaryChunks: state.commentaryChunks
+          commentaryChunks: state.commentaryChunks,
+          errors: state.errors
         })
       : null
     return true

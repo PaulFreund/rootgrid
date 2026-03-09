@@ -159,6 +159,17 @@ test('session envelope handler keeps registry maps in sync for snapshot/update/d
   assert.equal(sessionStores.get('s-1').turnHasReasoningLive.has('turn-live'), true)
 
   handleEnvelope({
+    type: 'session.queuedPrompts.updated',
+    scope: { sessionId: 's-1' },
+    payload: {
+      sessionId: 's-1',
+      queuedPrompts: [{ id: 'qp-1', promptId: 'qp-1', text: 'later', attachments: [] }]
+    }
+  })
+  assert.equal(sessionStores.get('s-1').queuedPrompts?.length ?? 0, 1)
+  assert.equal(sessionStores.get('s-1').queueSending, false)
+
+  handleEnvelope({
     type: 'registry.session.delete',
     payload: { sessionId: 's-1' }
   })

@@ -99,6 +99,31 @@ Examples:
   - stops/removes the user service
   - updates `autostart.enabled=false` and clears the method in config
 
+## Installing a remote runner without git/npm
+
+From the host web UI, open **Settings → Machines** and generate the install command. It looks like:
+
+```bash
+curl -fsSL 'https://YOUR-HOST/api/install/runner.sh?installToken=...' | bash
+```
+
+The target machine only needs:
+- `curl`
+- `node`
+- `tar`
+
+The host serves:
+- a short-lived bootstrap shell script
+- a prebuilt runner bundle
+
+The script then:
+1. downloads the bundle from the host
+2. writes a runner-only `~/.rootgrid/config.json`
+3. installs the user service (`systemd --user` on Linux/WSL, `launchd` on macOS)
+4. starts the runner
+
+If the generated install URL points at `localhost`/`127.0.0.1`, set `host.publicUrl` so the target machine gets a reachable host address.
+
 ---
 
 ## Proposed config shape (v0)

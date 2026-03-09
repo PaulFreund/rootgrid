@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 8
+export const SCHEMA_VERSION = 9
 
 export const CREATE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS machines (
@@ -105,4 +105,17 @@ CREATE TABLE IF NOT EXISTS uploads (
 );
 
 CREATE INDEX IF NOT EXISTS uploads_by_session ON uploads(session_id, created_ms);
+
+-- Persisted queued follow-up prompts (survive UI reload/reconnect).
+CREATE TABLE IF NOT EXISTS queued_prompts (
+  prompt_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  attachments_json TEXT NOT NULL,
+  created_ms INTEGER NOT NULL,
+  updated_ms INTEGER NOT NULL,
+  FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS queued_prompts_by_session ON queued_prompts(session_id, created_ms);
 `

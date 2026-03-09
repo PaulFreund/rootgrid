@@ -59,6 +59,19 @@ Setup also installs a managed runtime under:
 
 That managed runtime is used for **runner-only installs** and remote runner upgrades. Host-mode installs run directly from the current package checkout/install so a normal `git pull` + restart picks up the new UI/code.
 
+To add a new remote runner without `git` or `npm`, open **Settings → Machines** on the host and use the generated one-liner:
+
+```bash
+curl -fsSL 'https://YOUR-HOST/api/install/runner.sh?installToken=...' | bash
+```
+
+The target machine only needs:
+- `curl`
+- `node`
+- `tar`
+
+The install token is short-lived; the script downloads a prebuilt runner bundle from the host, writes `~/.rootgrid/config.json`, installs the user service, and starts the runner.
+
 ---
 
 ## MVP runbook (v0)

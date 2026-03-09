@@ -6,17 +6,21 @@ import {
   deleteApproval,
   deleteIdeSession,
   deletePushSubscription,
+  deleteQueuedPrompt,
   deleteUpload,
   getApproval,
   getIdeSession,
+  getQueuedPrompt,
   getUpload,
   listApprovals,
   listIdeSessions,
   listPushSubscriptions,
+  listQueuedPrompts,
   listSessionUploads,
   upsertApproval,
   upsertIdeSession,
   upsertPushSubscription,
+  upsertQueuedPrompt,
   upsertUpload
 } from '../src/db/storeSideTables.js'
 
@@ -130,4 +134,37 @@ test('storeSideTables upload and push helpers persist and delete rows', () => {
   assert.equal(deletePushSubscription(store.db, 'https://push.example.test/sub-1'), true)
   assert.equal(listSessionUploads(store.db, 's-1').length, 0)
   assert.equal(listPushSubscriptions(store.db).length, 0)
+})
+
+test('storeSideTables queued prompt helpers persist and delete rows', () => {
+  const store = buildStore()
+
+  upsertQueuedPrompt(store.db, {
+    promptId: 'qp-1',
+    sessionId: 's-1',
+    text: 'follow up next',
+    attachmentIds: ['u-1', 'u-2'],
+    createdMs: 55,
+    now: 56
+  })
+
+  assert.deepEqual(getQueuedPrompt(store.db, { sessionId: 's-1', promptId: 'qp-1' }), {
+    promptId: 'qp-1',
+    sessionId: 's-1',
+    text: 'follow up next',
+    attachmentIds: ['u-1', 'u-2'],
+    createdMs: 55,
+    updatedMs: 56
+  })
+  assert.deepEqual(listQueuedPrompts(store.db, 's-1'), [{
+    promptId: 'qp-1',
+    sessionId: 's-1',
+    text: 'follow up next',
+    attachmentIds: ['u-1', 'u-2'],
+    createdMs: 55,
+    updatedMs: 56
+  }])
+
+  assert.equal(deleteQueuedPrompt(store.db, { sessionId: 's-1', promptId: 'qp-1' }), true)
+  assert.deepEqual(listQueuedPrompts(store.db, 's-1'), [])
 })

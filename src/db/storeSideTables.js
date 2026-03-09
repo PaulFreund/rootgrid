@@ -2,6 +2,7 @@ import {
   approvalRowToRecord,
   ideSessionRowToRecord,
   pushSubscriptionRowToRecord,
+  queuedPromptRowToRecord,
   uploadRowToRecord
 } from './storeRows.js'
 
@@ -155,4 +156,51 @@ export function listPushSubscriptions(db) {
     LIMIT 2000
   `).all()
   return rows.map(pushSubscriptionRowToRecord)
+}
+
+export function upsertQueuedPrompt(db, {
+  promptId,
+  sessionId,
+  text = '',
+  attachmentIds = [],
+  createdMs = Date.now(),
+  now = Date.now()
+}) {
+  const attachmentsJson = JSON.stringify(Array.isArray(attachmentIds) ? attachmentIds : [])
+  db.prepare(`
+    INSERT INTO queued_prompts(prompt_id, session_id, text, attachments_json, created_ms, updated_ms)
+    VALUES(?, ?, ?, ?, ?, ?)
+    ON CONFLICT(prompt_id) DO UPDATE SET
+      text=excluded.text,
+      attachments_json=excluded.attachments_json,
+      updated_ms=excluded.updated_ms
+  `).run(promptId, sessionId, String(text ?? ''), attachmentsJson, createdMs, now)
+}
+
+export function getQueuedPrompt(db, { sessionId, promptId }) {
+  const row = db.prepare(`
+    SELECT prompt_id, session_id, text, attachments_json, created_ms, updated_ms
+    FROM queued_prompts
+    WHERE prompt_id=? AND session_id=?
+  `).get(promptId, sessionId)
+  return queuedPromptRowToRecord(row)
+}
+
+export function listQueuedPrompts(db, sessionId) {
+  const rows = db.prepare(`
+    SELECT prompt_id, session_id, text, attachments_json, created_ms, updated_ms
+    FROM queued_prompts
+    WHERE session_id=?
+    ORDER BY created_ms ASC
+    LIMIT 200
+  `).all(sessionId)
+  return rows.map(queuedPromptRowToRecord)
+}
+
+export function deleteQueuedPrompt(db, { sessionId, promptId }) {
+  const res = db.prepare(`
+    DELETE FROM queued_prompts
+    WHERE prompt_id=? AND session_id=?
+  `).run(promptId, sessionId)
+  return res.changes > 0
 }

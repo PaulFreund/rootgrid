@@ -134,20 +134,22 @@ export function updateTokenUsageMap(map, sessionId, payload) {
 
 export function buildContextUsageSummary(usage) {
   if (!usage || typeof usage !== 'object') return null
-  const usedRaw = Number(usage?.totalTotalTokens ?? usage?.lastTotalTokens ?? NaN)
+  const totalRaw = Number(usage?.totalTotalTokens ?? NaN)
   const lastRaw = Number(usage?.lastTotalTokens ?? NaN)
   const windowRaw = Number(usage?.modelContextWindow ?? NaN)
-  const usedTokens = Number.isFinite(usedRaw) && usedRaw >= 0 ? usedRaw : null
+  const totalTokens = Number.isFinite(totalRaw) && totalRaw >= 0 ? totalRaw : null
   const lastTokens = Number.isFinite(lastRaw) && lastRaw >= 0 ? lastRaw : null
   const modelContextWindow = Number.isFinite(windowRaw) && windowRaw > 0 ? windowRaw : null
-  if (usedTokens === null && lastTokens === null) return null
-  const primaryTokens = usedTokens ?? lastTokens
+  if (totalTokens === null && lastTokens === null) return null
+  const primaryTokens = lastTokens ?? totalTokens
   const percent = (primaryTokens !== null && modelContextWindow)
     ? Math.max(0, Math.min(100, (primaryTokens / modelContextWindow) * 100))
     : null
   return {
     usedTokens: primaryTokens,
     usedLabel: formatCompactInt(primaryTokens),
+    totalTokens,
+    totalLabel: totalTokens !== null ? formatCompactInt(totalTokens) : null,
     lastTokens,
     lastLabel: lastTokens !== null ? formatCompactInt(lastTokens) : null,
     modelContextWindow,

@@ -290,6 +290,8 @@ export function resetSessionStoreState(store) {
   store.seen.clear()
   store.historyLoaded = false
   store.lastLoadedSeq = 0
+  try { store.queuedPrompts?.splice?.(0, store.queuedPrompts.length) } catch {}
+  store.queueSending = false
   store.diff = ''
   store.plan = null
   store.planExplanation = null
@@ -523,6 +525,7 @@ export async function loadSessionHistory({
     resetSessionStoreState(store)
 
     if (Array.isArray(data?.events)) {
+      store.queuedPrompts = Array.isArray(data?.queuedPrompts) ? data.queuedPrompts : []
       applySessionEventsPage({
         events: data.events,
         reasoningTurnIds: data?.reasoningTurnIds,
@@ -537,6 +540,7 @@ export async function loadSessionHistory({
       if (!pageRes.ok) return
       const page = await pageRes.json().catch(() => null)
       if (nonce !== loadSessionNonce.value) return
+      store.queuedPrompts = Array.isArray(data?.queuedPrompts) ? data.queuedPrompts : []
       applySessionEventsPage({
         events: page?.events,
         reasoningTurnIds: page?.reasoningTurnIds,

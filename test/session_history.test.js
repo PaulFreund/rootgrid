@@ -66,6 +66,8 @@ test('resetSessionStoreState clears derived session store state', () => {
   const store = {
     events: [{ eventId: 'e-1' }],
     seen: new Set(['e-1']),
+    queuedPrompts: [{ id: 'qp-1' }],
+    queueSending: true,
     diff: 'changed',
     plan: [{ step: 'x' }],
     planExplanation: 'because',
@@ -90,6 +92,8 @@ test('resetSessionStoreState clears derived session store state', () => {
 
   assert.deepEqual(store.events, [])
   assert.equal(store.seen.size, 0)
+  assert.deepEqual(store.queuedPrompts, [])
+  assert.equal(store.queueSending, false)
   assert.equal(store.diff, '')
   assert.equal(store.plan, null)
   assert.equal(store.planExplanation, null)
@@ -140,6 +144,7 @@ test('loadSessionHistory uses bootstrap payload for the initial render in one re
         async json() {
           return {
             session: { sessionId: 's-1', title: 'Bootstrap', lastSeq: 3 },
+            queuedPrompts: [{ id: 'qp-1', promptId: 'qp-1', text: 'later', attachments: [] }],
             events: [
               { eventId: 'e-1', seq: 1, type: 'session.input', payload: { text: 'hello' } },
               { eventId: 'e-2', seq: 2, type: 'turn.started', payload: { turnId: 'turn-1' } },
@@ -170,6 +175,7 @@ test('loadSessionHistory uses bootstrap payload for the initial render in one re
   assert.deepEqual(upserts, [{ sessionId: 's-1', title: 'Bootstrap', lastSeq: 3 }])
   const store = getSessionStore('s-1')
   assert.deepEqual(store.events.map((event) => event.eventId), ['e-1', 'e-2', 'e-3'])
+  assert.equal(store.queuedPrompts.length, 1)
   assert.equal(store.currentTurnId, 'turn-1')
   assert.equal(store.turnHasReasoningHistory.has('turn-1'), true)
   assert.equal(store.hasMoreBefore, false)

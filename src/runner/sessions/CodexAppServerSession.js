@@ -551,9 +551,24 @@ export class CodexAppServerSession {
     }
 
     if (method === 'error') {
-      const text = buildCodexErrorOutputText(params)
-      if (!text) return
-      this.#bufferOutput({ stream: 'stderr', text })
+      const willRetry = Boolean(params?.willRetry ?? params?.will_retry)
+      const message = safeString(params?.error?.message ?? params?.message) ?? 'Unknown error'
+      const details = safeString(params?.error?.additionalDetails ?? params?.details)
+      const codexErrorInfo = params?.error?.codexErrorInfo ?? params?.codexErrorInfo ?? null
+      const turnId = safeString(params?.turnId ?? params?.turn?.id) ?? this.activeTurnId
+      this.emit('session.error', {
+        sessionId: this.sessionId,
+        ...(turnId ? { turnId } : {}),
+        message,
+        willRetry,
+        ...(details ? { details } : {}),
+        ...(codexErrorInfo ? { codexErrorInfo } : {})
+      })
+
+      if (!willRetry) {
+        const text = buildCodexErrorOutputText(params)
+        if (text) this.#bufferOutput({ stream: 'stderr', text })
+      }
       return
     }
 

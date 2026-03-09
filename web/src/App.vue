@@ -1,15 +1,15 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Archive, ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FileText, FolderClosed, GitBranch, Loader2, MoreHorizontal, Plus, Search, Settings, SlidersHorizontal, Square, Terminal, Trash2, X } from 'lucide-vue-next'
+import { Archive, ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FileText, FolderClosed, GitBranch, Loader2, MoreHorizontal, Pencil, Plus, Settings, SlidersHorizontal, Square, Terminal, Trash2, X } from 'lucide-vue-next'
 
 import MarkdownView from './components/MarkdownView.vue'
+import ComposerPillSelect from './components/ComposerPillSelect.vue'
 import WorkspaceFilesPane from './components/WorkspaceFilesPane.vue'
 import WorkspaceTerminalPane from './components/WorkspaceTerminalPane.vue'
 import {
   buildContextUsageSummary,
   buildRecentWorkspaces,
   formatAgeShort as formatAgeShortValue,
-  formatAgo as formatAgoValue,
   formatCompactInt,
   finalizeCompletedPlan,
   indicatorDotClass,
@@ -280,6 +280,11 @@ const deleteMachineRow = computed(() => {
 const appSettingsLoaded = ref(false)
 const appSettingsError = ref('')
 const appSettingsSaving = ref(false)
+const runnerInstallCommand = ref('')
+const runnerInstallUrl = ref('')
+const runnerInstallExpiresAtMs = ref(null)
+const runnerInstallLoading = ref(false)
+const runnerInstallError = ref('')
 const retentionDraft = ref('')
 const sseToastsDraft = ref('if-not-visible') // always|never|if-not-visible
 const webPushDraft = ref('if-not-visible') // always|never|if-not-visible
@@ -615,11 +620,13 @@ const {
   requestNotificationPermission,
   refreshPushSubscription,
   enablePush,
+  autoEnablePushOnLoad,
   disablePush,
   openSettings
 } = createSystemSettingsActions({
   apiFetch,
   authed,
+  appSettings,
   appSettingsLoaded,
   loadAppSettings,
   settingsTab,
@@ -644,10 +651,6 @@ function showBrowserToast(toast) {
       openSession(sessionId)
     }
   })
-}
-
-function formatAgo(ts) {
-  return formatAgoValue(nowMs.value, ts)
 }
 
 function formatAgeShort(ts) {
@@ -1066,6 +1069,13 @@ const selectedSession = computed(() => {
 })
 const selectedStore = computed(() => selectedSessionId.value ? sessionStores.get(selectedSessionId.value) : null)
 const selectedTokenUsage = computed(() => selectedSessionId.value ? (tokenUsageBySessionId.get(selectedSessionId.value) ?? null) : null)
+const selectedQueuedPrompts = computed(() => {
+  const list = selectedStore.value?.queuedPrompts
+  return Array.isArray(list) ? list : []
+})
+const selectedQueueSending = computed(() => Boolean(selectedStore.value?.queueSending))
+const queuedPromptEditingId = ref(null)
+const queuedPromptEditDraft = ref('')
 const workspaceRootEntries = computed(() => {
   const rootPath = String(workspaceFilesPath.value ?? '').trim()
   if (!rootPath) return []
@@ -1121,7 +1131,10 @@ const {
 })
 
 schedulePostVisibility = schedulePostVisibilityImpl
-onLoginConnect = () => connectSse()
+onLoginConnect = () => {
+  connectSse()
+  autoEnablePushOnLoad().catch(() => {})
+}
 
 watch(selectedSessionId, async (sid) => {
   closeSessionMenu()
@@ -1156,6 +1169,34 @@ watch(selectedSessionId, async (sid) => {
 watch(settingsTab, (t) => {
   if (!defaultsOpen.value) return
   if (t === 'system') refreshPushSubscription().catch(() => {})
+  if (t === 'machines' && (!runnerInstallCommand.value || Number(runnerInstallExpiresAtMs.value ?? 0) <= nowMs.value)) {
+    loadRunnerInstallBootstrap().catch(() => {})
+  }
+})
+
+watch(
+  () => [String(selectedSessionId.value ?? ''), selectedQueuedPrompts.value.map((queued) => String(queued?.promptId ?? queued?.id ?? '')).join(',')],
+  ([sid, promptIds]) => {
+    const editId = String(queuedPromptEditingId.value ?? '').trim()
+    if (!sid || !editId) {
+      queuedPromptEditingId.value = null
+      queuedPromptEditDraft.value = ''
+      return
+    }
+    const list = String(promptIds ?? '').split(',').filter(Boolean)
+    if (!list.includes(editId)) {
+      queuedPromptEditingId.value = null
+      queuedPromptEditDraft.value = ''
+    }
+  }
+)
+
+watch(defaultsOpen, (open) => {
+  if (!open) return
+  if (settingsTab.value === 'system') refreshPushSubscription().catch(() => {})
+  if (settingsTab.value === 'machines' && (!runnerInstallCommand.value || Number(runnerInstallExpiresAtMs.value ?? 0) <= nowMs.value)) {
+    loadRunnerInstallBootstrap().catch(() => {})
+  }
 })
 
 watch(selectedSessionId, (sid, prevSid) => {
@@ -1205,13 +1246,12 @@ const sessionSidebarStyle = computed(() => {
   if (isMobileLayout.value) return null
   return { width: `${sessionSidebarWidth.value}px` }
 })
-const sidebarProjectLabel = computed(() => {
-  if (selectedSession.value) return sessionProject(selectedSession.value)
-  const cwd = String(defaults.cwd ?? '').trim()
-  return cwd ? sessionProject({ cwd }) : ''
-})
 const composerMachineLabel = computed(() => {
-  if (selectedSession.value) return sessionHostName(selectedSession.value) || 'Local'
+  if (selectedSession.value) {
+    const host = sessionHostName(selectedSession.value) || 'Local'
+    const project = sessionProject(selectedSession.value)
+    return project ? `${host} / ${project}` : host
+  }
   const machine = defaultsSelectedMachine.value
   return String(machine?.machineName ?? '').trim() || 'Local'
 })
@@ -1252,10 +1292,26 @@ const composerMachineUpgradePopoverVisible = computed(() => (
 ))
 const composerMachineUpgradeStatus = computed(() => machineUpgradeStatusText(composerMachine.value))
 const composerMachineUpgradeErrorText = computed(() => String(machineUpgradeError.value ?? '').trim())
-const composerProjectLabel = computed(() => {
-  if (selectedSession.value) return sessionProject(selectedSession.value)
-  const cwd = String(defaults.cwd ?? '').trim()
-  return cwd ? sessionProject({ cwd }) : 'No workspace'
+const runnerInstallExpiryLabel = computed(() => {
+  const expiresAtMs = Number(runnerInstallExpiresAtMs.value ?? 0)
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= 0) return ''
+  const deltaMs = expiresAtMs - nowMs.value
+  if (deltaMs <= 0) return 'expired'
+  const minutes = Math.max(1, Math.round(deltaMs / 60_000))
+  if (minutes < 60) return `expires in ~${minutes}m`
+  const hours = Math.max(1, Math.round(minutes / 60))
+  return `expires in ~${hours}h`
+})
+const runnerInstallNeedsReachableUrl = computed(() => {
+  const raw = String(runnerInstallUrl.value ?? '').trim()
+  if (!raw) return false
+  try {
+    const parsed = new URL(raw)
+    const host = String(parsed.hostname ?? '').trim().toLowerCase()
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1'
+  } catch {
+    return false
+  }
 })
 const showWorkspacePane = computed(() => {
   if (isMobileLayout.value) return false
@@ -1265,13 +1321,14 @@ const composerContextUsage = computed(() => buildContextUsageSummary(selectedTok
 const composerContextPopoverVisible = computed(() => (
   Boolean(composerContextUsage.value) && (composerContextPopoverOpen.value || composerContextPopoverHover.value)
 ))
-const composerContextRingStyle = computed(() => {
+const composerContextRingStrokeStyle = computed(() => {
   const percent = Number(composerContextUsage.value?.percent ?? 0)
   const clamped = Math.max(0, Math.min(100, percent))
-  const active = '#94a3b8'
-  const inactive = 'rgba(15, 23, 42, 0.1)'
+  const radius = 7.5
+  const circumference = 2 * Math.PI * radius
   return {
-    background: `conic-gradient(${active} 0deg ${clamped * 3.6}deg, ${inactive} ${clamped * 3.6}deg 360deg)`
+    strokeDasharray: `${circumference}`,
+    strokeDashoffset: `${circumference * (1 - (clamped / 100))}`
   }
 })
 const workspacePaneTitle = computed(() => {
@@ -1362,8 +1419,146 @@ const {
   upsertSessionRow
 })
 
+const composerModelSelectOptions = computed(() => ([
+  { value: '', label: defaultCodexModelLabel.value || 'Default' },
+  ...composerModelOptions.value
+]))
+
+const composerReasoningSelectOptions = computed(() => ([
+  {
+    value: '',
+    label: selectedCodexDefaultReasoningEffortLabel.value
+      ? `Auto (${selectedCodexDefaultReasoningEffortLabel.value})`
+      : 'Auto',
+    description: 'Use the model default.'
+  },
+  ...composerReasoningEffortOptions.value
+]))
+
+const composerApprovalSelectOptions = Object.freeze([
+  { value: 'untrusted', label: 'Untrusted', description: 'Ask unless the action is trusted.' },
+  { value: 'on-request', label: 'On request', description: 'Ask before actions that need approval.' },
+  { value: 'never', label: 'Never', description: 'Never ask for approval.' },
+  { value: 'on-failure', label: 'On failure', description: 'Ask only after blocked or failing actions.' }
+])
+
+const composerSandboxSelectOptions = Object.freeze([
+  { value: 'read-only', label: 'Read only', description: 'No filesystem writes.' },
+  { value: 'workspace-write', label: 'Workspace write', description: 'Allow writes in the workspace.' },
+  { value: 'danger-full-access', label: 'Full access', description: 'Allow unrestricted local access.' }
+])
+
 async function copyText(text) {
   await copyTextToClipboard(text)
+}
+
+async function loadRunnerInstallBootstrap({ force = false } = {}) {
+  if (runnerInstallLoading.value) return false
+  if (!force) {
+    const expiresAtMs = Number(runnerInstallExpiresAtMs.value ?? 0)
+    if (runnerInstallCommand.value && Number.isFinite(expiresAtMs) && expiresAtMs > nowMs.value) {
+      return true
+    }
+  }
+
+  runnerInstallLoading.value = true
+  runnerInstallError.value = ''
+  try {
+    const res = await apiFetch('/api/install/runner-bootstrap', {
+      method: 'POST',
+      body: '{}'
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => null)
+      runnerInstallError.value = err?.error ?? `HTTP ${res.status}`
+      return false
+    }
+
+    const data = await res.json().catch(() => null)
+    runnerInstallCommand.value = String(data?.installCommand ?? '').trim()
+    runnerInstallUrl.value = String(data?.installUrl ?? '').trim()
+    runnerInstallExpiresAtMs.value = Number(data?.expiresAtMs ?? 0) || null
+    if (!runnerInstallCommand.value || !runnerInstallUrl.value) {
+      runnerInstallError.value = 'Install bootstrap did not return a command.'
+      return false
+    }
+    return true
+  } catch (err) {
+    runnerInstallError.value = String(err?.message ?? err)
+    return false
+  } finally {
+    runnerInstallLoading.value = false
+  }
+}
+
+async function copyRunnerInstallCommand() {
+  if (!runnerInstallCommand.value) {
+    const ok = await loadRunnerInstallBootstrap().catch(() => false)
+    if (!ok || !runnerInstallCommand.value) return false
+  }
+  await copyText(runnerInstallCommand.value)
+  return true
+}
+
+async function copyRunnerInstallUrl() {
+  if (!runnerInstallUrl.value) {
+    const ok = await loadRunnerInstallBootstrap().catch(() => false)
+    if (!ok || !runnerInstallUrl.value) return false
+  }
+  await copyText(runnerInstallUrl.value)
+  return true
+}
+
+async function steerQueuedPrompt(promptId) {
+  const sessionId = String(selectedSessionId.value ?? '').trim()
+  if (!sessionId || !promptId) return false
+  return await sendQueuedPromptNow(sessionId, promptId)
+}
+
+function queuedPromptId(queued) {
+  return String(queued?.promptId ?? queued?.id ?? '').trim()
+}
+
+function queuedPromptAttachmentSummary(queued) {
+  const attachments = Array.isArray(queued?.attachments) ? queued.attachments : []
+  if (!attachments.length) return ''
+  const filenames = attachments
+    .map((attachment) => String(attachment?.filename ?? '').trim())
+    .filter(Boolean)
+  const label = filenames.slice(0, 2).join(', ')
+  if (attachments.length <= 2) return label
+  return label ? `${label}, +${attachments.length - 2} more` : `${attachments.length} attachments`
+}
+
+function beginQueuedPromptEdit(queued) {
+  const promptId = queuedPromptId(queued)
+  if (!promptId) return
+  queuedPromptEditingId.value = promptId
+  queuedPromptEditDraft.value = String(queued?.text ?? '')
+}
+
+function cancelQueuedPromptEdit() {
+  queuedPromptEditingId.value = null
+  queuedPromptEditDraft.value = ''
+}
+
+function isQueuedPromptEditing(queued) {
+  return queuedPromptId(queued) === String(queuedPromptEditingId.value ?? '').trim()
+}
+
+async function saveQueuedPromptText(queued) {
+  const sessionId = String(selectedSessionId.value ?? '').trim()
+  const promptId = queuedPromptId(queued)
+  if (!sessionId || !promptId) return false
+  const ok = await updateQueuedPromptText(sessionId, promptId, queuedPromptEditDraft.value)
+  if (ok) cancelQueuedPromptEdit()
+  return ok
+}
+
+async function deleteQueuedPrompt(promptId) {
+  const sessionId = String(selectedSessionId.value ?? '').trim()
+  if (!sessionId || !promptId) return false
+  return await removeQueuedPrompt(sessionId, promptId)
 }
 
 function diffStepSelectedPath(stepId, files) {
@@ -1410,6 +1605,9 @@ const {
   onComposerDrop,
   removeAttachment,
   createSessionFromDraft,
+  sendQueuedPromptNow,
+  updateQueuedPromptText,
+  removeQueuedPrompt,
   submit,
   stopSession,
   stopGenerating
@@ -1424,6 +1622,7 @@ const {
   sendError,
   messageDraft,
   sending,
+  getSessionStore,
   selectedSession,
   selectedSessionId
 })
@@ -2174,6 +2373,7 @@ onMounted(async () => {
   await checkAuth()
   if (authed.value) {
     connectSse()
+    autoEnablePushOnLoad().catch(() => {})
     if (deepLinkSessionId.value) {
       openSession(deepLinkSessionId.value)
       deepLinkSessionId.value = null
@@ -2330,21 +2530,7 @@ watch(
           :style="sessionSidebarStyle"
         >
           <div class="shrink-0 px-3 pb-2 pt-3">
-            <div class="flex items-center justify-between gap-3">
-              <button
-                class="inline-flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                title="Rootgrid"
-              >
-                <Square class="h-3.5 w-3.5" />
-              </button>
-              <span
-                class="h-2 w-2 rounded-full"
-                :class="sseStatus === 'connected' ? 'bg-emerald-500' : (sseStatus === 'error' ? 'bg-red-500' : 'bg-amber-500')"
-                :title="`SSE: ${sseStatus}`"
-              />
-            </div>
-
-            <div class="mt-4 space-y-0.5">
+            <div class="space-y-0.5">
               <button
                 class="w-full inline-flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-slate-700 transition-colors hover:bg-black/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
                 @click="openNewThreadDialog"
@@ -2356,19 +2542,9 @@ watch(
           </div>
 
           <div class="shrink-0 px-2 pb-2 pt-3">
-            <div v-if="sidebarProjectLabel" class="mb-3 flex items-center gap-2 px-2 text-[12px] font-medium text-slate-600">
-              <FolderClosed class="h-3.5 w-3.5 text-slate-400" />
-              <span class="truncate">{{ sidebarProjectLabel }}</span>
-            </div>
             <div class="flex items-center justify-between gap-2 px-2">
-              <div class="text-[11px] text-slate-400">Threads</div>
+              <div class="flex h-7 items-center text-[11px] text-slate-400">Threads</div>
               <div class="flex items-center gap-1">
-                <button
-                  class="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                  title="Search threads"
-                >
-                  <Search class="h-3.5 w-3.5" />
-                </button>
                 <button
                   class="inline-flex h-7 items-center justify-center gap-1 rounded-md px-2 text-[11px] text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
                   :class="sessionListGroupingMode === 'project' ? 'bg-black/[0.05] text-slate-700' : ''"
@@ -2413,9 +2589,14 @@ watch(
                 <template v-for="entry in visibleSessionWindow.items" :key="entry.key">
                   <div
                     v-if="entry.kind === 'group'"
-                    class="px-2.5 pb-1 pt-3 text-[10px] font-medium uppercase tracking-[0.16em] text-slate-500"
+                    class="px-2.5 pb-1 pt-3"
                   >
-                    <div class="truncate" :title="entry.label">{{ entry.label }}</div>
+                    <div
+                      class="inline-flex min-w-0 max-w-full items-center rounded-full border border-black/[0.08] px-2 py-0.5 text-[10px] font-medium text-slate-500"
+                      :title="`${entry.host} / ${entry.project}`"
+                    >
+                      <span class="truncate">{{ entry.host }} / {{ entry.project }}</span>
+                    </div>
                   </div>
 
                   <button
@@ -2427,7 +2608,7 @@ watch(
                   >
                     <div class="flex items-start gap-2.5">
                       <span
-                        class="mt-1.5 h-2 w-2 shrink-0 rounded-full"
+                        class="mt-[0.38rem] h-2 w-2 shrink-0 rounded-full"
                         :class="indicatorDotClass(sessionIndicator(entry.session))"
                       />
 
@@ -2435,8 +2616,13 @@ watch(
                         <div class="flex items-center justify-between gap-2">
                           <div class="truncate text-[13px] font-medium text-slate-700">{{ sessionListTitle(entry.session) }}</div>
                           <div class="flex shrink-0 items-center gap-1">
-                            <div class="text-[11px] text-slate-400">{{ formatAgeShort(entry.session.updatedMs) }}</div>
-                            <div class="relative" data-session-menu-root="true">
+                            <div
+                              v-if="sessionListGroupingMode === 'project'"
+                              class="text-[11px] text-slate-400"
+                            >
+                              {{ formatAgeShort(entry.session.updatedMs) }}
+                            </div>
+                            <div class="relative shrink-0" data-session-menu-root="true">
                               <button
                                 class="inline-flex h-6 w-6 items-center justify-center rounded-md text-slate-300 transition-colors hover:bg-black/[0.05] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
                                 :class="sessionMenuId === entry.session.sessionId ? 'bg-black/[0.05] text-slate-600 opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'"
@@ -2479,21 +2665,17 @@ watch(
                           </div>
                         </div>
 
-                        <div class="mt-0.5 flex min-w-0 items-center gap-1.5 text-[11px] text-slate-400">
-                          <template v-if="sessionListGroupingMode === 'project'">
-                            <span class="truncate">{{ entry.session.preview || 'No preview yet' }}</span>
-                          </template>
-                          <template v-else>
-                            <button
-                              class="shrink-0 max-w-[120px] truncate rounded-md px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.16em] text-slate-500 transition-colors hover:bg-black/[0.05]"
-                              :title="entry.session.cwd"
-                              @click.stop="openRenameSession(entry.session, { focus: 'project' })"
-                            >
-                              {{ sessionProject(entry.session) }}
-                            </button>
-                            <span class="shrink-0 text-slate-300">·</span>
-                            <span class="truncate">{{ entry.session.preview || sessionHostName(entry.session) }}</span>
-                          </template>
+                        <div
+                          v-if="sessionListGroupingMode !== 'project'"
+                          class="mt-1 flex min-w-0 items-center justify-between gap-2 text-[11px] text-slate-400"
+                        >
+                          <span
+                            class="inline-flex min-w-0 max-w-[170px] shrink-0 items-center rounded-full border border-black/[0.08] px-2 py-0.5 text-[10px] font-medium text-slate-500"
+                            :title="`${sessionHostName(entry.session)} / ${sessionProject(entry.session)}`"
+                          >
+                            <span class="truncate">{{ sessionHostName(entry.session) }} / {{ sessionProject(entry.session) }}</span>
+                          </span>
+                          <span class="shrink-0 text-right">{{ formatAgeShort(entry.session.updatedMs) }}</span>
                         </div>
                       </div>
                     </div>
@@ -2566,13 +2748,6 @@ watch(
                       @click="openRenameSession(selectedSession, { focus: 'title' })"
                     >
                       {{ sessionListTitle(selectedSession) }}
-                    </button>
-                    <button
-                      class="shrink-0 rounded-full bg-black/[0.04] px-2 py-0.5 text-[10px] text-slate-500 transition-colors hover:bg-black/[0.06] hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                      title="Rename project label"
-                      @click="openRenameSession(selectedSession, { focus: 'project' })"
-                    >
-                      {{ sessionProject(selectedSession) }}
                     </button>
                   </div>
                   <div v-else class="truncate text-[13px] font-semibold text-slate-800">New thread</div>
@@ -2871,6 +3046,22 @@ watch(
                                 </span>
                               </div>
                             </div>
+                            <div
+                              v-else-if="it.kind === 'error'"
+                              class="rounded-xl bg-rose-50 px-3 py-2 text-sm"
+                              :title="it.message"
+                            >
+                              <div class="min-w-0">
+                                <span class="text-rose-800">{{ it.message || 'Error' }}</span>
+                                <span v-if="it.willRetry" class="ml-1 text-rose-500">retrying…</span>
+                              </div>
+                              <div v-if="it.details" class="mt-1 whitespace-pre-wrap break-words text-xs text-rose-600">
+                                {{ it.details }}
+                              </div>
+                              <div v-if="it.meta" class="mt-1 whitespace-pre-wrap break-words text-[11px] text-rose-500">
+                                {{ it.meta }}
+                              </div>
+                            </div>
                           </template>
 
                           <div v-if="m.reasoning?.truncated" class="text-xs text-slate-500">(reasoning truncated)</div>
@@ -2892,7 +3083,7 @@ watch(
                             <span
                               v-for="(ch, idx) in activeThinkingLabelChars"
                               :key="`thinking-char-${idx}`"
-                              :style="{ '--rg-letter-index': idx }"
+                              :style="{ animationDelay: `${(activeThinkingLabelChars.length - 1 - idx) * -90}ms` }"
                             >{{ ch }}</span>
                           </span>
                           <span v-else>{{ m.title || 'Thinking' }}</span>
@@ -3181,7 +3372,99 @@ watch(
               <div v-if="composerOptionsError" class="mb-2 text-sm text-red-600">{{ composerOptionsError }}</div>
               <div v-if="modelCatalogError" class="mb-2 text-sm text-red-600">{{ modelCatalogError }}</div>
 
-              <div class="rounded-[24px] border border-black/[0.06] bg-white px-3 py-3 shadow-[0_1px_2px_rgba(0,0,0,0.05)] transition-colors focus-within:border-black/[0.12] focus-within:ring-2 focus-within:ring-slate-400/20">
+              <div class="overflow-hidden rounded-[24px] border border-black/[0.06] bg-white shadow-[0_1px_2px_rgba(0,0,0,0.05)] transition-colors focus-within:border-black/[0.12] focus-within:ring-2 focus-within:ring-slate-400/20">
+                <div
+                  v-if="selectedSessionId && selectedQueuedPrompts.length"
+                  class="border-b border-black/[0.06] bg-[#f5f5f2]"
+                >
+                  <div class="flex items-center justify-between gap-3 px-4 py-2 text-left text-xs text-slate-700">
+                    <div class="font-medium uppercase tracking-wider text-slate-500">Next up</div>
+                    <div class="text-[11px] text-slate-400">
+                      {{ selectedQueuedPrompts.length }} queued
+                    </div>
+                  </div>
+
+                  <div class="border-t border-black/[0.05] bg-[#fbfbfa] px-4 py-3">
+                    <div class="space-y-2.5">
+                      <div
+                        v-for="(queued, idx) in selectedQueuedPrompts"
+                        :key="queued.promptId ?? queued.id"
+                        class="flex items-center gap-2 text-sm"
+                      >
+                        <span class="shrink-0 text-xs tabular-nums text-slate-500">{{ idx + 1 }}.</span>
+                        <div class="min-w-0 flex-1">
+                          <div class="flex items-center justify-between gap-3">
+                            <div class="min-w-0 flex-1">
+                              <textarea
+                                v-if="isQueuedPromptEditing(queued)"
+                                v-model="queuedPromptEditDraft"
+                                rows="2"
+                                class="w-full resize-none rounded-xl border border-black/[0.06] bg-white px-3 py-2 text-[13px] leading-6 text-slate-800 outline-none placeholder:text-slate-400 focus:border-black/[0.12]"
+                                placeholder="Queued follow-up…"
+                                @keydown.enter.exact.prevent="saveQueuedPromptText(queued)"
+                                @keydown.esc.prevent="cancelQueuedPromptEdit()"
+                              />
+                              <div v-else class="min-w-0">
+                                <div class="whitespace-pre-wrap text-[13px] leading-6 text-slate-900">
+                                  {{ queued.text || '(attachments only)' }}
+                                </div>
+                                <div
+                                  v-if="Array.isArray(queued.attachments) && queued.attachments.length"
+                                  class="mt-1 text-xs text-slate-500"
+                                  :title="queuedPromptAttachmentSummary(queued)"
+                                >
+                                  {{ queuedPromptAttachmentSummary(queued) }}
+                                </div>
+                              </div>
+                            </div>
+
+                            <div class="flex shrink-0 items-center gap-1.5">
+                              <button
+                                type="button"
+                                class="rounded-full bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 ring-1 ring-black/6 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                :disabled="selectedQueueSending"
+                                @click="steerQueuedPrompt(queued.promptId ?? queued.id)"
+                              >
+                                {{ selectedQueueSending ? 'Steering…' : 'Steer' }}
+                              </button>
+                              <button
+                                v-if="isQueuedPromptEditing(queued)"
+                                type="button"
+                                class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white text-slate-700 ring-1 ring-black/6 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                :disabled="selectedQueueSending"
+                                @click="saveQueuedPromptText(queued)"
+                                title="Save"
+                              >
+                                <CheckCircle2 class="h-4 w-4" />
+                              </button>
+                              <button
+                                v-else
+                                type="button"
+                                class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white text-slate-700 ring-1 ring-black/6 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                :disabled="selectedQueueSending"
+                                @click="beginQueuedPromptEdit(queued)"
+                                title="Edit"
+                              >
+                                <Pencil class="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-white text-slate-700 ring-1 ring-black/6 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                :disabled="selectedQueueSending"
+                                @click="deleteQueuedPrompt(queued.promptId ?? queued.id)"
+                                title="Delete"
+                              >
+                                <Trash2 class="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="px-3 py-3">
                 <textarea
                   v-model="messageDraft"
                   rows="2"
@@ -3234,49 +3517,38 @@ watch(
                       <Plus class="h-3.5 w-3.5 sm:h-4 sm:w-4" />
                     </button>
 
-                    <select
+                    <ComposerPillSelect
                       v-model="composerModel"
-                      class="h-7 max-w-[132px] rounded-full border border-black/[0.06] bg-transparent px-2.5 pr-7 text-[11px] text-slate-700 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20 sm:h-8 sm:max-w-[220px] sm:px-3 sm:pr-8 sm:text-[12px]"
-                      title="Model"
+                      class="max-w-[220px]"
+                      title="Choose model"
+                      :options="composerModelSelectOptions"
                       :disabled="modelCatalogLoading && !composerModelOptions.length"
-                    >
-                      <option value="">
-                        {{ defaultCodexModelLabel }}
-                      </option>
-                      <option v-for="opt in composerModelOptions" :key="opt.value" :value="opt.value">
-                        {{ opt.label }}
-                      </option>
-                    </select>
+                      size="md"
+                    />
 
-                    <select
+                    <ComposerPillSelect
                       v-model="composerReasoningEffort"
-                      class="h-7 max-w-[112px] rounded-full border border-black/[0.06] bg-transparent px-2.5 pr-7 text-[11px] text-slate-700 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20 sm:h-8 sm:max-w-none sm:px-3 sm:pr-8 sm:text-[12px]"
-                      title="Reasoning effort"
-                    >
-                      <option value="">
-                        {{
-                          selectedCodexDefaultReasoningEffortLabel
-                            ? `Auto (${selectedCodexDefaultReasoningEffortLabel})`
-                            : 'Auto'
-                        }}
-                      </option>
-                      <option v-for="opt in composerReasoningEffortOptions" :key="opt.value" :value="opt.value" :title="opt.description || ''">
-                        {{ opt.label }}
-                      </option>
-                    </select>
+                      class="max-w-[220px]"
+                      title="Select reasoning"
+                      :options="composerReasoningSelectOptions"
+                      size="md"
+                    />
 
                   </div>
 
                   <button
                     class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-slate-700 text-white transition-colors hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/50 active:scale-[0.99] sm:h-8 sm:w-8"
                     @click="submit"
-                    :disabled="sending || (selectedSession?.turnState !== 'running' && !messageDraft.trim() && !attachments.length)"
-                    :title="selectedSession?.turnState === 'running' ? 'Stop' : 'Send'"
+                    :disabled="sending || (!messageDraft.trim() && !attachments.length && selectedSession?.turnState !== 'running')"
+                    :title="selectedSession?.turnState === 'running'
+                      ? ((messageDraft.trim() || attachments.length) ? 'Queue follow-up' : 'Stop')
+                      : 'Send'"
                   >
                     <Loader2 v-if="sending" class="h-3.5 w-3.5 animate-spin sm:h-4 sm:w-4" />
-                    <Square v-else-if="selectedSession?.turnState === 'running'" class="h-3.5 w-3.5 sm:h-4 sm:w-4" />
+                    <Square v-else-if="selectedSession?.turnState === 'running' && !messageDraft.trim() && !attachments.length" class="h-3.5 w-3.5 sm:h-4 sm:w-4" />
                     <ArrowUp v-else class="h-3.5 w-3.5 sm:h-4 sm:w-4" />
                   </button>
+                </div>
                 </div>
               </div>
 
@@ -3290,8 +3562,8 @@ watch(
                   >
                     <button
                       type="button"
-                      class="inline-flex max-w-full items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] transition-colors sm:px-2.5 sm:py-1 sm:text-[11px]"
-                      :class="(composerMachineVersionMismatch || composerMachineUnknownVersion) ? 'border-red-200 bg-red-50 text-red-700 hover:bg-red-100' : 'border-black/[0.06] bg-transparent text-slate-500'"
+                      class="rg-pill-button inline-flex max-w-full items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] transition-colors sm:px-2.5 sm:py-1 sm:text-[11px]"
+                      :class="(composerMachineVersionMismatch || composerMachineUnknownVersion) ? 'border-red-200 bg-red-50 text-red-700 hover:bg-red-100' : 'border-black/[0.08] bg-transparent text-slate-500 hover:bg-transparent'"
                       :title="composerMachineVersionMismatch
                         ? `Version mismatch: runner ${composerMachineRunnerVersion} · host ${appSettings.appVersion || 'unknown'}`
                         : (composerMachineUnknownVersion
@@ -3354,47 +3626,58 @@ watch(
                     </div>
                   </div>
 
-                  <select
+                  <ComposerPillSelect
                     v-model="composerApprovalPolicy"
-                    class="h-6 rounded-full border border-black/[0.06] bg-transparent px-2 pr-7 text-[10px] text-slate-600 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20 sm:h-7 sm:px-2.5 sm:pr-8 sm:text-[11px]"
+                    class="max-w-[170px]"
                     :title="selectedSession ? 'Session approval policy' : 'Default approval policy'"
-                  >
-                    <option value="untrusted">untrusted</option>
-                    <option value="on-request">on-request</option>
-                    <option value="never">never</option>
-                    <option value="on-failure">on-failure</option>
-                  </select>
+                    :options="composerApprovalSelectOptions"
+                    size="sm"
+                  />
 
-                  <select
+                  <ComposerPillSelect
                     v-model="composerSandbox"
-                    class="h-6 rounded-full border border-black/[0.06] bg-transparent px-2 pr-7 text-[10px] text-slate-600 outline-none transition-colors focus:border-slate-400 focus:ring-2 focus:ring-slate-400/20 sm:h-7 sm:px-2.5 sm:pr-8 sm:text-[11px]"
+                    class="max-w-[190px]"
                     :title="selectedSession ? 'Session sandbox' : 'Default sandbox'"
-                  >
-                    <option value="read-only">read-only</option>
-                    <option value="workspace-write">workspace-write</option>
-                    <option value="danger-full-access">danger-full-access</option>
-                  </select>
+                    :options="composerSandboxSelectOptions"
+                    size="sm"
+                  />
                 </div>
-                <div class="flex items-center gap-2">
-                  <div class="hidden max-w-[240px] truncate sm:block" :title="selectedSession?.cwd ?? defaults.cwd">
-                    {{ composerProjectLabel }}
-                  </div>
+                <div class="flex items-center self-center gap-2">
                   <div
                     v-if="composerContextUsage"
-                    class="relative shrink-0"
+                    class="relative flex shrink-0 items-center self-center"
                     data-context-usage-root="true"
                     @mouseenter="composerContextPopoverHover = true"
                     @mouseleave="composerContextPopoverHover = false"
                   >
                     <button
-                      class="relative inline-flex h-6 w-6 items-center justify-center rounded-full transition-transform hover:scale-[1.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                      class="relative inline-flex h-5 w-5 items-center justify-center rounded-full align-middle transition-transform hover:scale-[1.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
                       type="button"
                       :title="composerContextUsage.usageLabel"
                       @click.stop="composerContextPopoverOpen = !composerContextPopoverOpen"
                     >
-                      <span class="absolute inset-0 rounded-full" :style="composerContextRingStyle" />
-                      <span class="absolute inset-[2px] rounded-full bg-white ring-1 ring-black/[0.06]" />
-                      <span class="relative h-1.5 w-1.5 rounded-full bg-slate-400" />
+                      <svg class="absolute inset-0" viewBox="0 0 20 20" aria-hidden="true">
+                        <circle
+                          cx="10"
+                          cy="10"
+                          r="7.5"
+                          fill="none"
+                          stroke="rgba(15, 23, 42, 0.1)"
+                          stroke-width="3.5"
+                        />
+                        <circle
+                          cx="10"
+                          cy="10"
+                          r="7.5"
+                          fill="none"
+                          stroke="#94a3b8"
+                          stroke-width="3.5"
+                          transform="rotate(-90 10 10)"
+                          stroke-linecap="round"
+                          :style="composerContextRingStrokeStyle"
+                        />
+                      </svg>
+                      <span class="absolute inset-[3.75px] rounded-full bg-white" />
                     </button>
                     <div
                       v-if="composerContextPopoverVisible"
@@ -3407,11 +3690,14 @@ watch(
                       <div class="mt-1 text-xs font-medium text-slate-900">
                         {{ composerContextUsage.usageLabel }}
                       </div>
+                      <div
+                        v-if="composerContextUsage.totalLabel && composerContextUsage.totalLabel !== composerContextUsage.usedLabel"
+                        class="mt-1 text-[11px] text-slate-500"
+                      >
+                        Session total {{ composerContextUsage.totalLabel }}
+                      </div>
                       <div v-if="composerContextUsage.lastLabel" class="mt-1 text-[11px] text-slate-500">
                         Last turn {{ composerContextUsage.lastLabel }}
-                      </div>
-                      <div class="mt-1 text-[11px] text-slate-800">
-                        Codex automatically compacts its context
                       </div>
                     </div>
                   </div>
@@ -3960,6 +4246,62 @@ watch(
 		            </div>
 
 		            <div v-else-if="settingsTab === 'machines'" class="mt-4 space-y-3">
+		              <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
+		                <div class="flex items-start justify-between gap-3">
+		                  <div class="min-w-0">
+		                    <div class="text-sm font-medium text-slate-900">Add machine</div>
+		                    <div class="mt-1 text-xs text-slate-500">
+		                      Install a runner with a one-liner. The target machine only needs
+		                      <span class="font-medium text-slate-700">curl</span>,
+		                      <span class="font-medium text-slate-700">node</span>, and
+		                      <span class="font-medium text-slate-700">tar</span>.
+		                    </div>
+		                  </div>
+		                  <div v-if="runnerInstallExpiryLabel" class="shrink-0 text-[11px] text-slate-500">
+		                    {{ runnerInstallExpiryLabel }}
+		                  </div>
+		                </div>
+
+		                <div class="mt-3 flex flex-wrap items-center gap-2">
+		                  <button
+		                    class="inline-flex items-center gap-2 rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+		                    :disabled="runnerInstallLoading"
+		                    @click="loadRunnerInstallBootstrap({ force: true })"
+		                  >
+		                    <Loader2 v-if="runnerInstallLoading" class="h-3.5 w-3.5 animate-spin" />
+		                    {{ runnerInstallCommand ? 'Regenerate command' : 'Generate command' }}
+		                  </button>
+		                  <button
+		                    class="rounded-md bg-white px-3 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+		                    :disabled="!runnerInstallCommand"
+		                    @click="copyRunnerInstallCommand"
+		                  >
+		                    Copy command
+		                  </button>
+		                  <button
+		                    class="rounded-md bg-white px-3 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+		                    :disabled="!runnerInstallUrl"
+		                    @click="copyRunnerInstallUrl"
+		                  >
+		                    Copy URL
+		                  </button>
+		                </div>
+
+		                <div
+		                  v-if="runnerInstallCommand"
+		                  class="mt-3 overflow-x-auto rounded-xl bg-slate-950 px-3 py-3 text-[11px] text-slate-100"
+		                >
+		                  <code class="font-mono break-all">{{ runnerInstallCommand }}</code>
+		                </div>
+		                <div v-if="runnerInstallUrl" class="mt-2 text-[11px] text-slate-500 break-all">
+		                  URL: <span class="font-mono text-slate-700">{{ runnerInstallUrl }}</span>
+		                </div>
+		                <div v-if="runnerInstallNeedsReachableUrl" class="mt-2 text-[11px] text-amber-700">
+		                  This command currently points at localhost. Set <span class="font-mono">host.publicUrl</span> if the runner is being installed on another machine.
+		                </div>
+		                <div v-if="runnerInstallError" class="mt-2 text-sm text-red-600">{{ runnerInstallError }}</div>
+		              </div>
+
 		              <div v-if="!machines.length" class="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
 		                No machines connected yet.
 		              </div>

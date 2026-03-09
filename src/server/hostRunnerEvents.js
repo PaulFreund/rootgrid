@@ -123,7 +123,8 @@ export function createHostRunnerEventHandlers({
   pendingModelLists,
   pendingIdeStarts,
   terminalSessions,
-  httpError
+  httpError,
+  onSessionTurnCompleted = null
 }) {
   return {
     onRunnerMessage(msg, { machineId, inserted }) {
@@ -360,6 +361,10 @@ export function createHostRunnerEventHandlers({
       }
 
       if (msg?.type === 'turn.completed' && sessionId) {
+        try {
+          onSessionTurnCompleted?.({ sessionId, machineId, payload: msg.payload ?? null })
+        } catch {
+        }
         const payload = buildTurnCompletedNotificationPayload({ label, sessionId, turn: msg.payload })
         if (!payload) return
         sse.sendToast(makeEnvelope({

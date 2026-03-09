@@ -348,6 +348,54 @@ test('buildChatMessages keeps live commentary inside Thinking and hides the fina
   assert.equal(completedMessages[2].text, 'Final answer in progress')
 })
 
+test('buildChatMessages keeps session errors inside Thinking and preserves completed thought duration', () => {
+  const store = createSessionStoreState()
+  store.backgroundExpandedByTurnId.set('turn-err', true)
+
+  store.events.push(
+    {
+      eventId: 'u-1',
+      type: 'session.input',
+      payload: { text: 'Funny', attachments: [] }
+    },
+    {
+      eventId: 't-1',
+      tsMs: 1_000,
+      type: 'turn.started',
+      payload: { turnId: 'turn-err' }
+    },
+    {
+      eventId: 'err-1',
+      seq: 2,
+      tsMs: 290_000,
+      type: 'session.error',
+      payload: {
+        turnId: 'turn-err',
+        message: 'Reconnecting... 2/5',
+        details: 'stream disconnected before completion: idle timeout waiting for websocket',
+        willRetry: true
+      }
+    },
+    {
+      eventId: 'done-1',
+      seq: 3,
+      tsMs: 304_000,
+      type: 'turn.completed',
+      payload: { turnId: 'turn-err', status: 'completed' }
+    }
+  )
+
+  const messages = buildChatMessages(store)
+  assert.equal(messages.length, 2)
+  assert.equal(messages[1].stepKind, 'background')
+  assert.equal(messages[1].title, 'Thought for 5m 3s')
+  assert.equal(messages[1].active, false)
+  assert.equal(messages[1].timeline[0]?.kind, 'error')
+  assert.equal(messages[1].timeline[0]?.message, 'Reconnecting... 2/5')
+  assert.match(String(messages[1].timeline[0]?.details ?? ''), /idle timeout waiting for websocket/)
+  assert.equal(messages[1].timeline[0]?.willRetry, true)
+})
+
 test('buildChatMessages interleaves live reasoning chunks with command steps by seq', () => {
   const store = createSessionStoreState()
   store.currentTurnId = 'turn-live'

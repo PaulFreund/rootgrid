@@ -94,8 +94,13 @@ body {
   .rg-thinking-rainbow > span {
     display: inline-block;
     color: rgb(51 65 85);
-    animation: rg-thinking-rainbow 1.05s linear infinite;
-    animation-delay: calc(var(--rg-letter-index, 0) * 70ms);
+    animation: rg-thinking-rainbow 1.35s linear infinite both;
+    will-change: color;
+  }
+
+  .rg-pill-button,
+  .rg-pill-button {
+    @apply relative inline-flex items-center rounded-full border border-transparent text-slate-500;
   }
 }
 
@@ -121,26 +126,26 @@ body {
 
 @keyframes rg-thinking-rainbow {
   0%,
-  68%,
+  54%,
   100% {
     color: rgb(51 65 85);
   }
-  72% {
+  60% {
     color: rgb(239 68 68);
   }
-  76% {
+  66% {
     color: rgb(249 115 22);
   }
-  80% {
+  72% {
     color: rgb(234 179 8);
   }
-  84% {
+  78% {
     color: rgb(34 197 94);
   }
-  88% {
+  84% {
     color: rgb(14 165 233);
   }
-  92% {
+  90% {
     color: rgb(99 102 241);
   }
   96% {
@@ -159,9 +164,6 @@ body {
     transform: none !important;
   }
 
-  .rg-thinking-rainbow > span {
-    animation: none !important;
-  }
 }
 
 body.rootgrid-col-resize-active,

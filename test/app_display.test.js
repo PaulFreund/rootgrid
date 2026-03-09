@@ -73,17 +73,18 @@ test('token usage helpers normalize payloads and update the reactive map', () =>
     modelContextWindow: 64000
   })
 
-  assert.deepEqual(buildContextUsageSummary(map.get('session-1')), {
-    usedTokens: 21,
-    usedLabel: '21',
-    lastTokens: 7,
-    lastLabel: '7',
-    modelContextWindow: 64000,
-    windowLabel: '64k',
-    percent: 0.0328125,
-    percentLabel: '0% full',
-    usageLabel: '21 / 64k tokens used'
-  })
+  const summary = buildContextUsageSummary(map.get('session-1'))
+  assert.equal(summary?.usedTokens, 7)
+  assert.equal(summary?.usedLabel, '7')
+  assert.equal(summary?.totalTokens, 21)
+  assert.equal(summary?.totalLabel, '21')
+  assert.equal(summary?.lastTokens, 7)
+  assert.equal(summary?.lastLabel, '7')
+  assert.equal(summary?.modelContextWindow, 64000)
+  assert.equal(summary?.windowLabel, '64k')
+  assert.equal(summary?.percent, (7 / 64000) * 100)
+  assert.equal(summary?.percentLabel, '0% full')
+  assert.equal(summary?.usageLabel, '7 / 64k tokens used')
 })
 
 test('machine status and plan helpers derive labels consistently', () => {

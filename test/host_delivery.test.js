@@ -614,6 +614,132 @@ test('legacy inline base64 attachments still upload and persist as reusable refs
   assert.ok(typeof inputEvent.payload.attachments[0].uploadId === 'string')
 })
 
+test('queued prompts persist in bootstrap payloads and auto-drain after turn completion', async (t) => {
+  const svc = await startHostProcess({ cwd: process.cwd() })
+  t.after(async () => {
+    await svc.stop()
+  })
+
+  const port = svc.config.host.listen.port
+  const cookie = await login({ port, token: svc.config.host.auth.clientToken })
+  const machineId = 'machine-queue-1'
+  const runner = await connectRunner({
+    port,
+    token: svc.config.host.auth.runnerToken,
+    machineId
+  })
+  t.after(() => {
+    try { runner.close() } catch {}
+  })
+
+  let sendCount = 0
+  let drainedText = null
+  let sessionId = null
+  runner.on('message', (buf) => {
+    let msg
+    try {
+      msg = JSON.parse(String(buf))
+    } catch {
+      return
+    }
+
+    if (msg.type !== 'session.send') return
+    sendCount += 1
+    if (sendCount >= 2) drainedText = String(msg.payload?.text ?? '')
+
+    runner.send(JSON.stringify({
+      v: 1,
+      type: 'session.command.accepted',
+      ts: Date.now(),
+      id: crypto.randomUUID(),
+      scope: { machineId, sessionId: msg.payload.sessionId },
+      payload: {
+        requestId: msg.payload.requestId,
+        sessionId: msg.payload.sessionId,
+        kind: 'send'
+      }
+    }))
+  })
+
+  const draft = await apiJson({
+    port,
+    path: '/api/sessions/draft',
+    method: 'POST',
+    cookie,
+    body: {
+      machineId,
+      cwd: process.cwd()
+    }
+  })
+  assert.equal(draft.res.status, 200)
+  sessionId = draft.data?.sessionId
+  assert.ok(sessionId)
+
+  const firstSend = await apiJson({
+    port,
+    path: `/api/sessions/${sessionId}/messages`,
+    method: 'POST',
+    cookie,
+    body: { text: 'first turn' }
+  })
+  assert.equal(firstSend.res.status, 200)
+
+  const queueCreate = await apiJson({
+    port,
+    path: `/api/sessions/${sessionId}/queued-prompts`,
+    method: 'POST',
+    cookie,
+    body: { text: 'after completion' }
+  })
+  assert.equal(queueCreate.res.status, 200)
+  assert.equal(Array.isArray(queueCreate.data?.queuedPrompts), true)
+  assert.equal(queueCreate.data?.queuedPrompts?.length, 1)
+
+  const bootstrapBefore = await apiJson({
+    port,
+    path: `/api/sessions/${sessionId}?bootstrap=1`,
+    cookie
+  })
+  assert.equal(bootstrapBefore.res.status, 200)
+  assert.equal(bootstrapBefore.data?.queuedPrompts?.length, 1)
+  assert.equal(bootstrapBefore.data?.queuedPrompts?.[0]?.text, 'after completion')
+
+  runner.send(JSON.stringify({
+    v: 1,
+    type: 'turn.completed',
+    ts: Date.now(),
+    id: crypto.randomUUID(),
+    scope: { machineId, sessionId },
+    payload: {
+      sessionId,
+      turnId: 'turn-1',
+      status: 'completed',
+      preview: 'done'
+    }
+  }))
+
+  await waitFor(() => drainedText === 'after completion', { timeoutMs: 5_000, intervalMs: 50 })
+
+  const bootstrapAfter = await apiJson({
+    port,
+    path: `/api/sessions/${sessionId}?bootstrap=1`,
+    cookie
+  })
+  assert.equal(bootstrapAfter.res.status, 200)
+  assert.deepEqual(bootstrapAfter.data?.queuedPrompts, [])
+
+  const events = await apiJson({
+    port,
+    path: `/api/sessions/${sessionId}/events?mode=full&limit=100`,
+    cookie
+  })
+  assert.equal(events.res.status, 200)
+  const inputs = (Array.isArray(events.data?.events) ? events.data.events : [])
+    .filter((event) => event?.type === 'session.input')
+    .map((event) => String(event?.payload?.text ?? ''))
+  assert.deepEqual(inputs, ['first turn', 'after completion'])
+})
+
 test('session metadata routes rename, patch options, archive, unarchive, and delete sessions', async (t) => {
   const svc = await startHostProcess({ cwd: process.cwd() })
   t.after(async () => {

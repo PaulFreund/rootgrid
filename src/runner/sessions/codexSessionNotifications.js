@@ -138,9 +138,20 @@ export function normalizeWrappedNotification({ method, params, sessionId }) {
   if (msgType === 'error') {
     const willRetry = Boolean(wrapped?.will_retry ?? wrapped?.willRetry)
     const message = safeString(wrapped?.message)
+    const details = safeString(wrapped?.additional_details ?? wrapped?.additionalDetails)
+    const codexErrorInfo = wrapped?.codex_error_info ?? wrapped?.codexErrorInfo ?? null
     return {
       kind: 'forward',
-      notifications: [{ method: 'error', params: fromWrappedParams({ willRetry, message }) }]
+      notifications: [{
+        method: 'error',
+        params: fromWrappedParams({
+          ...(turnId ? { turnId } : {}),
+          willRetry,
+          ...(message ? { message } : {}),
+          ...(details ? { details } : {}),
+          ...(codexErrorInfo ? { codexErrorInfo } : {})
+        })
+      }]
     }
   }
 
