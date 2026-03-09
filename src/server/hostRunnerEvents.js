@@ -158,7 +158,13 @@ export function createHostRunnerEventHandlers({
         return
       }
 
-      if (msg?.type === 'git.status.result') {
+      if (
+        msg?.type === 'git.status.result'
+        || msg?.type === 'git.stage.result'
+        || msg?.type === 'git.unstage.result'
+        || msg?.type === 'git.branch.switch.result'
+        || msg?.type === 'git.branch.create.result'
+      ) {
         const requestId = msg.payload?.requestId
         if (!requestId) return
         if (msg.payload?.ok === false) pendingGitStatuses.reject(requestId, new Error(msg.payload?.error ?? 'git status failed'))

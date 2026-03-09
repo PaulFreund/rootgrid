@@ -1,7 +1,10 @@
 import { spawn } from 'node:child_process'
+import { mkdir, rm } from 'node:fs/promises'
 import net from 'node:net'
+import { join } from 'node:path'
 
 import { buildIdeBasePath } from '../lib/idePaths.js'
+import { getRootgridTmpDir } from '../lib/paths.js'
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms))
@@ -48,11 +51,18 @@ async function getFreePort() {
 
 let cachedCodeServerCapabilitiesPromise = null
 
+export function buildCodeServerEnv(baseEnv = process.env) {
+  const env = { ...(baseEnv ?? {}) }
+  delete env.VSCODE_IPC_HOOK_CLI
+  delete env.CODE_SERVER_SESSION_SOCKET
+  return env
+}
+
 async function readCodeServerCapabilities() {
   if (!cachedCodeServerCapabilitiesPromise) {
     cachedCodeServerCapabilitiesPromise = new Promise((resolve) => {
       const proc = spawn('code-server', ['--help'], {
-        env: process.env,
+        env: buildCodeServerEnv(process.env),
         stdio: ['ignore', 'pipe', 'pipe']
       })
       let text = ''
@@ -92,6 +102,55 @@ function summarizeStartupOutput(stdoutText, stderrText) {
   return pieces.join('\n').trim()
 }
 
+function sanitizePathSegment(value) {
+  return String(value ?? '').replace(/[^a-zA-Z0-9._-]+/g, '_').trim() || 'default'
+}
+
+export function buildCodeServerLaunchSpec({ ideId, machineId, port, cwd, capabilities = {} } = {}) {
+  const safeIdeId = sanitizePathSegment(ideId)
+  const safeMachineId = sanitizePathSegment(machineId)
+  const basePath = buildIdeBasePath(ideId)
+  const runtimeDir = join(getRootgridTmpDir(), 'ide', safeMachineId, safeIdeId)
+  const userDataDir = join(runtimeDir, 'user-data')
+  const trustedOrigins = Array.isArray(capabilities?.trustedOrigins)
+    ? capabilities.trustedOrigins
+      .map((value) => String(value ?? '').trim().toLowerCase())
+      .filter(Boolean)
+    : []
+  const args = [
+    '--auth', 'none',
+    '--bind-addr', `127.0.0.1:${port}`,
+    '--disable-telemetry',
+    '--disable-update-check',
+    '--ignore-last-opened',
+    '--user-data-dir', userDataDir
+  ]
+  if (capabilities.supportsAbsProxyBasePath) {
+    args.push('--abs-proxy-base-path', basePath)
+  } else if (capabilities.supportsBasePath) {
+    args.push('--base-path', basePath)
+  }
+  for (const origin of trustedOrigins) {
+    args.push('--trusted-origins', origin)
+  }
+  args.push(cwd)
+  return {
+    args,
+    basePath,
+    runtimeDir,
+    userDataDir
+  }
+}
+
+async function cleanupRuntimeDir(runtimeDir) {
+  const path = String(runtimeDir ?? '').trim()
+  if (!path) return
+  try {
+    await rm(path, { recursive: true, force: true })
+  } catch {
+  }
+}
+
 export class RunnerIdeManager {
   /**
    * @param {{
@@ -106,7 +165,7 @@ export class RunnerIdeManager {
     this.ideSessions = new Map()
   }
 
-  async start({ ideId, cwd }) {
+  async start({ ideId, cwd, trustedOrigins = [] }) {
     if (!ideId || typeof ideId !== 'string') throw new Error('ideId required')
     if (!cwd || typeof cwd !== 'string') throw new Error('cwd required')
     if (this.ideSessions.has(ideId)) return
@@ -114,25 +173,22 @@ export class RunnerIdeManager {
     const port = await getFreePort()
     if (!port) throw new Error('failed to allocate port')
 
-    const basePath = buildIdeBasePath(ideId)
     const capabilities = await readCodeServerCapabilities()
-
-    const args = [
-      '--auth', 'none',
-      '--bind-addr', `127.0.0.1:${port}`,
-      '--disable-telemetry',
-      '--disable-update-check'
-    ]
-    if (capabilities.supportsAbsProxyBasePath) {
-      args.push('--abs-proxy-base-path', basePath)
-    } else if (capabilities.supportsBasePath) {
-      args.push('--base-path', basePath)
-    }
-    args.push(cwd)
-
-    const proc = spawn('code-server', args, {
+    const spec = buildCodeServerLaunchSpec({
+      ideId,
+      machineId: this.machineId,
+      port,
       cwd,
-      env: process.env,
+      capabilities: {
+        ...capabilities,
+        trustedOrigins
+      }
+    })
+    await mkdir(spec.userDataDir, { recursive: true })
+
+    const proc = spawn('code-server', spec.args, {
+      cwd,
+      env: buildCodeServerEnv(process.env),
       stdio: ['ignore', 'pipe', 'pipe']
     })
 
@@ -145,30 +201,25 @@ export class RunnerIdeManager {
       startupStderr = appendOutputTail(startupStderr, chunk)
     })
 
-    this.ideSessions.set(ideId, { proc, port, cwd })
+    this.ideSessions.set(ideId, { proc, port, cwd, runtimeDir: spec.runtimeDir })
     let started = false
     let failedDuringStartup = false
+    let startupExit = null
 
     proc.once('error', (err) => {
       this.ideSessions.delete(ideId)
+      cleanupRuntimeDir(spec.runtimeDir)
       failedDuringStartup = true
       this.emit('ide.failed', { ideId, error: String(err?.message ?? err) })
     })
 
     proc.once('exit', (code, signal) => {
-      this.ideSessions.delete(ideId)
       if (!started && !failedDuringStartup) {
-        failedDuringStartup = true
-        const detail = summarizeStartupOutput(startupStdout, startupStderr)
-        const status = [`code-server exited before startup`]
-        if (Number.isFinite(Number(code))) status.push(`(exit ${Number(code)})`)
-        else if (signal) status.push(`(${String(signal)})`)
-        this.emit('ide.failed', {
-          ideId,
-          error: detail ? `${status.join(' ')}: ${detail}` : status.join(' ')
-        })
+        startupExit = { code, signal }
         return
       }
+      this.ideSessions.delete(ideId)
+      cleanupRuntimeDir(spec.runtimeDir)
       if (!started) return
       this.emit('ide.stopped', { ideId, code, signal })
     })
@@ -177,17 +228,26 @@ export class RunnerIdeManager {
     if (!ready) {
       try { proc.kill('SIGKILL') } catch { }
       this.ideSessions.delete(ideId)
+      cleanupRuntimeDir(spec.runtimeDir)
       failedDuringStartup = true
       const detail = summarizeStartupOutput(startupStdout, startupStderr)
+      const status = startupExit
+        ? [
+            'code-server exited before startup',
+            Number.isFinite(Number(startupExit.code))
+              ? `(exit ${Number(startupExit.code)})`
+              : (startupExit.signal ? `(${String(startupExit.signal)})` : '')
+          ].filter(Boolean).join(' ')
+        : 'code-server failed to start (timeout)'
       this.emit('ide.failed', {
         ideId,
-        error: detail ? `code-server failed to start: ${detail}` : 'code-server failed to start (timeout)'
+        error: detail ? `${status}: ${detail}` : status
       })
       return
     }
 
     started = true
-    this.emit('ide.started', { ideId, cwd, port, basePath })
+    this.emit('ide.started', { ideId, cwd, port, basePath: spec.basePath })
   }
 
   async stop({ ideId }) {

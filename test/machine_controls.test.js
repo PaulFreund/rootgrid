@@ -162,7 +162,7 @@ test('openVSCode reports IDE session metadata to the caller when embedding in-ap
       ok: true,
       status: 200,
       async json() {
-        return { ideId: 'ide-embedded-1', urlPath: '/vscode/ide-embedded-1/' }
+        return { ideId: 'ide-embedded-1', urlPath: '/vscode/ide-embedded-1/?folder=%2Fembedded%2Fworkspace' }
       }
     }),
     defaults: reactive({
@@ -194,7 +194,7 @@ test('openVSCode reports IDE session metadata to the caller when embedding in-ap
   assert.equal(ok, true)
   assert.deepEqual(started, [{
     ideId: 'ide-embedded-1',
-    urlPath: '/vscode/ide-embedded-1/',
+    urlPath: '/vscode/ide-embedded-1/?folder=%2Fembedded%2Fworkspace',
     cwd: '/embedded/workspace',
     machineId: 'machine-embedded'
   }])

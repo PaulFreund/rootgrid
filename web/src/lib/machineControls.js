@@ -137,7 +137,7 @@ export function createMachineControlActions({
     })
     if (!request.ok) {
       ideError.value = request.error
-      if (typeof openSettings === 'function') openSettings('defaults')
+      if (typeof openSettings === 'function') openSettings('machines')
       return false
     }
 

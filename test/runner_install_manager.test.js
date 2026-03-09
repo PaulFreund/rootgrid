@@ -51,6 +51,7 @@ test('buildRunnerInstallScript generates a self-contained bootstrap script', () 
 
 test('runner install manager creates expiring bootstrap payloads', async () => {
   let now = 1_000
+  let getBundleCalls = 0
   const manager = createRunnerInstallManager({
     config: {
       version: 1,
@@ -63,7 +64,14 @@ test('runner install manager creates expiring bootstrap payloads', async () => {
       }
     },
     releaseBundles: {
+      getBundleMetadata() {
+        return {
+          version: '0.0.1',
+          releaseId: null
+        }
+      },
       async getBundle() {
+        getBundleCalls += 1
         return {
           version: '0.0.1',
           releaseId: 'rootgrid-0.0.1-test',
@@ -87,9 +95,11 @@ test('runner install manager creates expiring bootstrap payloads', async () => {
   assert.match(payload.installCommand, /^curl -fsSL '/)
   assert.equal(payload.version, '0.0.1')
   assert.equal(payload.releaseId, 'rootgrid-0.0.1-test')
+  assert.equal(getBundleCalls, 1)
 
   const script = await manager.renderInstallScript(req, payload.installToken)
   assert.match(script, /Rootgrid runner installed\./)
+  assert.equal(getBundleCalls, 1)
 
   now += 61_000
   assert.equal(await manager.renderInstallScript(req, payload.installToken), null)

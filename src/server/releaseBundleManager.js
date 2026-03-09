@@ -6,15 +6,34 @@ import { ROOTGRID_VERSION } from '../lib/rootgridVersion.js'
 
 export function createReleaseBundleManager() {
   let cached = null
+  let inflight = null
+
+  function getBundleMetadata() {
+    return {
+      version: cached?.version ?? ROOTGRID_VERSION,
+      releaseId: cached?.releaseId ?? null,
+      ready: Boolean(cached)
+    }
+  }
 
   async function getBundle() {
     if (cached) return cached
-    cached = await createManagedReleaseBundle({
+    if (inflight) return await inflight
+    inflight = createManagedReleaseBundle({
       sourceRoot: getCurrentPackageRoot(),
       version: ROOTGRID_VERSION,
       source: 'host'
+    }).then((bundle) => {
+      cached = bundle
+      return bundle
+    }).finally(() => {
+      inflight = null
     })
-    return cached
+    return await inflight
+  }
+
+  function warmBundle() {
+    void getBundle().catch(() => {})
   }
 
   async function sendBundleToMachine({
@@ -86,6 +105,8 @@ export function createReleaseBundleManager() {
 
   return {
     getBundle,
+    getBundleMetadata,
+    warmBundle,
     sendBundleToMachine,
     streamBundleToMachine,
     nextRequestId() {

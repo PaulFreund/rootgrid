@@ -198,6 +198,51 @@ export function parseGitStatusOutput(stdout, { cwd = '' } = {}) {
   }
 }
 
+async function runGitCommand(args, { cwd = '', timeoutMs = 10_000 } = {}) {
+  const resolvedCwd = resolveWorkspaceListPath(cwd)
+  const result = await runCommandCapture('git', ['-C', resolvedCwd, ...args], {
+    cwd: resolvedCwd,
+    timeoutMs
+  })
+  if (result.code !== 0) {
+    throw new Error(String(result.stderr ?? result.stdout ?? 'git command failed').trim() || 'git command failed')
+  }
+  return {
+    cwd: resolvedCwd,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    durationMs: result.durationMs
+  }
+}
+
+export function parseGitBranchesOutput(stdout) {
+  return String(stdout ?? '')
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => {
+      const [nameRaw = '', currentRaw = ''] = line.split('\t')
+      const name = String(nameRaw).trim()
+      if (!name) return null
+      return {
+        name,
+        current: String(currentRaw).trim() === '*'
+      }
+    })
+    .filter(Boolean)
+}
+
+export async function listGitBranches({ cwd = '', timeoutMs = 10_000 } = {}) {
+  const result = await runGitCommand([
+    'for-each-ref',
+    '--format=%(refname:short)\t%(if)%(HEAD)%(then)*%(end)',
+    'refs/heads'
+  ], { cwd, timeoutMs })
+  return {
+    cwd: result.cwd,
+    branches: parseGitBranchesOutput(result.stdout)
+  }
+}
+
 export async function getGitStatus({ cwd = '', timeoutMs = 10_000 } = {}) {
   const resolvedCwd = resolveWorkspaceListPath(cwd)
   const check = await runCommandCapture('git', ['-C', resolvedCwd, 'rev-parse', '--show-toplevel'], {
@@ -227,11 +272,78 @@ export async function getGitStatus({ cwd = '', timeoutMs = 10_000 } = {}) {
   if (result.code !== 0) {
     throw new Error(String(result.stderr ?? result.stdout ?? 'git status failed').trim() || 'git status failed')
   }
+  let branches = []
+  try {
+    const branchInfo = await listGitBranches({ cwd: resolvedCwd, timeoutMs })
+    branches = Array.isArray(branchInfo?.branches) ? branchInfo.branches : []
+  } catch {
+  }
   return {
     ...parseGitStatusOutput(result.stdout, { cwd: resolvedCwd }),
     rootPath,
+    branches,
     notRepo: false
   }
+}
+
+export async function stageGitPaths({ cwd = '', paths = [], timeoutMs = 10_000 } = {}) {
+  const safePaths = (Array.isArray(paths) ? paths : [])
+    .map((value) => String(value ?? '').trim())
+    .filter(Boolean)
+  if (!safePaths.length) throw new Error('paths are required')
+  const result = await runGitCommand(['add', '--', ...safePaths], { cwd, timeoutMs })
+  return {
+    cwd: result.cwd,
+    paths: safePaths
+  }
+}
+
+export async function unstageGitPaths({ cwd = '', paths = [], timeoutMs = 10_000 } = {}) {
+  const safePaths = (Array.isArray(paths) ? paths : [])
+    .map((value) => String(value ?? '').trim())
+    .filter(Boolean)
+  if (!safePaths.length) throw new Error('paths are required')
+  try {
+    const result = await runGitCommand(['restore', '--staged', '--', ...safePaths], { cwd, timeoutMs })
+    return {
+      cwd: result.cwd,
+      paths: safePaths
+    }
+  } catch {
+    const result = await runGitCommand(['reset', 'HEAD', '--', ...safePaths], { cwd, timeoutMs })
+    return {
+      cwd: result.cwd,
+      paths: safePaths
+    }
+  }
+}
+
+async function switchGitWithFallback({ cwd = '', branch, timeoutMs = 10_000, create = false } = {}) {
+  const safeBranch = String(branch ?? '').trim()
+  if (!safeBranch) throw new Error('branch is required')
+  const argsPrimary = create ? ['switch', '-c', safeBranch] : ['switch', safeBranch]
+  const argsFallback = create ? ['checkout', '-b', safeBranch] : ['checkout', safeBranch]
+  try {
+    const result = await runGitCommand(argsPrimary, { cwd, timeoutMs })
+    return {
+      cwd: result.cwd,
+      branch: safeBranch
+    }
+  } catch {
+    const result = await runGitCommand(argsFallback, { cwd, timeoutMs })
+    return {
+      cwd: result.cwd,
+      branch: safeBranch
+    }
+  }
+}
+
+export async function switchGitBranch({ cwd = '', branch, timeoutMs = 10_000 } = {}) {
+  return await switchGitWithFallback({ cwd, branch, timeoutMs, create: false })
+}
+
+export async function createGitBranch({ cwd = '', branch, timeoutMs = 10_000 } = {}) {
+  return await switchGitWithFallback({ cwd, branch, timeoutMs, create: true })
 }
 
 export async function execTerminalCommand({ cwd = '', command, timeoutMs = 60_000 } = {}) {

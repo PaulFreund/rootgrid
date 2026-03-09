@@ -20,6 +20,7 @@ export function machineRowToRecord(row) {
   return {
     machineId: row.machine_id,
     machineName: row.machine_name,
+    machineAlias: row.machine_alias ?? null,
     platform: row.platform,
     lastSeenMs: row.last_seen_ms,
     capabilities: parseJsonCell(row.capabilities_json, null)

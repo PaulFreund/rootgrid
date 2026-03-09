@@ -46,6 +46,8 @@ export function buildRunnerInstallScript({
   if (!safeBaseUrl) throw new Error('baseUrl is required')
   if (!safeInstallToken) throw new Error('installToken is required')
   if (!safeRunnerToken) throw new Error('runnerToken is required')
+  const safeVersion = trimText(version) ?? '0.0.0'
+  const safeReleaseId = trimText(releaseId) ?? 'rootgrid'
 
   const bundleUrl = `${safeBaseUrl}/api/install/runner-bundle?installToken=${encodeURIComponent(safeInstallToken)}`
 
@@ -55,8 +57,8 @@ set -euo pipefail
 ROOTGRID_BASE_URL=${shellQuote(safeBaseUrl)}
 ROOTGRID_INSTALL_TOKEN=${shellQuote(safeInstallToken)}
 ROOTGRID_BUNDLE_URL=${shellQuote(bundleUrl)}
-ROOTGRID_VERSION=${shellQuote(version)}
-ROOTGRID_RELEASE_ID=${shellQuote(releaseId)}
+ROOTGRID_VERSION=${shellQuote(safeVersion)}
+ROOTGRID_RELEASE_ID=${shellQuote(safeReleaseId)}
 ROOTGRID_DIR="\${ROOTGRID_DIR:-$HOME/.rootgrid}"
 NODE_BIN="\${NODE_BIN:-node}"
 TMP_DIR="$(mktemp -d "\${TMPDIR:-/tmp}/rootgrid-install.XXXXXX")"
@@ -186,8 +188,8 @@ export function createRunnerInstallManager({
       baseUrl,
       installUrl,
       installCommand: `curl -fsSL ${shellQuote(installUrl)} | bash`,
-      version: bundle.version,
-      releaseId: bundle.releaseId
+      version: trimText(bundle?.version) ?? '0.0.0',
+      releaseId: trimText(bundle?.releaseId)
     }
   }
 
@@ -210,13 +212,13 @@ export function createRunnerInstallManager({
       publicUrl: config?.host?.publicUrl ?? null,
       trustProxy: config?.host?.trustProxy ?? false
     })
-    const bundle = await releaseBundles.getBundle()
+    const bundleMeta = releaseBundles?.getBundleMetadata?.() ?? {}
     return buildRunnerInstallScript({
       baseUrl,
       installToken: valid.token,
       runnerToken: config?.host?.auth?.runnerToken,
-      version: bundle.version,
-      releaseId: bundle.releaseId,
+      version: trimText(bundleMeta.version) ?? '0.0.0',
+      releaseId: trimText(bundleMeta.releaseId),
       configVersion: config?.version ?? 1
     })
   }

@@ -18,7 +18,7 @@ import { createPendingRequestBook } from './pendingRequestBook.js'
 import { PushService } from './pushService.js'
 import { createReleaseBundleManager } from './releaseBundleManager.js'
 import { recoverAfterRunnerRestart } from './recovery.js'
-import { createRunnerInstallManager } from './runnerInstallManager.js'
+import { buildExternalBaseUrl, createRunnerInstallManager } from './runnerInstallManager.js'
 import { createSessionApi } from './sessionApi.js'
 import { buildAttachmentPayload, buildCodexInputItems } from './sessionApiHelpers.js'
 import { SSEManager } from './sseManager.js'
@@ -379,23 +379,89 @@ export async function startHost({ config }) {
   }
 
   async function gitStatusOnRunner({ machineId, cwd, timeoutMs = 10_000 }) {
+    return await gitRequestOnRunner({
+      machineId,
+      type: 'git.status',
+      payload: { cwd: String(cwd ?? ''), timeoutMs: Number(timeoutMs) || 10_000 },
+      timeoutMs: Math.max(5_000, Number(timeoutMs) || 10_000),
+      timeoutMessage: 'timeout reading git status'
+    })
+  }
+
+  async function gitRequestOnRunner({ machineId, type, payload, timeoutMs = 10_000, timeoutMessage = 'timeout running git command' }) {
     const requestId = crypto.randomUUID()
     const resultP = pendingGitStatuses.create(requestId, {
       machineId,
       timeoutMs: Math.max(5_000, Number(timeoutMs) || 10_000),
-      onTimeout: () => httpError(504, 'timeout reading git status')
+      onTimeout: () => httpError(504, timeoutMessage)
     })
 
     const ok = runnerWs.sendToMachine(machineId, makeEnvelope({
-      type: 'git.status',
+      type,
       scope: { machineId },
-      payload: { requestId, cwd: String(cwd ?? ''), timeoutMs: Number(timeoutMs) || 10_000 }
+      payload: { requestId, ...(payload ?? {}) }
     }))
     if (!ok) {
       pendingGitStatuses.cancel(requestId)
       throw httpError(503, 'runner not connected')
     }
     return await resultP
+  }
+
+  async function gitStageOnRunner({ machineId, cwd, paths, timeoutMs = 10_000 }) {
+    return await gitRequestOnRunner({
+      machineId,
+      type: 'git.stage',
+      payload: {
+        cwd: String(cwd ?? ''),
+        paths: Array.isArray(paths) ? paths : [],
+        timeoutMs: Number(timeoutMs) || 10_000
+      },
+      timeoutMs,
+      timeoutMessage: 'timeout staging files'
+    })
+  }
+
+  async function gitUnstageOnRunner({ machineId, cwd, paths, timeoutMs = 10_000 }) {
+    return await gitRequestOnRunner({
+      machineId,
+      type: 'git.unstage',
+      payload: {
+        cwd: String(cwd ?? ''),
+        paths: Array.isArray(paths) ? paths : [],
+        timeoutMs: Number(timeoutMs) || 10_000
+      },
+      timeoutMs,
+      timeoutMessage: 'timeout unstaging files'
+    })
+  }
+
+  async function gitSwitchBranchOnRunner({ machineId, cwd, branch, timeoutMs = 10_000 }) {
+    return await gitRequestOnRunner({
+      machineId,
+      type: 'git.branch.switch',
+      payload: {
+        cwd: String(cwd ?? ''),
+        branch: String(branch ?? ''),
+        timeoutMs: Number(timeoutMs) || 10_000
+      },
+      timeoutMs,
+      timeoutMessage: 'timeout switching branches'
+    })
+  }
+
+  async function gitCreateBranchOnRunner({ machineId, cwd, branch, timeoutMs = 10_000 }) {
+    return await gitRequestOnRunner({
+      machineId,
+      type: 'git.branch.create',
+      payload: {
+        cwd: String(cwd ?? ''),
+        branch: String(branch ?? ''),
+        timeoutMs: Number(timeoutMs) || 10_000
+      },
+      timeoutMs,
+      timeoutMessage: 'timeout creating branch'
+    })
   }
 
   async function terminalExecOnRunner({ machineId, cwd, command, timeoutMs = 60_000 }) {
@@ -560,6 +626,12 @@ export async function startHost({ config }) {
 
   const hostMachineApi = createHostMachineApi({
     auth,
+    getExternalBaseUrl(req) {
+      return buildExternalBaseUrl(req, {
+        publicUrl: config?.host?.publicUrl ?? null,
+        trustProxy: config?.host?.trustProxy ?? false
+      })
+    },
     store,
     sse,
     runnerWs,
@@ -572,6 +644,10 @@ export async function startHost({ config }) {
     fsListOnRunner,
     fsReadOnRunner,
     gitStatusOnRunner,
+    gitStageOnRunner,
+    gitUnstageOnRunner,
+    gitSwitchBranchOnRunner,
+    gitCreateBranchOnRunner,
     terminalSessions,
     terminalPtyStartOnRunner,
     terminalExecOnRunner,
@@ -820,6 +896,9 @@ export async function startHost({ config }) {
   })
 
   console.log(`[rootgrid] host listening on http://${config.host.listen.host}:${config.host.listen.port}`)
+  // Warm the runner install bundle as soon as the host is up so the first
+  // "Add machine" flow doesn't have to pay the full packaging cost.
+  releaseBundles.warmBundle()
 
   // Retention pruning (Rootgrid-owned data only).
   let retentionRunning = false

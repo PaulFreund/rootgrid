@@ -6,7 +6,17 @@ import { RunnerIdeManager } from './ideManager.js'
 import { RunnerReleaseManager } from './runnerReleaseManager.js'
 import { RunnerTerminalManager } from './runnerTerminalManager.js'
 import { RunnerUploadManager } from './runnerUploadManager.js'
-import { execTerminalCommand, getGitStatus, listCodexModels, listWorkspaceEntries, readWorkspaceFile } from './runnerWorkspaceApi.js'
+import {
+  createGitBranch,
+  execTerminalCommand,
+  getGitStatus,
+  listCodexModels,
+  listWorkspaceEntries,
+  readWorkspaceFile,
+  stageGitPaths,
+  switchGitBranch,
+  unstageGitPaths
+} from './runnerWorkspaceApi.js'
 
 function nextTurnOfLoop() {
   return new Promise((resolve) => setImmediate(resolve))
@@ -62,6 +72,10 @@ export class RunnerSessionManager {
     if (type === 'fs.list') return this.#onFsList(payload)
     if (type === 'fs.read') return this.#onFsRead(payload)
     if (type === 'git.status') return this.#onGitStatus(payload)
+    if (type === 'git.stage') return this.#onGitStage(payload)
+    if (type === 'git.unstage') return this.#onGitUnstage(payload)
+    if (type === 'git.branch.switch') return this.#onGitBranchSwitch(payload)
+    if (type === 'git.branch.create') return this.#onGitBranchCreate(payload)
     if (type === 'terminal.exec') return this.#onTerminalExec(payload)
     if (type === 'terminal.pty.start') return this.#onTerminalPtyStart(payload)
     if (type === 'terminal.pty.input') return this.#onTerminalPtyInput(payload)
@@ -335,6 +349,98 @@ export class RunnerSessionManager {
     }
   }
 
+  async #onGitStage(payload) {
+    const requestId = payload?.requestId
+    if (!requestId || typeof requestId !== 'string') return
+    try {
+      const out = await stageGitPaths({
+        cwd: payload?.cwd,
+        paths: payload?.paths,
+        timeoutMs: Number(payload?.timeoutMs) || 10_000
+      })
+      this.#emit('git.stage.result', { machineId: this.machineId }, {
+        requestId,
+        ok: true,
+        ...out
+      }, { track: false })
+    } catch (err) {
+      this.#emit('git.stage.result', { machineId: this.machineId }, {
+        requestId,
+        ok: false,
+        error: String(err?.message ?? err)
+      }, { track: false })
+    }
+  }
+
+  async #onGitUnstage(payload) {
+    const requestId = payload?.requestId
+    if (!requestId || typeof requestId !== 'string') return
+    try {
+      const out = await unstageGitPaths({
+        cwd: payload?.cwd,
+        paths: payload?.paths,
+        timeoutMs: Number(payload?.timeoutMs) || 10_000
+      })
+      this.#emit('git.unstage.result', { machineId: this.machineId }, {
+        requestId,
+        ok: true,
+        ...out
+      }, { track: false })
+    } catch (err) {
+      this.#emit('git.unstage.result', { machineId: this.machineId }, {
+        requestId,
+        ok: false,
+        error: String(err?.message ?? err)
+      }, { track: false })
+    }
+  }
+
+  async #onGitBranchSwitch(payload) {
+    const requestId = payload?.requestId
+    if (!requestId || typeof requestId !== 'string') return
+    try {
+      const out = await switchGitBranch({
+        cwd: payload?.cwd,
+        branch: payload?.branch,
+        timeoutMs: Number(payload?.timeoutMs) || 10_000
+      })
+      this.#emit('git.branch.switch.result', { machineId: this.machineId }, {
+        requestId,
+        ok: true,
+        ...out
+      }, { track: false })
+    } catch (err) {
+      this.#emit('git.branch.switch.result', { machineId: this.machineId }, {
+        requestId,
+        ok: false,
+        error: String(err?.message ?? err)
+      }, { track: false })
+    }
+  }
+
+  async #onGitBranchCreate(payload) {
+    const requestId = payload?.requestId
+    if (!requestId || typeof requestId !== 'string') return
+    try {
+      const out = await createGitBranch({
+        cwd: payload?.cwd,
+        branch: payload?.branch,
+        timeoutMs: Number(payload?.timeoutMs) || 10_000
+      })
+      this.#emit('git.branch.create.result', { machineId: this.machineId }, {
+        requestId,
+        ok: true,
+        ...out
+      }, { track: false })
+    } catch (err) {
+      this.#emit('git.branch.create.result', { machineId: this.machineId }, {
+        requestId,
+        ok: false,
+        error: String(err?.message ?? err)
+      }, { track: false })
+    }
+  }
+
   async #onTerminalExec(payload) {
     const requestId = payload?.requestId
     if (!requestId || typeof requestId !== 'string') return
@@ -515,10 +621,11 @@ export class RunnerSessionManager {
   async #onIdeStart(payload) {
     const ideId = payload?.ideId
     const cwd = payload?.cwd
+    const trustedOrigins = Array.isArray(payload?.trustedOrigins) ? payload.trustedOrigins : []
     if (!ideId || typeof ideId !== 'string') return
     if (!cwd || typeof cwd !== 'string') return
     try {
-      await this.ide.start({ ideId, cwd })
+      await this.ide.start({ ideId, cwd, trustedOrigins })
     } catch (err) {
       this.#emit('ide.failed', { machineId: this.machineId }, { ideId, error: String(err?.message ?? err) })
     }

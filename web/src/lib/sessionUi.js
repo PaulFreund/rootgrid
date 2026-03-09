@@ -53,6 +53,7 @@ export function sessionProject(session) {
 export function sessionHostName(session, machineNameById) {
   const value = machineNameById?.get?.(session?.machineId)
   if (typeof value === 'string' && value) return value
+  if (value?.machineAlias) return String(value.machineAlias)
   if (value?.machineName) return String(value.machineName)
   return session?.machineId ? String(session.machineId).slice(0, 8) : 'unknown'
 }

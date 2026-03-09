@@ -196,13 +196,14 @@ export function createSystemSettingsActions({
     }
   }
 
-  function openSettings(tab = 'defaults') {
-    settingsTab.value = tab
+  function openSettings(tab = 'machines') {
+    const nextTab = tab === 'defaults' ? 'machines' : tab
+    settingsTab.value = nextTab
     defaultsOpen.value = true
     if (authed.value && !appSettingsLoaded.value) {
       loadAppSettings().catch(() => {})
     }
-    if (tab === 'system') {
+    if (nextTab === 'system') {
       refreshPushSubscription().catch(() => {})
     }
   }

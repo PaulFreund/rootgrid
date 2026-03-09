@@ -204,5 +204,5 @@ watch(() => props.connected, () => {
 </script>
 
 <template>
-  <div ref="terminalEl" class="h-full w-full overflow-hidden rounded-2xl bg-[#0b0f14]" />
+  <div ref="terminalEl" class="h-full w-full overflow-hidden bg-[#0b0f14]" />
 </template>

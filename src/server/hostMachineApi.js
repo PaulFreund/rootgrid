@@ -7,8 +7,11 @@ import {
   serializeTerminalSession
 } from './terminalSessionState.js'
 
+import { buildIdeUrlPath } from '../lib/idePaths.js'
+
 export function createHostMachineApi({
   auth,
+  getExternalBaseUrl = null,
   store,
   sse,
   runnerWs,
@@ -21,6 +24,10 @@ export function createHostMachineApi({
   fsListOnRunner,
   fsReadOnRunner,
   gitStatusOnRunner,
+  gitStageOnRunner,
+  gitUnstageOnRunner,
+  gitSwitchBranchOnRunner,
+  gitCreateBranchOnRunner,
   terminalSessions,
   terminalPtyStartOnRunner,
   terminalExecOnRunner,
@@ -28,12 +35,43 @@ export function createHostMachineApi({
   pendingIdeStarts,
   requestMachineUpgrade
 }) {
+  function deriveTrustedOrigins(req) {
+    const out = new Set()
+    try {
+      const baseUrl = typeof getExternalBaseUrl === 'function' ? getExternalBaseUrl(req) : ''
+      if (baseUrl) out.add(new URL(baseUrl).host.trim().toLowerCase())
+    } catch {
+    }
+    try {
+      const origin = String(req?.headers?.origin ?? '').trim()
+      if (origin) out.add(new URL(origin).host.trim().toLowerCase())
+    } catch {
+    }
+    try {
+      const host = String(req?.headers?.host ?? '').trim().toLowerCase()
+      if (host) out.add(host)
+    } catch {
+    }
+    return Array.from(out)
+  }
+
   function clearPendingIdeStart(ideId) {
     pendingIdeStarts.cancel(ideId)
   }
 
   return {
     async handle(req, res, url, parts) {
+      function resolveConnectedMachineId(preferredMachineId) {
+        const machineId = pickMachineId(
+          (typeof preferredMachineId === 'string' && preferredMachineId.trim()) ? preferredMachineId.trim() : null
+        )
+        if (!machineId) return { error: 'no runner connected', status: 503 }
+        if (!runnerWs.listConnectedMachineIds().includes(machineId)) {
+          return { error: 'runner not connected', status: 503 }
+        }
+        return { machineId }
+      }
+
       if (url.pathname === '/api/machines' && req.method === 'GET') {
         if (!auth.requireAuth(req, res)) return true
         const connectedMachineIds = new Set(runnerWs.listConnectedMachineIds())
@@ -43,6 +81,37 @@ export function createHostMachineApi({
             connected: connectedMachineIds.has(machine.machineId)
           }))
         })
+        return true
+      }
+
+      if (parts[0] === 'api' && parts[1] === 'machines' && parts.length === 3 && parts[2] && req.method === 'PATCH') {
+        if (!auth.requireAuth(req, res)) return true
+        const machineId = parts[2]
+        const machine = store.getMachine(machineId)
+        if (!machine) {
+          json(res, 404, { error: 'not found' })
+          return true
+        }
+
+        const body = await readJsonBody(req)
+        const alias = String(body?.alias ?? '').trim() || null
+        const ok = store.setMachineAlias(machineId, alias)
+        if (!ok) {
+          json(res, 404, { error: 'not found' })
+          return true
+        }
+
+        const nextMachine = store.getMachine(machineId)
+        const payload = {
+          ...nextMachine,
+          connected: runnerWs.listConnectedMachineIds().includes(machineId)
+        }
+        sse.send(makeEnvelope({
+          type: 'registry.machine.upsert',
+          scope: { machineId },
+          payload
+        }))
+        json(res, 200, { ok: true, machine: payload })
         return true
       }
 
@@ -213,15 +282,9 @@ export function createHostMachineApi({
       if (url.pathname === '/api/git/status' && req.method === 'GET') {
         if (!auth.requireAuth(req, res)) return true
         const preferredMachineId = url.searchParams.get('machineId')
-        const machineId = pickMachineId(
-          (typeof preferredMachineId === 'string' && preferredMachineId.trim()) ? preferredMachineId.trim() : null
-        )
-        if (!machineId) {
-          json(res, 503, { error: 'no runner connected' })
-          return true
-        }
-        if (!runnerWs.listConnectedMachineIds().includes(machineId)) {
-          json(res, 503, { error: 'runner not connected' })
+        const machine = resolveConnectedMachineId(preferredMachineId)
+        if (!machine.machineId) {
+          json(res, machine.status, { error: machine.error })
           return true
         }
         const cwd = url.searchParams.get('cwd') ?? ''
@@ -230,7 +293,119 @@ export function createHostMachineApi({
           return true
         }
         try {
-          const out = await gitStatusOnRunner({ machineId, cwd })
+          const out = await gitStatusOnRunner({ machineId: machine.machineId, cwd })
+          json(res, 200, out)
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          json(res, code, { error: String(err?.message ?? err) })
+        }
+        return true
+      }
+
+      if (url.pathname === '/api/git/stage' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        const body = await readJsonBody(req)
+        const machine = resolveConnectedMachineId(body?.machineId ?? null)
+        if (!machine.machineId) {
+          json(res, machine.status, { error: machine.error })
+          return true
+        }
+        const cwd = body?.cwd
+        const paths = body?.paths
+        if (!cwd || typeof cwd !== 'string') {
+          json(res, 400, { error: 'cwd is required' })
+          return true
+        }
+        if (!Array.isArray(paths) || !paths.length) {
+          json(res, 400, { error: 'paths are required' })
+          return true
+        }
+        try {
+          const out = await gitStageOnRunner({ machineId: machine.machineId, cwd, paths })
+          json(res, 200, out)
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          json(res, code, { error: String(err?.message ?? err) })
+        }
+        return true
+      }
+
+      if (url.pathname === '/api/git/unstage' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        const body = await readJsonBody(req)
+        const machine = resolveConnectedMachineId(body?.machineId ?? null)
+        if (!machine.machineId) {
+          json(res, machine.status, { error: machine.error })
+          return true
+        }
+        const cwd = body?.cwd
+        const paths = body?.paths
+        if (!cwd || typeof cwd !== 'string') {
+          json(res, 400, { error: 'cwd is required' })
+          return true
+        }
+        if (!Array.isArray(paths) || !paths.length) {
+          json(res, 400, { error: 'paths are required' })
+          return true
+        }
+        try {
+          const out = await gitUnstageOnRunner({ machineId: machine.machineId, cwd, paths })
+          json(res, 200, out)
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          json(res, code, { error: String(err?.message ?? err) })
+        }
+        return true
+      }
+
+      if (url.pathname === '/api/git/branch/switch' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        const body = await readJsonBody(req)
+        const machine = resolveConnectedMachineId(body?.machineId ?? null)
+        if (!machine.machineId) {
+          json(res, machine.status, { error: machine.error })
+          return true
+        }
+        const cwd = body?.cwd
+        const branch = body?.branch
+        if (!cwd || typeof cwd !== 'string') {
+          json(res, 400, { error: 'cwd is required' })
+          return true
+        }
+        if (!branch || typeof branch !== 'string') {
+          json(res, 400, { error: 'branch is required' })
+          return true
+        }
+        try {
+          const out = await gitSwitchBranchOnRunner({ machineId: machine.machineId, cwd, branch })
+          json(res, 200, out)
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          json(res, code, { error: String(err?.message ?? err) })
+        }
+        return true
+      }
+
+      if (url.pathname === '/api/git/branch/create' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        const body = await readJsonBody(req)
+        const machine = resolveConnectedMachineId(body?.machineId ?? null)
+        if (!machine.machineId) {
+          json(res, machine.status, { error: machine.error })
+          return true
+        }
+        const cwd = body?.cwd
+        const branch = body?.branch
+        if (!cwd || typeof cwd !== 'string') {
+          json(res, 400, { error: 'cwd is required' })
+          return true
+        }
+        if (!branch || typeof branch !== 'string') {
+          json(res, 400, { error: 'branch is required' })
+          return true
+        }
+        try {
+          const out = await gitCreateBranchOnRunner({ machineId: machine.machineId, cwd, branch })
           json(res, 200, out)
         } catch (err) {
           const code = Number(err?.statusCode) || 500
@@ -490,7 +665,11 @@ export function createHostMachineApi({
         const ok = runnerWs.sendToMachine(machineId, makeEnvelope({
           type: 'ide.start',
           scope: { machineId },
-          payload: { ideId, cwd }
+          payload: {
+            ideId,
+            cwd,
+            trustedOrigins: deriveTrustedOrigins(req)
+          }
         }))
         if (!ok) {
           clearPendingIdeStart(ideId)
@@ -505,7 +684,7 @@ export function createHostMachineApi({
           return true
         }
 
-        json(res, 200, { ideId, urlPath: `/vscode/${ideId}/` })
+        json(res, 200, { ideId, urlPath: buildIdeUrlPath(ideId, cwd) })
         return true
       }
 

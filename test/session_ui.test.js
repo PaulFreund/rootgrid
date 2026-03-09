@@ -29,7 +29,7 @@ test('createSessionStoreState returns fresh mutable containers', () => {
 })
 
 test('session UI helpers derive labels and indicator state', () => {
-  const machineNames = new Map([['machine-1', { machineName: 'runner-a' }]])
+  const machineNames = new Map([['machine-1', { machineName: 'runner-a', machineAlias: 'Desk' }]])
   const session = {
     sessionId: 'session-12345678',
     machineId: 'machine-1',
@@ -45,8 +45,8 @@ test('session UI helpers derive labels and indicator state', () => {
   assert.equal(sessionProject(session), 'project')
   assert.equal(sessionListTitle(session), 'project')
   assert.equal(sessionInitial(session), 'P')
-  assert.equal(sessionHostName(session, machineNames), 'runner-a')
-  assert.equal(sessionTooltip(session, machineNames), 'project — project · runner-a · running')
+  assert.equal(sessionHostName(session, machineNames), 'Desk')
+  assert.equal(sessionTooltip(session, machineNames), 'project — project · Desk · running')
   assert.equal(sessionIndicator(session), 'blue')
 })
 

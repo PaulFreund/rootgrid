@@ -1135,12 +1135,14 @@ test('IDE session routes start and stop a runner-backed IDE session', async (t) 
   })
   assert.equal(started.res.status, 200)
   assert.ok(started.data?.ideId)
-  assert.equal(started.data?.urlPath, `/vscode/${started.data.ideId}/`)
+  assert.equal(started.data?.urlPath, `/vscode/${started.data.ideId}/?folder=${encodeURIComponent(process.cwd())}`)
 
   const startMsg = await waitFor(() => {
     return ideMessages.find((msg) => msg?.type === 'ide.start' && msg?.payload?.ideId === started.data.ideId) ?? null
   }, { timeoutMs: 5_000, intervalMs: 50 })
   assert.equal(startMsg.payload.cwd, process.cwd())
+  assert.ok(Array.isArray(startMsg.payload.trustedOrigins))
+  assert.ok(startMsg.payload.trustedOrigins.includes(`127.0.0.1:${port}`))
 
   const stopped = await apiJson({
     port,

@@ -4,8 +4,16 @@ import { Archive, ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, ChevronDown, Chev
 
 import MarkdownView from './components/MarkdownView.vue'
 import ComposerPillSelect from './components/ComposerPillSelect.vue'
+import WorkspaceFolderTreeNode from './components/WorkspaceFolderTreeNode.vue'
 import WorkspaceFilesPane from './components/WorkspaceFilesPane.vue'
+import WorkspaceGitPane from './components/WorkspaceGitPane.vue'
 import WorkspaceTerminalPane from './components/WorkspaceTerminalPane.vue'
+import {
+  DEFAULT_WORKSPACE_CHAT_WIDTH,
+  clampWorkspaceChatWidth,
+  persistWorkspaceChatWidth,
+  readStoredWorkspaceChatWidth
+} from './lib/workspacePaneResize.js'
 import {
   buildContextUsageSummary,
   buildRecentWorkspaces,
@@ -13,6 +21,7 @@ import {
   formatCompactInt,
   finalizeCompletedPlan,
   indicatorDotClass,
+  machineDisplayName as machineDisplayNameAt,
   machineIsOnline as machineIsOnlineAt,
   machineHasUnknownVersion as machineHasUnknownVersionAt,
   machineHasVersionMismatch as machineHasVersionMismatchAt,
@@ -159,6 +168,7 @@ let onlineHandler = null
 let offlineHandler = null
 
 const layoutShellEl = ref(null)
+const workspaceSplitEl = ref(null)
 const machines = ref([])
 const sessions = ref([])
 const machineRowsById = reactive(new Map())
@@ -171,6 +181,8 @@ const sessionListScrollTop = ref(0)
 const sessionListViewportHeight = ref(720)
 const sessionSidebarWidth = ref(DEFAULT_SESSION_SIDEBAR_WIDTH)
 const sessionSidebarDragging = ref(false)
+const workspaceChatWidth = ref(DEFAULT_WORKSPACE_CHAT_WIDTH)
+const workspaceSplitDragging = ref(false)
 const isMobileLayout = ref(false)
 const mobilePane = ref('list')
 const sessionListGroupingMode = ref(readSessionListGroupingMode())
@@ -178,6 +190,7 @@ const sessionListLoading = ref(false)
 const sessionListHasMore = ref(false)
 const sessionListNextBeforeUpdatedMs = ref(null)
 const sessionListNextBeforeSessionId = ref(null)
+const NEW_THREAD_ROOT_PATH = '/'
 
 const visibleSessions = computed(() => sessions.value.filter((s) => !s?.archivedMs))
 
@@ -252,8 +265,11 @@ const newThreadBrowseParent = ref(null)
 const newThreadBrowseEntries = ref([]) // [{ name, path, kind }]
 const newThreadBrowseLoading = ref(false)
 const newThreadBrowseError = ref('')
+const newThreadTreeDirectoryEntries = reactive(new Map())
+const newThreadTreeExpandedDirs = reactive(new Set())
+const newThreadTreeLoadingDirs = reactive(new Set())
 
-const settingsTab = ref('defaults') // defaults|machines|threads|system
+const settingsTab = ref('machines') // machines|threads|system
 const forceEmptyHomeScreen = ref(false)
 
 const machinesForSelect = computed(() => {
@@ -301,6 +317,10 @@ const runnerInstallUrl = ref('')
 const runnerInstallExpiresAtMs = ref(null)
 const runnerInstallLoading = ref(false)
 const runnerInstallError = ref('')
+const runnerInstallStatusText = ref('')
+const machineAliasDrafts = reactive({})
+const machineAliasSavingId = ref(null)
+const machineAliasError = ref('')
 const retentionDraft = ref('')
 const sseToastsDraft = ref('if-not-visible') // always|never|if-not-visible
 const webPushDraft = ref('if-not-visible') // always|never|if-not-visible
@@ -341,6 +361,9 @@ const workspaceFileError = ref('')
 const workspaceGitStatus = ref(null)
 const workspaceGitLoading = ref(false)
 const workspaceGitError = ref('')
+const workspaceGitActionWorking = ref(false)
+const workspaceGitBranchWorking = ref(false)
+const workspaceGitBranchDraft = ref('')
 const workspaceTerminalError = ref('')
 const workspaceTerminalSession = ref(null)
 const workspaceTerminalStarting = ref(false)
@@ -398,6 +421,8 @@ let swMessageHandler = null
 let windowResizeHandler = null
 let sidebarDragMoveHandler = null
 let sidebarDragUpHandler = null
+let workspaceDragMoveHandler = null
+let workspaceDragUpHandler = null
 let sessionListResizeObserver = null
 let sessionMenuOutsideHandler = null
 
@@ -409,8 +434,16 @@ function upsertSessionRow(value) {
   upsertSessionRowInList(sessions.value, value, sessionRowsById)
 }
 
+function syncMachineAliasDraft(machine, { force = false } = {}) {
+  const machineId = String(machine?.machineId ?? '').trim()
+  if (!machineId) return
+  if (!force && machineAliasDrafts[machineId] !== undefined) return
+  machineAliasDrafts[machineId] = String(machine?.machineAlias ?? '')
+}
+
 function upsertMachineRow(value) {
   upsertMachineRowInList(machines.value, value, machineRowsById)
+  syncMachineAliasDraft(value)
 }
 
 function replaceAllSessionRows(rows) {
@@ -423,6 +456,16 @@ function appendOlderSessionRows(rows) {
 
 function replaceAllMachineRows(rows) {
   replaceMachineRows(machines.value, machineRowsById, rows)
+  const keepIds = new Set()
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const machineId = String(row?.machineId ?? '').trim()
+    if (!machineId) continue
+    keepIds.add(machineId)
+    syncMachineAliasDraft(row)
+  }
+  for (const machineId of Object.keys(machineAliasDrafts)) {
+    if (!keepIds.has(machineId)) delete machineAliasDrafts[machineId]
+  }
 }
 
 function removeSessionRow(sessionId) {
@@ -515,14 +558,29 @@ function readSessionSidebarWidth() {
   return readStoredSessionSidebarWidth(globalThis.localStorage, viewportWidth)
 }
 
+function readWorkspaceChatPaneWidth() {
+  const viewportWidth = Number(workspaceSplitEl.value?.clientWidth ?? layoutShellEl.value?.clientWidth ?? window.innerWidth ?? 0)
+  return readStoredWorkspaceChatWidth(globalThis.localStorage, viewportWidth)
+}
+
 function applySessionSidebarWidth(value) {
   const viewportWidth = Number(layoutShellEl.value?.clientWidth ?? window.innerWidth ?? 0)
   sessionSidebarWidth.value = clampSessionSidebarWidth(value, viewportWidth)
   return sessionSidebarWidth.value
 }
 
+function applyWorkspaceChatPaneWidth(value) {
+  const viewportWidth = Number(workspaceSplitEl.value?.clientWidth ?? layoutShellEl.value?.clientWidth ?? window.innerWidth ?? 0)
+  workspaceChatWidth.value = clampWorkspaceChatWidth(value, viewportWidth)
+  return workspaceChatWidth.value
+}
+
 function persistSidebarWidth() {
   persistSessionSidebarWidth(sessionSidebarWidth.value)
+}
+
+function persistWorkspaceWidth() {
+  persistWorkspaceChatWidth(workspaceChatWidth.value)
 }
 
 function refreshMobileLayout() {
@@ -545,11 +603,33 @@ function stopSessionSidebarDrag() {
   persistSidebarWidth()
 }
 
+function stopWorkspacePaneDrag() {
+  workspaceSplitDragging.value = false
+  if (workspaceDragMoveHandler) {
+    try { window.removeEventListener('pointermove', workspaceDragMoveHandler) } catch {}
+    workspaceDragMoveHandler = null
+  }
+  if (workspaceDragUpHandler) {
+    try { window.removeEventListener('pointerup', workspaceDragUpHandler) } catch {}
+    try { window.removeEventListener('pointercancel', workspaceDragUpHandler) } catch {}
+    workspaceDragUpHandler = null
+  }
+  try { document.body.classList.remove('rootgrid-col-resize-active') } catch {}
+  persistWorkspaceWidth()
+}
+
 function updateSessionSidebarWidthFromClientX(clientX) {
   const rect = layoutShellEl.value?.getBoundingClientRect?.()
   const left = Number(rect?.left ?? 0)
   const width = clientX - left
   applySessionSidebarWidth(width)
+}
+
+function updateWorkspacePaneWidthFromClientX(clientX) {
+  const rect = workspaceSplitEl.value?.getBoundingClientRect?.()
+  const left = Number(rect?.left ?? 0)
+  const width = clientX - left
+  applyWorkspaceChatPaneWidth(width)
 }
 
 function beginSessionSidebarDrag(ev) {
@@ -570,6 +650,29 @@ function beginSessionSidebarDrag(ev) {
 
   sidebarDragMoveHandler = onMove
   sidebarDragUpHandler = onUp
+  try { window.addEventListener('pointermove', onMove) } catch {}
+  try { window.addEventListener('pointerup', onUp, { once: true }) } catch {}
+  try { window.addEventListener('pointercancel', onUp, { once: true }) } catch {}
+}
+
+function beginWorkspacePaneDrag(ev) {
+  if (isMobileLayout.value || !showWorkspacePane.value) return
+  const clientX = Number(ev?.clientX)
+  if (!Number.isFinite(clientX)) return
+  stopWorkspacePaneDrag()
+  workspaceSplitDragging.value = true
+  try { document.body.classList.add('rootgrid-col-resize-active') } catch {}
+  updateWorkspacePaneWidthFromClientX(clientX)
+
+  const onMove = (moveEv) => {
+    updateWorkspacePaneWidthFromClientX(Number(moveEv?.clientX))
+  }
+  const onUp = () => {
+    stopWorkspacePaneDrag()
+  }
+
+  workspaceDragMoveHandler = onMove
+  workspaceDragUpHandler = onUp
   try { window.addEventListener('pointermove', onMove) } catch {}
   try { window.addEventListener('pointerup', onUp, { once: true }) } catch {}
   try { window.addEventListener('pointercancel', onUp, { once: true }) } catch {}
@@ -660,13 +763,14 @@ const {
   defaultsOpen
 })
 
-function openSettings(tab = 'defaults') {
+function openSettings(tab = 'machines') {
+  const nextTab = tab === 'defaults' ? 'machines' : tab
   forceEmptyHomeScreen.value = false
   suppressAutoNewThreadScreen.value = true
   newThreadOpen.value = false
   workspacePaneOpen.value = false
-  openSettingsBase(tab)
-  if (tab === 'threads') {
+  openSettingsBase(nextTab)
+  if (nextTab === 'threads') {
     loadArchivedSessions().catch(() => {})
   }
   if (isMobileLayout.value) mobilePane.value = 'session'
@@ -702,6 +806,10 @@ function maybeUpdateTokenUsage(sessionId, payload) {
 
 function machineIsOnline(m) {
   return machineIsOnlineAt(nowMs.value, m)
+}
+
+function machineDisplayName(m) {
+  return machineDisplayNameAt(m)
 }
 
 function machineShowLastSeen(m) {
@@ -1229,14 +1337,6 @@ watch(selectedSessionId, async (sid, prevSid) => {
   scheduleMarkRead(sid)
 })
 
-watch(settingsTab, (t) => {
-  if (!defaultsOpen.value) return
-  if (t === 'system') refreshPushSubscription().catch(() => {})
-  if (t === 'machines' && (!runnerInstallCommand.value || Number(runnerInstallExpiresAtMs.value ?? 0) <= nowMs.value)) {
-    loadRunnerInstallBootstrap().catch(() => {})
-  }
-})
-
 watch(
   () => [String(selectedSessionId.value ?? ''), selectedQueuedPrompts.value.map((queued) => String(queued?.promptId ?? queued?.id ?? '')).join(',')],
   ([sid, promptIds]) => {
@@ -1256,13 +1356,11 @@ watch(
 
 watch(defaultsOpen, (open) => {
   if (!open) return
-  if (settingsTab.value === 'system') refreshPushSubscription().catch(() => {})
-  if (settingsTab.value === 'machines' && (!runnerInstallCommand.value || Number(runnerInstallExpiresAtMs.value ?? 0) <= nowMs.value)) {
+  refreshPushSubscription().catch(() => {})
+  if (!runnerInstallCommand.value || Number(runnerInstallExpiresAtMs.value ?? 0) <= nowMs.value) {
     loadRunnerInstallBootstrap().catch(() => {})
   }
-  if (settingsTab.value === 'threads') {
-    loadArchivedSessions().catch(() => {})
-  }
+  loadArchivedSessions().catch(() => {})
 })
 
 watch(selectedSessionId, (sid, prevSid) => {
@@ -1312,6 +1410,10 @@ const sessionSidebarStyle = computed(() => {
   if (isMobileLayout.value) return null
   return { width: `${sessionSidebarWidth.value}px` }
 })
+const workspaceMainStyle = computed(() => {
+  if (isMobileLayout.value || !showWorkspacePane.value) return null
+  return { width: `${workspaceChatWidth.value}px` }
+})
 const composerMachineLabel = computed(() => {
   if (selectedSession.value) {
     const host = sessionHostName(selectedSession.value) || 'Local'
@@ -1319,7 +1421,7 @@ const composerMachineLabel = computed(() => {
     return project ? `${host} / ${project}` : host
   }
   const machine = defaultsSelectedMachine.value
-  return String(machine?.machineName ?? '').trim() || 'Local'
+  return machineDisplayName(machine) || 'Local'
 })
 const composerMachine = computed(() => {
   if (selectedSession.value) {
@@ -1543,6 +1645,9 @@ async function loadRunnerInstallBootstrap({ force = false } = {}) {
 
   runnerInstallLoading.value = true
   runnerInstallError.value = ''
+  runnerInstallStatusText.value = runnerInstallCommand.value
+    ? 'Refreshing install command…'
+    : 'Preparing runner bundle…'
   try {
     const res = await apiFetch('/api/install/runner-bootstrap', {
       method: 'POST',
@@ -1562,11 +1667,13 @@ async function loadRunnerInstallBootstrap({ force = false } = {}) {
       runnerInstallError.value = 'Install bootstrap did not return a command.'
       return false
     }
+    runnerInstallStatusText.value = ''
     return true
   } catch (err) {
     runnerInstallError.value = String(err?.message ?? err)
     return false
   } finally {
+    if (runnerInstallError.value) runnerInstallStatusText.value = ''
     runnerInstallLoading.value = false
   }
 }
@@ -1587,6 +1694,39 @@ async function copyRunnerInstallUrl() {
   }
   await copyText(runnerInstallUrl.value)
   return true
+}
+
+async function saveMachineAlias(machineId) {
+  const mid = String(machineId ?? '').trim()
+  if (!mid) return false
+  const machine = machineRowsById.get(mid) ?? null
+  if (!machine) return false
+  const alias = String(machineAliasDrafts[mid] ?? '').trim()
+  const currentAlias = String(machine?.machineAlias ?? '').trim()
+  if (alias === currentAlias) return true
+
+  machineAliasSavingId.value = mid
+  machineAliasError.value = ''
+  try {
+    const res = await apiFetch(`/api/machines/${encodeURIComponent(mid)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ alias })
+    })
+    const data = await res.json().catch(() => null)
+    if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+    if (data?.machine) {
+      upsertMachineRow(data.machine)
+      machineAliasDrafts[mid] = String(data.machine?.machineAlias ?? '')
+    } else {
+      machineAliasDrafts[mid] = alias
+    }
+    return true
+  } catch (err) {
+    machineAliasError.value = String(err?.message ?? err)
+    return false
+  } finally {
+    machineAliasSavingId.value = null
+  }
 }
 
 async function steerQueuedPrompt(promptId) {
@@ -1710,7 +1850,7 @@ const {
 const {
   openNewThreadDialog: openNewThreadDialogBase,
   closeNewThreadDialog: closeNewThreadDialogBase,
-  loadNewThreadBrowse,
+  loadNewThreadBrowse: loadNewThreadBrowseBase,
   openNewThreadBrowse,
   selectNewThreadBrowseFolder,
   confirmNewThreadDialog,
@@ -1738,12 +1878,133 @@ const {
   selectedSessionId
 })
 
+function normalizeDirectoryPath(path) {
+  const text = String(path ?? '').trim()
+  if (!text) return ''
+  if (text === '/') return '/'
+  return text.replace(/\/+$/, '') || '/'
+}
+
+function parentDirectoryPath(path) {
+  const normalized = normalizeDirectoryPath(path)
+  if (!normalized || normalized === '/') return ''
+  const idx = normalized.lastIndexOf('/')
+  if (idx <= 0) return '/'
+  return normalized.slice(0, idx) || '/'
+}
+
+function buildAncestorDirectories(path) {
+  const normalized = normalizeDirectoryPath(path)
+  if (!normalized || normalized === '/') return []
+  const parts = normalized.split('/').filter(Boolean)
+  const out = []
+  let current = ''
+  for (let i = 0; i < Math.max(0, parts.length - 1); i += 1) {
+    current += `/${parts[i]}`
+    out.push(current)
+  }
+  return out
+}
+
+function syncNewThreadTreeRoot() {
+  const rootPath = String(newThreadBrowsePath.value ?? '').trim()
+  newThreadTreeDirectoryEntries.clear()
+  newThreadTreeExpandedDirs.clear()
+  newThreadTreeLoadingDirs.clear()
+  if (!rootPath) return
+  newThreadTreeDirectoryEntries.set(rootPath, Array.isArray(newThreadBrowseEntries.value) ? newThreadBrowseEntries.value : [])
+  newThreadTreeExpandedDirs.add(rootPath)
+}
+
+async function loadNewThreadBrowse(path) {
+  await loadNewThreadBrowseBase(path)
+  syncNewThreadTreeRoot()
+}
+
+async function ensureNewThreadTreeDirLoaded(path) {
+  const machineId = String(newThreadMachineId.value ?? '').trim()
+  const targetPath = normalizeDirectoryPath(path)
+  if (!machineId || !targetPath || newThreadTreeDirectoryEntries.has(targetPath) || newThreadTreeLoadingDirs.has(targetPath)) return
+  newThreadTreeLoadingDirs.add(targetPath)
+  try {
+    newThreadBrowseError.value = ''
+    const res = await apiFetch(`/api/fs/list?machineId=${encodeURIComponent(machineId)}&path=${encodeURIComponent(targetPath)}`)
+    const data = await res.json().catch(() => null)
+    if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+    newThreadTreeDirectoryEntries.set(targetPath, Array.isArray(data?.entries) ? data.entries : [])
+  } catch (err) {
+    newThreadBrowseError.value = String(err?.message ?? err)
+  } finally {
+    newThreadTreeLoadingDirs.delete(targetPath)
+  }
+}
+
+async function toggleNewThreadTreeDir(path) {
+  const targetPath = normalizeDirectoryPath(path)
+  if (!targetPath) return
+  if (newThreadTreeExpandedDirs.has(targetPath)) {
+    newThreadTreeExpandedDirs.delete(targetPath)
+    return
+  }
+  newThreadTreeExpandedDirs.add(targetPath)
+  await ensureNewThreadTreeDirLoaded(targetPath)
+}
+
+function scrollNewThreadFolderIntoView(path) {
+  const targetPath = normalizeDirectoryPath(path)
+  if (!targetPath) return
+  nextTick(() => {
+    const escape = (globalThis.CSS && typeof globalThis.CSS.escape === 'function')
+      ? globalThis.CSS.escape
+      : (value) => String(value).replace(/["\\]/g, '\\$&')
+    const el = document.querySelector(`[data-folder-path="${escape(targetPath)}"]`)
+    if (el && typeof el.scrollIntoView === 'function') {
+      el.scrollIntoView({ block: 'nearest' })
+    }
+  })
+}
+
+async function focusNewThreadFolder(path) {
+  const targetPath = normalizeDirectoryPath(path)
+  if (!targetPath) {
+    newThreadCwd.value = ''
+    await loadNewThreadBrowse(NEW_THREAD_ROOT_PATH)
+    return
+  }
+  await loadNewThreadBrowse(NEW_THREAD_ROOT_PATH)
+  for (const dirPath of buildAncestorDirectories(targetPath)) {
+    newThreadTreeExpandedDirs.add(dirPath)
+    await ensureNewThreadTreeDirLoaded(dirPath)
+  }
+  newThreadCwd.value = targetPath
+  scrollNewThreadFolderIntoView(targetPath)
+}
+
+async function selectNewThreadFolder(path) {
+  const targetPath = normalizeDirectoryPath(path)
+  if (!targetPath) return
+  newThreadCwd.value = targetPath
+  newThreadTreeExpandedDirs.add(targetPath)
+  await ensureNewThreadTreeDirLoaded(targetPath)
+  scrollNewThreadFolderIntoView(targetPath)
+}
+
+function useRecentWorkspaceForNewThread(path) {
+  focusNewThreadFolder(path).catch(() => {})
+}
+
 function openNewThreadDialog() {
   forceEmptyHomeScreen.value = false
   suppressAutoNewThreadScreen.value = false
   defaultsOpen.value = false
   workspacePaneOpen.value = false
   openNewThreadDialogBase()
+  syncNewThreadTreeRoot()
+  if (String(newThreadCwd.value ?? '').trim()) {
+    focusNewThreadFolder(newThreadCwd.value).catch(() => {})
+  } else {
+    loadNewThreadBrowse(NEW_THREAD_ROOT_PATH).catch(() => {})
+  }
   if (isMobileLayout.value) mobilePane.value = 'session'
 }
 
@@ -1751,6 +2012,9 @@ function closeNewThreadDialog() {
   suppressAutoNewThreadScreen.value = true
   if (!String(selectedSessionId.value ?? '').trim()) forceEmptyHomeScreen.value = true
   closeNewThreadDialogBase()
+  newThreadTreeDirectoryEntries.clear()
+  newThreadTreeExpandedDirs.clear()
+  newThreadTreeLoadingDirs.clear()
   if (isMobileLayout.value) showMobileSessionList()
 }
 
@@ -1765,8 +2029,7 @@ function showInitialNewThreadIfNeeded() {
     forceEmptyHomeScreen: forceEmptyHomeScreen.value
   })) return
   if (newThreadOpen.value || defaultsOpen.value) return
-  openNewThreadDialogBase()
-  if (isMobileLayout.value) mobilePane.value = 'session'
+  openNewThreadDialog()
 }
 
 onLoginConnect = () => {
@@ -1785,13 +2048,30 @@ watch(
   (mode) => {
     if (mode !== 'new-thread') return
     if (newThreadOpen.value) return
-    openNewThreadDialogBase()
-    if (isMobileLayout.value) mobilePane.value = 'session'
+    openNewThreadDialog()
   },
   { immediate: true, flush: 'post' }
 )
 
-watch(newThreadMachineId, onNewThreadMachineChanged)
+watch(newThreadMachineId, () => {
+  onNewThreadMachineChanged()
+  if (!String(newThreadMachineId.value ?? '').trim()) {
+    newThreadBrowsePath.value = ''
+    newThreadBrowseParent.value = null
+    newThreadBrowseEntries.value = []
+    newThreadBrowseError.value = ''
+    newThreadTreeDirectoryEntries.clear()
+    newThreadTreeExpandedDirs.clear()
+    newThreadTreeLoadingDirs.clear()
+    return
+  }
+  const targetPath = String(newThreadCwd.value ?? '').trim()
+  if (targetPath) {
+    focusNewThreadFolder(targetPath).catch(() => {})
+    return
+  }
+  loadNewThreadBrowse(NEW_THREAD_ROOT_PATH).catch(() => {})
+})
 
 function updateSessionListMetrics() {
   const el = sessionListScrollEl.value
@@ -1976,7 +2256,7 @@ function resolveWorkspaceContext() {
   const cwd = String(ctx?.cwd ?? '').trim()
   if (!cwd) {
     ideError.value = 'Workspace (cwd) is required.'
-    openSettings('defaults')
+    openSettings('machines')
     return null
   }
   return {
@@ -2114,6 +2394,72 @@ async function refreshWorkspaceGit() {
   } finally {
     workspaceGitLoading.value = false
   }
+}
+
+async function runWorkspaceGitMutation(pathname, body, { branch = false } = {}) {
+  const workingRef = branch ? workspaceGitBranchWorking : workspaceGitActionWorking
+  if (workingRef.value) return false
+  workingRef.value = true
+  workspaceGitError.value = ''
+  try {
+    const res = await apiFetch(pathname, {
+      method: 'POST',
+      body: JSON.stringify(body)
+    })
+    const data = await res.json().catch(() => null)
+    if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+    await refreshWorkspaceGit()
+    return true
+  } catch (err) {
+    workspaceGitError.value = String(err?.message ?? err)
+    return false
+  } finally {
+    workingRef.value = false
+  }
+}
+
+async function stageWorkspaceGitPaths(paths) {
+  const ctx = resolveWorkspaceContext()
+  if (!ctx) return false
+  return await runWorkspaceGitMutation('/api/git/stage', {
+    machineId: ctx.machineId,
+    cwd: ctx.cwd,
+    paths
+  })
+}
+
+async function unstageWorkspaceGitPaths(paths) {
+  const ctx = resolveWorkspaceContext()
+  if (!ctx) return false
+  return await runWorkspaceGitMutation('/api/git/unstage', {
+    machineId: ctx.machineId,
+    cwd: ctx.cwd,
+    paths
+  })
+}
+
+async function switchWorkspaceGitBranch(branchName) {
+  const ctx = resolveWorkspaceContext()
+  const branch = String(branchName ?? '').trim()
+  if (!ctx || !branch) return false
+  return await runWorkspaceGitMutation('/api/git/branch/switch', {
+    machineId: ctx.machineId,
+    cwd: ctx.cwd,
+    branch
+  }, { branch: true })
+}
+
+async function createWorkspaceGitBranch() {
+  const ctx = resolveWorkspaceContext()
+  const branch = String(workspaceGitBranchDraft.value ?? '').trim()
+  if (!ctx || !branch) return false
+  const ok = await runWorkspaceGitMutation('/api/git/branch/create', {
+    machineId: ctx.machineId,
+    cwd: ctx.cwd,
+    branch
+  }, { branch: true })
+  if (ok) workspaceGitBranchDraft.value = ''
+  return ok
 }
 
 function openGitFile(entry) {
@@ -2303,6 +2649,13 @@ async function openWorkspaceTool(tab) {
   await openWorkspace()
 }
 
+function workspaceToolButtonClass(tab) {
+  const active = showWorkspacePane.value && workspacePaneTab.value === tab
+  return active
+    ? 'border-black bg-black text-white hover:bg-black'
+    : 'border-black/[0.06] bg-white text-slate-700 hover:bg-black/[0.03]'
+}
+
 async function openWorkspace() {
   ideError.value = ''
   activateWorkspacePane('code')
@@ -2412,6 +2765,7 @@ onMounted(async () => {
   workspacePaneOpen.value = false
   refreshMobileLayout()
   sessionSidebarWidth.value = readSessionSidebarWidth()
+  workspaceChatWidth.value = readWorkspaceChatPaneWidth()
 
   watch(defaults, () => {
     try {
@@ -2439,6 +2793,7 @@ onMounted(async () => {
   const onResize = () => {
     refreshMobileLayout()
     applySessionSidebarWidth(sessionSidebarWidth.value)
+    applyWorkspaceChatPaneWidth(workspaceChatWidth.value)
     updateSessionListMetrics()
   }
   windowResizeHandler = onResize
@@ -2451,6 +2806,7 @@ onMounted(async () => {
       composerMachinePopoverOpen.value = false
       composerMachinePopoverHover.value = false
       if (sessionSidebarDragging.value) stopSessionSidebarDrag()
+      else if (workspaceSplitDragging.value) stopWorkspacePaneDrag()
       else if (workspacePaneOpen.value) closeWorkspacePane()
       if (sessionMenuId.value) closeSessionMenu()
       else if (renameOpen.value) renameOpen.value = false
@@ -2523,6 +2879,7 @@ onBeforeUnmount(() => {
   clearComposerAttachments()
   disposeSse()
   stopSessionSidebarDrag()
+  stopWorkspacePaneDrag()
   if (workspaceTerminalInputFlushTimer) {
     try { clearTimeout(workspaceTerminalInputFlushTimer) } catch {}
     workspaceTerminalInputFlushTimer = null
@@ -2814,13 +3171,13 @@ watch(
           </div>
 
           <div class="shrink-0 p-2">
-            <button
-              class="w-full inline-flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-              @click="openSettings('defaults')"
-            >
-              <Settings class="h-3.5 w-3.5" />
-              Settings
-            </button>
+              <button
+                class="w-full inline-flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                @click="openSettings('machines')"
+              >
+                <Settings class="h-3.5 w-3.5" />
+                Settings
+              </button>
           </div>
         </aside>
 
@@ -2838,6 +3195,7 @@ watch(
 
       <!-- Main -->
       <div
+        ref="workspaceSplitEl"
         class="flex min-h-0 bg-white"
         :class="isMobileLayout ? 'min-h-0 h-full w-1/2 min-w-0 shrink-0 basis-1/2 overflow-hidden p-0' : 'flex-1 gap-1.5 p-1.5'"
       >
@@ -2845,7 +3203,8 @@ watch(
         class="min-h-0"
         :class="isMobileLayout
           ? 'h-full w-full min-w-0 max-w-full flex-1 overflow-hidden'
-          : (showWorkspacePane ? 'min-w-0 basis-[44%] shrink-0 grow-0' : 'min-w-0 flex-1')"
+          : (showWorkspacePane ? 'min-w-0 shrink-0 grow-0' : 'min-w-0 flex-1')"
+        :style="workspaceMainStyle"
       >
         <section
           v-if="!(isMobileLayout && mobilePane === 'workspace')"
@@ -2879,7 +3238,8 @@ watch(
 
               <div class="flex shrink-0 items-center gap-1.5">
                 <button
-                  class="inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white px-2.5 py-1 text-[11px] text-slate-700 transition-colors hover:bg-black/[0.03] disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  :class="workspaceToolButtonClass('code')"
                   @click="openWorkspace"
                   title="Open VS Code web (code-server)"
                   :disabled="ideStarting"
@@ -2889,7 +3249,8 @@ watch(
                   Open
                 </button>
                 <button
-                  class="inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white px-2.5 py-1 text-[11px] text-slate-700 transition-colors hover:bg-black/[0.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  :class="workspaceToolButtonClass('terminal')"
                   @click="openWorkspaceTool('terminal')"
                   title="Open terminal"
                 >
@@ -2897,7 +3258,8 @@ watch(
                   <span class="hidden sm:inline">Terminal</span>
                 </button>
                 <button
-                  class="inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white px-2.5 py-1 text-[11px] text-slate-700 transition-colors hover:bg-black/[0.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  :class="workspaceToolButtonClass('files')"
                   @click="openWorkspaceTool('files')"
                   title="Open file viewer"
                 >
@@ -2905,7 +3267,8 @@ watch(
                   <span class="hidden sm:inline">Files</span>
                 </button>
                 <button
-                  class="inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white px-2.5 py-1 text-[11px] text-slate-700 transition-colors hover:bg-black/[0.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  :class="workspaceToolButtonClass('git')"
                   @click="openWorkspaceTool('git')"
                   title="Open git viewer"
                 >
@@ -2930,7 +3293,7 @@ watch(
                     {{ mainPaneMode === 'new-thread' ? 'New thread' : 'Settings' }}
                   </div>
                   <div class="mt-0.5 truncate text-[11px] text-slate-500">
-                    {{ mainPaneMode === 'new-thread' ? 'Choose a machine and workspace before starting.' : 'Defaults, machines, threads, and system settings.' }}
+                    {{ mainPaneMode === 'new-thread' ? 'Choose a machine and workspace before starting.' : 'System, machines, and archived thread settings.' }}
                   </div>
                 </div>
               </div>
@@ -3482,7 +3845,7 @@ watch(
 	          </div>
 
           <!-- Pinned plan checklist (Codex-style) -->
-          <div v-if="pinnedPlanHasUnchecked" class="shrink-0 bg-white px-6 pb-3">
+          <div v-if="mainPaneMode === 'chat' && pinnedPlanHasUnchecked" class="shrink-0 bg-white px-6 pb-3">
             <div class="mx-auto w-full max-w-[700px]">
               <div class="overflow-hidden rounded-[20px] border border-black/[0.05] bg-[#f5f5f2]">
                 <button
@@ -3908,128 +4271,130 @@ watch(
             </div>
           </footer>
 
-          <div v-else-if="mainPaneMode === 'new-thread' || mainPaneMode === 'settings'" class="min-h-0 flex-1 overflow-auto px-4 py-4 sm:px-6 sm:py-6">
-            <div :class="mainPaneMode === 'new-thread' ? 'mx-auto w-full max-w-xl' : 'mx-auto w-full max-w-3xl'">
-              <div v-if="mainPaneMode === 'new-thread'" class="space-y-4">
-                <div>
-                  <div class="text-xs uppercase tracking-wider text-slate-500">1) Machine</div>
-                  <select
-                    v-model="newThreadMachineId"
-                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-                    :disabled="!machinesForSelect.length"
-                  >
-                    <option value="" disabled>(select a machine)</option>
-                    <option v-for="m in machinesForSelect" :key="m.machineId" :value="m.machineId">
-                      {{ m.machineName }} · {{ m.platform }} · {{ machineStatusLabel(m) }} · {{ String(m.machineId).slice(0, 8) }}
-                    </option>
-                  </select>
-                  <div v-if="!machines.length" class="mt-2 text-xs text-slate-600">
+          <div
+            v-else-if="mainPaneMode === 'new-thread' || mainPaneMode === 'settings'"
+            class="min-h-0 flex-1 px-4 py-4 sm:px-6 sm:py-6"
+            :class="mainPaneMode === 'new-thread' ? 'overflow-hidden' : 'overflow-auto'"
+          >
+            <div class="mx-auto flex h-full min-h-0 w-full max-w-3xl flex-col">
+              <div v-if="mainPaneMode === 'new-thread'" class="flex min-h-0 flex-1 flex-col gap-4">
+                <section class="space-y-3">
+                  <div>
+                    <div class="text-sm font-medium text-slate-900">Machine</div>
+                    <div class="mt-1 text-xs text-slate-500">Choose where the new thread should run.</div>
+                  </div>
+
+                  <div v-if="!machinesForSelect.length" class="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
                     No machines yet.
                   </div>
-                  <div v-else-if="newThreadSelectedMachine" class="mt-2 flex items-center gap-2 text-xs" :class="newThreadSelectedMachineOnline ? 'text-emerald-700' : 'text-slate-700'">
-                    <span class="h-2.5 w-2.5 rounded-full" :class="newThreadSelectedMachineOnline ? 'bg-emerald-500' : 'bg-slate-400'" />
-                    <span>{{ machineStatusLabel(newThreadSelectedMachine) }}</span>
-                  </div>
-                </div>
 
-                <div>
-                  <div class="flex items-end justify-between gap-3">
-                    <div class="text-xs uppercase tracking-wider text-slate-500">2) Workspace</div>
+                  <div v-else class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
                     <button
-                      class="rounded-md bg-slate-100 px-3 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                      @click="openNewThreadBrowse"
-                      :disabled="!newThreadMachineId || !newThreadSelectedMachineOnline"
+                      v-for="m in machinesForSelect"
+                      :key="m.machineId"
+                      class="rounded-2xl border px-4 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 disabled:cursor-not-allowed disabled:opacity-50"
+                      :class="newThreadMachineId === m.machineId
+                        ? 'border-indigo-300 bg-indigo-50/70'
+                        : 'border-slate-200 bg-white hover:bg-slate-50'"
+                      :disabled="!machineIsOnline(m)"
+                      @click="newThreadMachineId = m.machineId"
                     >
-                      Browse…
+                      <div class="flex items-start justify-between gap-3">
+                        <div class="min-w-0">
+                          <div class="truncate text-sm font-medium text-slate-900">{{ machineDisplayName(m) }}</div>
+                          <div
+                            v-if="m.machineAlias && m.machineName && m.machineAlias !== m.machineName"
+                            class="mt-0.5 truncate text-xs text-slate-500"
+                            :title="m.machineName"
+                          >
+                            {{ m.machineName }}
+                          </div>
+                        </div>
+                        <span class="mt-1 h-2.5 w-2.5 rounded-full" :class="machineIsOnline(m) ? 'bg-emerald-500' : 'bg-slate-400'" />
+                      </div>
+                      <div class="mt-3 flex items-center justify-between gap-3 text-[11px] text-slate-500">
+                        <span class="uppercase tracking-wider">{{ m.platform }}</span>
+                        <span class="truncate">
+                          {{ machineIsOnline(m) ? 'Online' : (m.lastSeenMs ? `Last seen ${formatAgeShort(m.lastSeenMs)}` : 'Offline') }}
+                        </span>
+                      </div>
                     </button>
                   </div>
-                  <input
-                    v-model="newThreadCwd"
-                    class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-                    placeholder="/home/me/project"
-                  />
+                </section>
 
-                  <div v-if="newThreadRecentWorkspaces.length" class="mt-3">
-                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Recent projects</div>
-                    <div class="mt-2 space-y-1">
+                <section class="space-y-3">
+                  <div>
+                    <div class="text-sm font-medium text-slate-900">Recent projects</div>
+                    <div class="mt-1 text-xs text-slate-500">Pick a recent workspace or browse from the root filesystem.</div>
+                  </div>
+                  <div v-if="!newThreadRecentWorkspaces.length" class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-6 text-center text-sm text-slate-500">
+                    No recent projects for this machine yet.
+                  </div>
+                  <div v-else class="-mx-1 overflow-x-auto px-1 pb-1">
+                    <div class="flex min-w-max gap-3">
                       <button
                         v-for="p in newThreadRecentWorkspaces"
                         :key="p.cwd"
-                        class="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-left transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 active:scale-[0.99]"
-                        @click="newThreadCwd = p.cwd"
+                        class="w-64 shrink-0 rounded-2xl border px-4 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                        :class="String(newThreadCwd ?? '').trim() === p.cwd
+                          ? 'border-indigo-300 bg-indigo-50/70'
+                          : 'border-slate-200 bg-white hover:bg-slate-50'"
                         :title="p.cwd"
+                        @click="useRecentWorkspaceForNewThread(p.cwd)"
                       >
                         <div class="truncate text-sm font-medium text-slate-900">{{ p.label }}</div>
-                        <div class="mt-0.5 truncate text-xs text-slate-600">{{ p.cwd }}</div>
+                        <div class="mt-2 truncate text-xs text-slate-500">{{ p.cwd }}</div>
                       </button>
                     </div>
                   </div>
-                </div>
+                </section>
 
-                <div v-if="newThreadBrowseOpen" class="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                  <div class="flex items-center justify-between gap-3">
-                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Folder browser</div>
-                    <button
-                      class="rounded-md bg-white px-2.5 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                      @click="newThreadBrowseOpen = false"
-                    >
-                      Close
-                    </button>
-                  </div>
-
-                  <div class="mt-2 flex items-center gap-2">
-                    <button
-                      class="rounded-md bg-white px-2.5 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed"
-                      @click="newThreadBrowseParent ? loadNewThreadBrowse(newThreadBrowseParent) : null"
-                      :disabled="!newThreadBrowseParent || newThreadBrowseLoading"
-                    >
-                      Up
-                    </button>
-                    <div class="min-w-0 flex-1 truncate rounded-md bg-white px-3 py-1.5 text-xs text-slate-700 ring-1 ring-slate-200" :title="newThreadBrowsePath">
-                      {{ newThreadBrowsePath || (newThreadBrowseLoading ? 'Loading…' : '—') }}
-                    </div>
-                    <button
-                      class="rounded-md bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed"
-                      @click="selectNewThreadBrowseFolder"
-                      :disabled="!newThreadBrowsePath"
-                    >
-                      Use folder
-                    </button>
-                  </div>
-
+                <section class="flex min-h-[280px] flex-1 flex-col rounded-lg border border-slate-200 bg-slate-50/70 p-2.5 sm:min-h-[360px] sm:p-3">
                   <div v-if="newThreadBrowseError" class="mt-2 text-sm text-red-600">{{ newThreadBrowseError }}</div>
 
-                  <div class="mt-3 max-h-64 overflow-auto rounded-lg border border-slate-200 bg-white">
-                    <div v-if="newThreadBrowseLoading" class="px-3 py-4 text-sm text-slate-600">Loading…</div>
-                    <div v-else-if="!newThreadBrowseEntries.length" class="px-3 py-4 text-sm text-slate-600">No folders.</div>
-                    <button
-                      v-for="entry in newThreadBrowseEntries"
-                      v-else
-                      :key="entry.path"
-                      class="flex w-full items-center justify-between gap-3 border-b border-slate-100 px-3 py-2 text-left text-sm transition-colors last:border-b-0 hover:bg-slate-50"
-                      @click="loadNewThreadBrowse(entry.path)"
-                    >
-                      <div class="min-w-0">
-                        <div class="truncate font-medium text-slate-900">{{ entry.name }}</div>
-                        <div class="truncate text-xs text-slate-500">{{ entry.path }}</div>
+                  <div class="mt-2 flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border border-slate-200 bg-white">
+                    <div class="truncate border-b border-slate-100 px-4 py-2 text-xs text-slate-500" :title="newThreadBrowsePath">
+                      {{ newThreadBrowsePath || NEW_THREAD_ROOT_PATH }}
+                    </div>
+                    <div class="min-h-0 flex-1 overflow-auto">
+                      <div v-if="!newThreadMachineId" class="px-4 py-8 text-center text-sm text-slate-500">
+                        Select a machine first.
                       </div>
-                      <div class="shrink-0 text-xs text-slate-400">{{ entry.kind }}</div>
-                    </button>
+                      <div v-else-if="newThreadBrowseLoading && !newThreadBrowseEntries.length" class="px-4 py-8 text-center text-sm text-slate-500">
+                        Loading folders…
+                      </div>
+                      <div v-else-if="!newThreadBrowseEntries.length" class="px-4 py-8 text-center text-sm text-slate-500">
+                        No folders found.
+                      </div>
+                      <div v-else class="px-2 py-2">
+                        <WorkspaceFolderTreeNode
+                          v-for="entry in newThreadBrowseEntries"
+                          :key="entry.path"
+                          :entry="entry"
+                          :depth="0"
+                          :selected-path="newThreadCwd"
+                          :expanded-dirs="newThreadTreeExpandedDirs"
+                          :loading-dirs="newThreadTreeLoadingDirs"
+                          :directory-entries="newThreadTreeDirectoryEntries"
+                          @toggle-dir="toggleNewThreadTreeDir"
+                          @select-dir="selectNewThreadFolder"
+                        />
+                      </div>
+                    </div>
                   </div>
-                </div>
+                </section>
 
                 <div v-if="newThreadError" class="text-sm text-red-600">{{ newThreadError }}</div>
 
-                <div class="flex items-center justify-end gap-2">
+                <div class="mt-auto flex shrink-0 flex-col gap-3 border-t border-black/[0.04] bg-white px-0 py-3 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] sm:flex-row sm:items-center sm:pb-3">
+                  <div class="min-w-0 flex-1 rounded-lg bg-white px-3 py-2 ring-1 ring-slate-200">
+                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Selected folder</div>
+                    <div class="mt-1 truncate text-sm text-slate-900" :title="newThreadCwd || newThreadBrowsePath">
+                      {{ newThreadCwd || newThreadBrowsePath || 'Choose a machine to browse folders.' }}
+                    </div>
+                  </div>
                   <button
-                    class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                    @click="closeNewThreadDialog"
-                    :disabled="newThreadCreating"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    class="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
+                    class="inline-flex w-full shrink-0 items-center justify-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40 sm:w-auto"
                     @click="confirmNewThreadDialog"
                     :disabled="newThreadCreating"
                   >
@@ -4039,279 +4404,13 @@ watch(
                 </div>
               </div>
 
-              <div v-else class="space-y-4">
-                <div class="flex items-center gap-2 text-xs">
-                  <button
-                    class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                    :class="settingsTab === 'defaults' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
-                    @click="settingsTab = 'defaults'"
-                  >
-                    Defaults
-                  </button>
-                  <button
-                    class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                    :class="settingsTab === 'machines' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
-                    @click="settingsTab = 'machines'"
-                  >
-                    Machines
-                  </button>
-                  <button
-                    class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                    :class="settingsTab === 'threads' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
-                    @click="settingsTab = 'threads'; loadArchivedSessions()"
-                  >
-                    Threads
-                  </button>
-                  <button
-                    class="rounded-lg border px-3 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                    :class="settingsTab === 'system' ? 'border-slate-300 bg-slate-100 text-slate-900' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'"
-                    @click="settingsTab = 'system'"
-                  >
-                    System
-                  </button>
-                </div>
-
-                <div v-if="settingsTab === 'defaults'" class="space-y-3">
+              <div v-else class="space-y-8">
+                <section class="space-y-3">
                   <div>
-                    <div class="text-xs uppercase tracking-wider text-slate-500">Workspace (cwd)</div>
-                    <input
-                      v-model="defaults.cwd"
-                      class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-                      placeholder="/home/me/project"
-                    />
+                    <div class="text-sm font-medium text-slate-900">System</div>
+                    <div class="mt-1 text-xs text-slate-500">Notifications, retention, and browser integration.</div>
                   </div>
 
-                  <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                    <div>
-                      <div class="text-xs uppercase tracking-wider text-slate-500">Machine</div>
-                      <select
-                        v-model="defaults.machineId"
-                        class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-                      >
-                        <option value="">(auto)</option>
-                        <option v-for="m in machinesForSelect" :key="m.machineId" :value="m.machineId">
-                          {{ m.machineName }} · {{ m.platform }} · {{ machineStatusLabel(m) }} · {{ String(m.machineId).slice(0, 8) }}
-                        </option>
-                      </select>
-                      <div v-if="defaultsSelectedMachine" class="mt-2 flex items-center gap-2 text-xs" :class="machineIsOnline(defaultsSelectedMachine) ? 'text-emerald-700' : 'text-slate-700'">
-                        <span class="h-2.5 w-2.5 rounded-full" :class="machineIsOnline(defaultsSelectedMachine) ? 'bg-emerald-500' : 'bg-slate-400'" />
-                        <span>{{ machineStatusLabel(defaultsSelectedMachine) }}</span>
-                      </div>
-                    </div>
-
-                    <div>
-                      <div class="text-xs uppercase tracking-wider text-slate-500">Model</div>
-                      <input
-                        v-model="defaults.model"
-                        class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-                        placeholder="(optional)"
-                      />
-                    </div>
-                  </div>
-
-                  <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                    <div>
-                      <div class="text-xs uppercase tracking-wider text-slate-500">Approval policy</div>
-                      <select
-                        v-model="defaults.approvalPolicy"
-                        class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-                      >
-                        <option value="untrusted">untrusted</option>
-                        <option value="on-request">on-request</option>
-                        <option value="never">never</option>
-                        <option value="on-failure">on-failure</option>
-                      </select>
-                    </div>
-
-                    <div>
-                      <div class="text-xs uppercase tracking-wider text-slate-500">Sandbox</div>
-                      <select
-                        v-model="defaults.sandbox"
-                        class="mt-2 w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-                      >
-                        <option value="read-only">read-only</option>
-                        <option value="workspace-write">workspace-write</option>
-                        <option value="danger-full-access">danger-full-access</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  <div v-if="defaultsError" class="text-sm text-red-600">{{ defaultsError }}</div>
-                </div>
-
-                <div v-else-if="settingsTab === 'machines'" class="space-y-3">
-                  <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                    <div class="flex items-start justify-between gap-3">
-                      <div class="min-w-0">
-                        <div class="text-sm font-medium text-slate-900">Add machine</div>
-                        <div class="mt-1 text-xs text-slate-500">
-                          Install a runner with a one-liner. The target machine only needs
-                          <span class="font-medium text-slate-700">curl</span>,
-                          <span class="font-medium text-slate-700">node</span>, and
-                          <span class="font-medium text-slate-700">tar</span>.
-                        </div>
-                      </div>
-                      <div v-if="runnerInstallExpiryLabel" class="shrink-0 text-[11px] text-slate-500">
-                        {{ runnerInstallExpiryLabel }}
-                      </div>
-                    </div>
-
-                    <div class="mt-3 flex flex-wrap items-center gap-2">
-                      <button
-                        class="inline-flex items-center gap-2 rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                        :disabled="runnerInstallLoading"
-                        @click="loadRunnerInstallBootstrap({ force: true })"
-                      >
-                        <Loader2 v-if="runnerInstallLoading" class="h-3.5 w-3.5 animate-spin" />
-                        {{ runnerInstallCommand ? 'Regenerate command' : 'Generate command' }}
-                      </button>
-                      <button
-                        class="rounded-md bg-white px-3 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                        :disabled="!runnerInstallCommand"
-                        @click="copyRunnerInstallCommand"
-                      >
-                        Copy command
-                      </button>
-                      <button
-                        class="rounded-md bg-white px-3 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                        :disabled="!runnerInstallUrl"
-                        @click="copyRunnerInstallUrl"
-                      >
-                        Copy URL
-                      </button>
-                    </div>
-
-                    <div
-                      v-if="runnerInstallCommand"
-                      class="mt-3 overflow-x-auto rounded-xl bg-slate-950 px-3 py-3 text-[11px] text-slate-100"
-                    >
-                      <code class="font-mono break-all">{{ runnerInstallCommand }}</code>
-                    </div>
-                    <div v-if="runnerInstallUrl" class="mt-2 break-all text-[11px] text-slate-500">
-                      URL: <span class="font-mono text-slate-700">{{ runnerInstallUrl }}</span>
-                    </div>
-                    <div v-if="runnerInstallNeedsReachableUrl" class="mt-2 text-[11px] text-amber-700">
-                      This command currently points at localhost. Set <span class="font-mono">host.publicUrl</span> if the runner is being installed on another machine.
-                    </div>
-                    <div v-if="runnerInstallError" class="mt-2 text-sm text-red-600">{{ runnerInstallError }}</div>
-                  </div>
-
-                  <div v-if="!machines.length" class="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
-                    No machines connected yet.
-                  </div>
-
-                  <div v-else class="space-y-2">
-                    <div v-if="machineDisconnectError" class="text-sm text-red-600">{{ machineDisconnectError }}</div>
-                    <div v-if="machineUpgradeError" class="text-sm text-red-600">{{ machineUpgradeError }}</div>
-                    <div
-                      v-for="m in machinesForSelect"
-                      :key="m.machineId"
-                      class="rounded-xl border border-slate-200 bg-white p-3"
-                    >
-                      <div class="flex items-center justify-between gap-3">
-                        <div class="min-w-0 flex items-center gap-2">
-                          <span class="h-2.5 w-2.5 rounded-full" :class="machineIsOnline(m) ? 'bg-emerald-500' : 'bg-slate-400'" />
-                          <div class="truncate text-sm font-medium text-slate-900">{{ m.machineName }}</div>
-                          <div class="shrink-0 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-600">
-                            {{ m.platform }}
-                          </div>
-                        </div>
-                        <div class="shrink-0 flex items-center gap-2">
-                          <button
-                            v-if="machineIsOnline(m) && ((machineHasVersionMismatch(m) && machineSupportsWebUpgrade(m)) || machineHasUnknownVersion(m))"
-                            class="inline-flex items-center gap-2 rounded-md bg-indigo-50 px-2.5 py-1.5 text-xs text-indigo-700 transition-colors hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                            @click="upgradeMachine(m.machineId)"
-                            :disabled="machineUpgradeWorkingId === m.machineId || ['starting', 'updating', 'restarting'].includes(String(m.upgrade?.state ?? ''))"
-                            :title="machineHasUnknownVersion(m) ? 'Try a remote runner upgrade. If this legacy runner does not support it, update it manually.' : 'Pull, rebuild, and restart this runner using its configured upgrade commands.'"
-                          >
-                            <Loader2 v-if="machineUpgradeWorkingId === m.machineId" class="h-3.5 w-3.5 animate-spin" />
-                            {{ machineHasUnknownVersion(m) ? 'Try upgrade' : 'Upgrade' }}
-                          </button>
-                          <button
-                            v-if="machineIsOnline(m)"
-                            class="inline-flex items-center gap-2 rounded-md bg-slate-100 px-2.5 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-                            @click="disconnectMachine(m.machineId)"
-                            :disabled="machineDisconnectWorkingId === m.machineId"
-                            title="Disconnect the runner (it may reconnect if the runner process is still running)."
-                          >
-                            <Loader2 v-if="machineDisconnectWorkingId === m.machineId" class="h-3.5 w-3.5 animate-spin" />
-                            Disconnect
-                          </button>
-                          <button
-                            v-else
-                            class="inline-flex items-center gap-2 rounded-md bg-red-50 px-2.5 py-1.5 text-xs text-red-700 transition-colors hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
-                            @click="openDeleteMachineModal(m.machineId)"
-                            title="Delete this machine and all its sessions."
-                          >
-                            <Trash2 class="h-3.5 w-3.5" />
-                            Delete
-                          </button>
-                        </div>
-                      </div>
-                      <div class="mt-2 flex items-center justify-between gap-3">
-                        <div class="min-w-0 truncate text-xs font-mono text-slate-500" :title="m.machineId">{{ m.machineId }}</div>
-                        <div class="shrink-0 text-[11px]" :class="machineIsOnline(m) ? 'text-emerald-600' : 'text-slate-500'">
-                          {{ machineStatusLabel(m) }}
-                        </div>
-                      </div>
-                      <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
-                        <div>
-                          Runner:
-                          <span class="font-mono text-slate-700">{{ machineRootgridVersion(m) ?? 'unknown' }}</span>
-                        </div>
-                        <div v-if="appSettings.appVersion">
-                          Host:
-                          <span class="font-mono text-slate-700">{{ appSettings.appVersion }}</span>
-                        </div>
-                        <div v-if="machineHasVersionMismatch(m)" class="text-amber-700">
-                          Version mismatch
-                        </div>
-                        <div v-else-if="machineHasUnknownVersion(m)" class="text-red-700">
-                          Runner version unknown
-                        </div>
-                      </div>
-                      <div v-if="machineUpgradeStatusText(m)" class="mt-2 text-xs" :class="m.upgrade?.state === 'failed' ? 'text-red-600' : 'text-slate-500'">
-                        {{ machineUpgradeStatusText(m) }}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div v-else-if="settingsTab === 'threads'" class="space-y-3">
-                  <div class="text-xs text-slate-500">Archived threads are hidden from the main thread list until restored.</div>
-                  <div v-if="archiveError" class="text-sm text-red-600">{{ archiveError }}</div>
-                  <div v-if="archiveLoading" class="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
-                    Loading archived threads…
-                  </div>
-                  <div v-else-if="!archivedSessions.length" class="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
-                    No archived threads.
-                  </div>
-                  <div v-else class="space-y-2">
-                    <div
-                      v-for="s in archivedSessions"
-                      :key="s.sessionId"
-                      class="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3"
-                    >
-                      <button class="min-w-0 flex-1 text-left" @click="openSession(s.sessionId); defaultsOpen = false">
-                        <div class="truncate text-sm font-medium text-slate-900">{{ sessionListTitle(s) }}</div>
-                        <div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                          <span class="inline-flex min-w-0 max-w-full items-center rounded-full border border-black/[0.08] px-2 py-0.5 text-[10px] font-medium text-slate-500" :title="`${sessionHostName(s)} / ${sessionProject(s)}`">
-                            <span class="truncate">{{ sessionHostName(s) }} / {{ sessionProject(s) }}</span>
-                          </span>
-                          <span>{{ formatAgeShort(s.updatedMs) }}</span>
-                        </div>
-                      </button>
-                      <button
-                        class="rounded-md bg-slate-100 px-3 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200"
-                        @click="unarchiveFromArchiveModal(s.sessionId)"
-                      >
-                        Restore
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                <div v-else class="space-y-3">
                   <div>
                     <div class="text-xs uppercase tracking-wider text-slate-500">Retention (days)</div>
                     <input
@@ -4428,7 +4527,219 @@ watch(
                       Save
                     </button>
                   </div>
-                </div>
+                </section>
+
+                <section class="space-y-3">
+                  <div>
+                    <div class="text-sm font-medium text-slate-900">Machines</div>
+                    <div class="mt-1 text-xs text-slate-500">Connected runners, upgrades, and machine installation.</div>
+                  </div>
+
+                  <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                    <div class="flex items-start justify-between gap-3">
+                      <div class="min-w-0">
+                        <div class="text-sm font-medium text-slate-900">Add machine</div>
+                        <div class="mt-1 text-xs text-slate-500">
+                          Install a runner with a one-liner. The target machine only needs
+                          <span class="font-medium text-slate-700">curl</span>,
+                          <span class="font-medium text-slate-700">node</span>, and
+                          <span class="font-medium text-slate-700">tar</span>.
+                        </div>
+                      </div>
+                      <div v-if="runnerInstallExpiryLabel" class="shrink-0 text-[11px] text-slate-500">
+                        {{ runnerInstallExpiryLabel }}
+                      </div>
+                    </div>
+
+                    <div class="mt-3 flex flex-wrap items-center gap-2">
+                      <button
+                        class="inline-flex items-center gap-2 rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                        :disabled="runnerInstallLoading"
+                        @click="loadRunnerInstallBootstrap({ force: true })"
+                      >
+                        <Loader2 v-if="runnerInstallLoading" class="h-3.5 w-3.5 animate-spin" />
+                        {{ runnerInstallCommand ? 'Regenerate command' : 'Generate command' }}
+                      </button>
+                      <button
+                        class="rounded-md bg-white px-3 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                        :disabled="!runnerInstallCommand"
+                        @click="copyRunnerInstallCommand"
+                      >
+                        Copy command
+                      </button>
+                      <button
+                        class="rounded-md bg-white px-3 py-1.5 text-xs text-slate-800 ring-1 ring-slate-200 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                        :disabled="!runnerInstallUrl"
+                        @click="copyRunnerInstallUrl"
+                      >
+                        Copy URL
+                      </button>
+                    </div>
+
+                    <div
+                      v-if="runnerInstallCommand"
+                      class="mt-3 overflow-x-auto rounded-xl bg-slate-950 px-3 py-3 text-[11px] text-slate-100"
+                    >
+                      <code class="font-mono break-all">{{ runnerInstallCommand }}</code>
+                    </div>
+                    <div v-if="runnerInstallUrl" class="mt-2 break-all text-[11px] text-slate-500">
+                      URL: <span class="font-mono text-slate-700">{{ runnerInstallUrl }}</span>
+                    </div>
+                    <div v-if="runnerInstallNeedsReachableUrl" class="mt-2 text-[11px] text-amber-700">
+                      This command currently points at localhost. Set <span class="font-mono">host.publicUrl</span> if the runner is being installed on another machine.
+                    </div>
+                    <div v-if="runnerInstallLoading && runnerInstallStatusText" class="mt-2 text-sm text-slate-600">
+                      {{ runnerInstallStatusText }}
+                    </div>
+                    <div v-if="runnerInstallError" class="mt-2 text-sm text-red-600">{{ runnerInstallError }}</div>
+                  </div>
+
+                  <div v-if="!machines.length" class="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600">
+                    No machines connected yet.
+                  </div>
+
+                  <div v-else class="space-y-2">
+                    <div v-if="machineDisconnectError" class="text-sm text-red-600">{{ machineDisconnectError }}</div>
+                    <div v-if="machineUpgradeError" class="text-sm text-red-600">{{ machineUpgradeError }}</div>
+                    <div v-if="machineAliasError" class="text-sm text-red-600">{{ machineAliasError }}</div>
+                    <div
+                      v-for="m in machinesForSelect"
+                      :key="m.machineId"
+                      class="rounded-xl border border-slate-200 bg-white p-3"
+                    >
+                      <div class="flex items-center justify-between gap-3">
+                        <div class="min-w-0 flex items-center gap-2">
+                          <span class="h-2.5 w-2.5 rounded-full" :class="machineIsOnline(m) ? 'bg-emerald-500' : 'bg-slate-400'" />
+                          <div class="min-w-0">
+                            <div class="truncate text-sm font-medium text-slate-900">{{ machineDisplayName(m) }}</div>
+                            <div
+                              v-if="m.machineAlias && m.machineName && m.machineAlias !== m.machineName"
+                              class="truncate text-[11px] text-slate-500"
+                              :title="m.machineName"
+                            >
+                              {{ m.machineName }}
+                            </div>
+                          </div>
+                          <div class="shrink-0 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-600">
+                            {{ m.platform }}
+                          </div>
+                        </div>
+                        <div class="shrink-0 flex items-center gap-2">
+                          <button
+                            v-if="machineIsOnline(m) && ((machineHasVersionMismatch(m) && machineSupportsWebUpgrade(m)) || machineHasUnknownVersion(m))"
+                            class="inline-flex items-center gap-2 rounded-md bg-indigo-50 px-2.5 py-1.5 text-xs text-indigo-700 transition-colors hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                            @click="upgradeMachine(m.machineId)"
+                            :disabled="machineUpgradeWorkingId === m.machineId || ['starting', 'updating', 'restarting'].includes(String(m.upgrade?.state ?? ''))"
+                            :title="machineHasUnknownVersion(m) ? 'Try a remote runner upgrade. If this legacy runner does not support it, update it manually.' : 'Pull, rebuild, and restart this runner using its configured upgrade commands.'"
+                          >
+                            <Loader2 v-if="machineUpgradeWorkingId === m.machineId" class="h-3.5 w-3.5 animate-spin" />
+                            {{ machineHasUnknownVersion(m) ? 'Try upgrade' : 'Upgrade' }}
+                          </button>
+                          <button
+                            v-if="machineIsOnline(m)"
+                            class="inline-flex items-center gap-2 rounded-md bg-slate-100 px-2.5 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                            @click="disconnectMachine(m.machineId)"
+                            :disabled="machineDisconnectWorkingId === m.machineId"
+                            title="Disconnect the runner (it may reconnect if the runner process is still running)."
+                          >
+                            <Loader2 v-if="machineDisconnectWorkingId === m.machineId" class="h-3.5 w-3.5 animate-spin" />
+                            Disconnect
+                          </button>
+                          <button
+                            v-else
+                            class="inline-flex items-center gap-2 rounded-md bg-red-50 px-2.5 py-1.5 text-xs text-red-700 transition-colors hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
+                            @click="openDeleteMachineModal(m.machineId)"
+                            title="Delete this machine and all its sessions."
+                          >
+                            <Trash2 class="h-3.5 w-3.5" />
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                      <div class="mt-2 flex items-center justify-between gap-3">
+                        <div class="min-w-0 truncate text-xs font-mono text-slate-500" :title="m.machineId">{{ m.machineId }}</div>
+                        <div class="shrink-0 text-[11px]" :class="machineIsOnline(m) ? 'text-emerald-600' : 'text-slate-500'">
+                          {{ machineStatusLabel(m) }}
+                        </div>
+                      </div>
+                      <div class="mt-3 flex flex-wrap items-center gap-2">
+                        <input
+                          :value="machineAliasDrafts[m.machineId] ?? m.machineAlias ?? ''"
+                          class="min-w-0 flex-1 rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+                          placeholder="Machine alias"
+                          @input="machineAliasDrafts[m.machineId] = $event.target.value"
+                          @keydown.enter.prevent="saveMachineAlias(m.machineId)"
+                        />
+                        <button
+                          class="rounded-md bg-slate-100 px-3 py-2 text-xs text-slate-800 transition-colors hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-40"
+                          :disabled="machineAliasSavingId === m.machineId || String(machineAliasDrafts[m.machineId] ?? '').trim() === String(m.machineAlias ?? '').trim()"
+                          @click="saveMachineAlias(m.machineId)"
+                        >
+                          <Loader2 v-if="machineAliasSavingId === m.machineId" class="h-3.5 w-3.5 animate-spin" />
+                          <span v-else>Save alias</span>
+                        </button>
+                      </div>
+                      <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+                        <div>
+                          Runner:
+                          <span class="font-mono text-slate-700">{{ machineRootgridVersion(m) ?? 'unknown' }}</span>
+                        </div>
+                        <div v-if="appSettings.appVersion">
+                          Host:
+                          <span class="font-mono text-slate-700">{{ appSettings.appVersion }}</span>
+                        </div>
+                        <div v-if="machineHasVersionMismatch(m)" class="text-amber-700">
+                          Version mismatch
+                        </div>
+                        <div v-else-if="machineHasUnknownVersion(m)" class="text-red-700">
+                          Runner version unknown
+                        </div>
+                      </div>
+                      <div v-if="machineUpgradeStatusText(m)" class="mt-2 text-xs" :class="m.upgrade?.state === 'failed' ? 'text-red-600' : 'text-slate-500'">
+                        {{ machineUpgradeStatusText(m) }}
+                      </div>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="space-y-3">
+                  <div>
+                    <div class="text-sm font-medium text-slate-900">Archived threads</div>
+                    <div class="mt-1 text-xs text-slate-500">Hidden threads stay here until restored.</div>
+                  </div>
+                  <div v-if="archiveError" class="text-sm text-red-600">{{ archiveError }}</div>
+                  <div class="max-h-[420px] overflow-auto rounded-2xl border border-slate-200 bg-slate-50 p-3">
+                    <div v-if="archiveLoading" class="rounded-xl bg-white p-6 text-center text-sm text-slate-600">
+                      Loading archived threads…
+                    </div>
+                    <div v-else-if="!archivedSessions.length" class="rounded-xl bg-white p-6 text-center text-sm text-slate-600">
+                      No archived threads.
+                    </div>
+                    <div v-else class="space-y-2">
+                      <div
+                        v-for="s in archivedSessions"
+                        :key="s.sessionId"
+                        class="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3"
+                      >
+                        <button class="min-w-0 flex-1 text-left" @click="openSession(s.sessionId); defaultsOpen = false">
+                          <div class="truncate text-sm font-medium text-slate-900">{{ sessionListTitle(s) }}</div>
+                          <div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                            <span class="inline-flex min-w-0 max-w-full items-center rounded-full border border-black/[0.08] px-2 py-0.5 text-[10px] font-medium text-slate-500" :title="`${sessionHostName(s)} / ${sessionProject(s)}`">
+                              <span class="truncate">{{ sessionHostName(s) }} / {{ sessionProject(s) }}</span>
+                            </span>
+                            <span>{{ formatAgeShort(s.updatedMs) }}</span>
+                          </div>
+                        </button>
+                        <button
+                          class="rounded-md bg-slate-100 px-3 py-1.5 text-xs text-slate-800 transition-colors hover:bg-slate-200"
+                          @click="unarchiveFromArchiveModal(s.sessionId)"
+                        >
+                          Restore
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </section>
               </div>
             </div>
           </div>
@@ -4436,7 +4747,7 @@ watch(
         </section>
         <section
           v-else
-          class="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-[16px] bg-white shadow-[0_1px_2px_rgba(0,0,0,0.03)]"
+          class="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-none bg-white shadow-[0_1px_2px_rgba(0,0,0,0.03)]"
         >
           <div class="flex items-center justify-between gap-3 px-4 py-2.5">
             <div class="flex items-center gap-2">
@@ -4528,97 +4839,50 @@ watch(
               />
             </div>
 
-            <div v-else class="flex h-full min-h-0 flex-col">
-              <div class="border-b border-black/[0.04] px-4 py-3">
-                <div class="flex items-center justify-between gap-2">
-                  <div class="text-xs text-slate-500" :title="workspaceGitStatus?.rootPath || currentWorkspaceContext.cwd">
-                    {{ workspaceGitStatus?.rootPath || currentWorkspaceContext.cwd }}
-                  </div>
-                  <button
-                    class="rounded-lg border border-black/[0.06] px-2.5 py-1.5 text-xs text-slate-700 transition-colors hover:bg-black/[0.04]"
-                    @click="refreshWorkspaceGit"
-                  >
-                    Refresh
-                  </button>
-                </div>
-                <div v-if="workspaceGitError" class="mt-2 text-xs text-red-600">{{ workspaceGitError }}</div>
-              </div>
-              <div class="min-h-0 flex-1 overflow-auto px-4 py-3">
-                <div v-if="workspaceGitLoading" class="text-sm text-slate-500">Loading git status…</div>
-                <div v-else-if="workspaceGitStatus?.notRepo" class="text-sm text-slate-500">This workspace is not a git repository.</div>
-                <div v-else-if="workspaceGitStatus">
-                  <div class="mb-3 rounded-2xl border border-black/[0.06] bg-[#f7f7f4] px-3 py-2">
-                    <div class="text-sm font-medium text-slate-800">{{ workspaceGitStatus.branch || 'Detached HEAD' }}</div>
-                    <div class="mt-1 text-xs text-slate-500">
-                      <span v-if="workspaceGitStatus.upstream">{{ workspaceGitStatus.upstream }}</span>
-                      <span v-if="workspaceGitStatus.ahead"> · ahead {{ workspaceGitStatus.ahead }}</span>
-                      <span v-if="workspaceGitStatus.behind"> · behind {{ workspaceGitStatus.behind }}</span>
-                    </div>
-                  </div>
-                  <div v-if="!workspaceGitStatus.entries?.length" class="text-sm text-slate-500">Working tree clean.</div>
-                  <div v-else class="space-y-2">
-                    <button
-                      v-for="entry in workspaceGitStatus.entries"
-                      :key="`${entry.path}:${entry.label}`"
-                      class="flex w-full items-center gap-3 rounded-xl border border-black/[0.06] bg-white px-3 py-2 text-left transition-colors hover:bg-black/[0.02]"
-                      @click="openGitFile(entry)"
-                    >
-                      <span class="w-8 shrink-0 font-mono text-xs text-slate-500">{{ entry.label }}</span>
-                      <span class="min-w-0 flex-1 truncate text-sm text-slate-800">{{ entry.path }}</span>
-                    </button>
-                  </div>
-                </div>
-                <div v-else class="text-sm text-slate-500">Load git status for this workspace.</div>
-              </div>
-            </div>
+            <WorkspaceGitPane
+              v-else
+              :cwd="currentWorkspaceContext.cwd"
+              :status="workspaceGitStatus"
+              :loading="workspaceGitLoading"
+              :error="workspaceGitError"
+              :action-working="workspaceGitActionWorking"
+              :branch-working="workspaceGitBranchWorking"
+              :branch-draft="workspaceGitBranchDraft"
+              @refresh="refreshWorkspaceGit"
+              @open-file="openGitFile"
+              @stage="stageWorkspaceGitPaths"
+              @unstage="unstageWorkspaceGitPaths"
+              @switch-branch="switchWorkspaceGitBranch"
+              @create-branch="createWorkspaceGitBranch"
+              @update:branch-draft="workspaceGitBranchDraft = $event"
+            />
           </div>
         </section>
       </main>
 
+      <div
+        v-if="showWorkspacePane && !isMobileLayout"
+        class="group relative shrink-0 w-3 cursor-col-resize touch-none"
+        title="Drag to resize the chat and workspace panes"
+        @pointerdown.prevent="beginWorkspacePaneDrag"
+      >
+        <div
+          class="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 rounded-full transition-colors"
+          :class="workspaceSplitDragging ? 'bg-slate-400/70' : 'bg-transparent group-hover:bg-slate-300/70'"
+        />
+      </div>
+
       <aside
         v-if="showWorkspacePane"
-        class="min-w-0 flex flex-1 flex-col overflow-hidden rounded-[16px] bg-white shadow-[0_1px_2px_rgba(0,0,0,0.03)]"
+        class="relative min-w-0 flex flex-1 flex-col overflow-hidden rounded-none bg-white shadow-[0_1px_2px_rgba(0,0,0,0.03)]"
       >
-        <div class="flex items-center justify-between gap-3 px-4 py-2.5">
-          <div class="min-w-0">
-            <div class="text-[13px] font-semibold text-slate-800">{{ workspacePaneTitle }}</div>
-            <div class="truncate text-[11px] text-slate-500" :title="activeIdeSession?.cwd || currentWorkspaceContext.cwd || ''">
-              {{ activeIdeSession?.cwd || currentWorkspaceContext.cwd || 'Current workspace' }}
-            </div>
-          </div>
-          <button
-            class="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-            title="Close workspace"
-            @click="closeWorkspacePane"
-          >
-            <X class="h-4 w-4" />
-          </button>
-        </div>
-
-        <div class="border-t border-black/[0.04] px-4 py-2">
-          <div class="flex flex-wrap gap-2">
-            <button
-              class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
-              :class="workspacePaneTab === 'code' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
-              @click="openWorkspaceTool('code')"
-            >Code</button>
-            <button
-              class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
-              :class="workspacePaneTab === 'terminal' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
-              @click="openWorkspaceTool('terminal')"
-            >Terminal</button>
-            <button
-              class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
-              :class="workspacePaneTab === 'files' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
-              @click="openWorkspaceTool('files')"
-            >Files</button>
-            <button
-              class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
-              :class="workspacePaneTab === 'git' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
-              @click="openWorkspaceTool('git')"
-            >Git</button>
-          </div>
-        </div>
+        <button
+          class="absolute right-3 top-3 z-10 inline-flex h-8 w-8 items-center justify-center rounded-full bg-white/90 text-slate-500 shadow-sm shadow-black/5 transition-colors hover:bg-white hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+          title="Close workspace"
+          @click="closeWorkspacePane"
+        >
+          <X class="h-4 w-4" />
+        </button>
 
         <div v-if="workspacePaneTab === 'code'" class="relative min-h-0 flex-1 bg-[#f7f7f4]">
           <div
@@ -4670,49 +4934,23 @@ watch(
           />
         </div>
 
-        <div v-else class="flex min-h-0 flex-1 flex-col">
-          <div class="border-t border-black/[0.04] px-4 py-3">
-            <div class="flex items-center justify-between gap-2">
-              <div class="text-xs text-slate-500" :title="workspaceGitStatus?.rootPath || currentWorkspaceContext.cwd">
-                {{ workspaceGitStatus?.rootPath || currentWorkspaceContext.cwd }}
-              </div>
-              <button
-                class="rounded-lg border border-black/[0.06] px-2.5 py-1.5 text-xs text-slate-700 transition-colors hover:bg-black/[0.04]"
-                @click="refreshWorkspaceGit"
-              >
-                Refresh
-              </button>
-            </div>
-            <div v-if="workspaceGitError" class="mt-2 text-xs text-red-600">{{ workspaceGitError }}</div>
-          </div>
-          <div class="min-h-0 flex-1 overflow-auto px-4 py-3">
-            <div v-if="workspaceGitLoading" class="text-sm text-slate-500">Loading git status…</div>
-            <div v-else-if="workspaceGitStatus?.notRepo" class="text-sm text-slate-500">This workspace is not a git repository.</div>
-            <div v-else-if="workspaceGitStatus">
-              <div class="mb-3 rounded-2xl border border-black/[0.06] bg-[#f7f7f4] px-3 py-2">
-                <div class="text-sm font-medium text-slate-800">{{ workspaceGitStatus.branch || 'Detached HEAD' }}</div>
-                <div class="mt-1 text-xs text-slate-500">
-                  <span v-if="workspaceGitStatus.upstream">{{ workspaceGitStatus.upstream }}</span>
-                  <span v-if="workspaceGitStatus.ahead"> · ahead {{ workspaceGitStatus.ahead }}</span>
-                  <span v-if="workspaceGitStatus.behind"> · behind {{ workspaceGitStatus.behind }}</span>
-                </div>
-              </div>
-              <div v-if="!workspaceGitStatus.entries?.length" class="text-sm text-slate-500">Working tree clean.</div>
-              <div v-else class="space-y-2">
-                <button
-                  v-for="entry in workspaceGitStatus.entries"
-                  :key="`${entry.path}:${entry.label}`"
-                  class="flex w-full items-center gap-3 rounded-xl border border-black/[0.06] bg-white px-3 py-2 text-left transition-colors hover:bg-black/[0.02]"
-                  @click="openGitFile(entry)"
-                >
-                  <span class="w-8 shrink-0 font-mono text-xs text-slate-500">{{ entry.label }}</span>
-                  <span class="min-w-0 flex-1 truncate text-sm text-slate-800">{{ entry.path }}</span>
-                </button>
-              </div>
-            </div>
-            <div v-else class="text-sm text-slate-500">Load git status for this workspace.</div>
-          </div>
-        </div>
+        <WorkspaceGitPane
+          v-else
+          :cwd="currentWorkspaceContext.cwd"
+          :status="workspaceGitStatus"
+          :loading="workspaceGitLoading"
+          :error="workspaceGitError"
+          :action-working="workspaceGitActionWorking"
+          :branch-working="workspaceGitBranchWorking"
+          :branch-draft="workspaceGitBranchDraft"
+          @refresh="refreshWorkspaceGit"
+          @open-file="openGitFile"
+          @stage="stageWorkspaceGitPaths"
+          @unstage="unstageWorkspaceGitPaths"
+          @switch-branch="switchWorkspaceGitBranch"
+          @create-branch="createWorkspaceGitBranch"
+          @update:branch-draft="workspaceGitBranchDraft = $event"
+        />
       </aside>
       </div>
 
@@ -4728,7 +4966,7 @@ watch(
 
 	            <div class="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
 	              <div class="text-sm font-medium text-slate-900">
-	                {{ deleteMachineRow?.machineName ?? 'unknown' }}
+	                {{ machineDisplayName(deleteMachineRow) }}
 	              </div>
 	              <div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-600">
 	                <span class="rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-600">{{ deleteMachineRow?.platform ?? 'unknown' }}</span>

@@ -21,14 +21,6 @@ const props = defineProps({
 
 const emit = defineEmits(['ready', 'input', 'resize', 'open'])
 
-const cwdLabel = computed(() => String(props.session?.cwd ?? '').trim() || 'Current workspace')
-
-const shellLabel = computed(() => {
-  const shell = String(props.session?.shell ?? '').trim()
-  if (!shell) return ''
-  return shell.split('/').filter(Boolean).pop() || shell
-})
-
 const statusLabel = computed(() => {
   if (props.error) return String(props.error)
   if (props.opening || !props.session?.terminalId) return 'Opening shell…'
@@ -48,27 +40,17 @@ const canOpenNewShell = computed(() => {
 })
 
 const openLabel = computed(() => (props.error ? 'Retry' : 'New shell'))
+
+const shellLabel = computed(() => {
+  const shell = String(props.session?.shell ?? '').trim()
+  if (!shell) return ''
+  return shell.split('/').filter(Boolean).pop() || shell
+})
 </script>
 
 <template>
-  <div class="flex h-full min-h-0 flex-col">
-    <div class="flex items-center justify-between gap-3 px-4 py-3">
-      <div class="min-w-0">
-        <div class="truncate font-mono text-xs text-slate-800" :title="cwdLabel">{{ cwdLabel }}</div>
-        <div class="mt-1 truncate text-[11px]" :class="error ? 'text-red-600' : 'text-slate-500'">{{ statusLabel }}</div>
-      </div>
-      <button
-        v-if="canOpenNewShell"
-        class="inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] text-slate-600 transition-colors hover:bg-black/[0.04] hover:text-slate-900"
-        type="button"
-        @click="$emit('open')"
-      >
-        <RotateCw class="h-3.5 w-3.5" />
-        <span>{{ openLabel }}</span>
-      </button>
-    </div>
-
-    <div class="relative min-h-0 flex-1 overflow-hidden rounded-[24px] bg-white">
+  <div class="relative flex h-full min-h-0 flex-col bg-[#0b0f14]">
+    <div class="min-h-0 flex-1 overflow-hidden bg-[#0b0f14]">
       <XtermTerminal
         :session-key="session?.terminalId ?? ''"
         :snapshot-text="session?.outputText ?? ''"
@@ -80,14 +62,29 @@ const openLabel = computed(() => (props.error ? 'Retry' : 'New shell'))
         @input="$emit('input', $event)"
         @resize="$emit('resize', $event)"
       />
-
       <div
         v-if="opening && !session?.terminalId"
-        class="pointer-events-none absolute inset-0 flex items-center justify-center gap-2 bg-white/70 text-sm text-slate-500"
+        class="pointer-events-none absolute inset-0 flex items-center justify-center gap-2 bg-[#0b0f14]/80 text-sm text-slate-200"
       >
         <Loader2 class="h-4 w-4 animate-spin" />
         <span>Opening terminal…</span>
       </div>
+    </div>
+
+    <div
+      v-if="(error || canOpenNewShell) && !opening"
+      class="absolute right-3 top-3 z-10 flex items-center gap-2 rounded-full bg-black/65 px-2 py-1 text-[11px] text-slate-200 backdrop-blur"
+    >
+      <span v-if="statusLabel" class="max-w-[200px] truncate">{{ statusLabel }}</span>
+      <button
+        v-if="canOpenNewShell"
+        class="inline-flex shrink-0 items-center gap-1 rounded-full bg-white/10 px-2 py-1 text-[11px] text-slate-100 transition-colors hover:bg-white/15"
+        type="button"
+        @click="$emit('open')"
+      >
+        <RotateCw class="h-3.5 w-3.5" />
+        <span>{{ openLabel }}</span>
+      </button>
     </div>
   </div>
 </template>

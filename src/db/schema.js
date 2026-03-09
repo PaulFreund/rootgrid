@@ -1,9 +1,10 @@
-export const SCHEMA_VERSION = 10
+export const SCHEMA_VERSION = 11
 
 export const CREATE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS machines (
   machine_id TEXT PRIMARY KEY,
   machine_name TEXT NOT NULL,
+  machine_alias TEXT,
   platform TEXT NOT NULL,
   last_seen_ms INTEGER NOT NULL,
   capabilities_json TEXT

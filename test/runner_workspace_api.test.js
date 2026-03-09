@@ -6,15 +6,20 @@ import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 
 import {
+  createGitBranch,
   execTerminalCommand,
   getGitStatus,
   listCodexModels,
+  listGitBranches,
   listWorkspaceEntries,
   listWorkspaceDirectories,
   normalizeCodexModelListResult,
   parseGitStatusOutput,
   readWorkspaceFile,
-  resolveWorkspaceListPath
+  resolveWorkspaceListPath,
+  stageGitPaths,
+  switchGitBranch,
+  unstageGitPaths
 } from '../src/runner/runnerWorkspaceApi.js'
 
 async function run(cmd, args, { cwd } = {}) {
@@ -120,6 +125,54 @@ test('getGitStatus reports repo state for workspace changes', async (t) => {
   assert.equal(out.notRepo, false)
   assert.ok(Array.isArray(out.entries))
   assert.equal(out.entries.some((entry) => entry.path === 'untracked.txt'), true)
+})
+
+test('git stage/unstage helpers update repository status', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'rootgrid-runner-git-stage-'))
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  await run('git', ['init'], { cwd: dir })
+  await run('git', ['config', 'user.email', 'rootgrid@example.test'], { cwd: dir })
+  await run('git', ['config', 'user.name', 'Rootgrid Test'], { cwd: dir })
+  await writeFile(join(dir, 'tracked.txt'), 'base\n')
+  await run('git', ['add', 'tracked.txt'], { cwd: dir })
+  await run('git', ['commit', '-m', 'init'], { cwd: dir })
+
+  await writeFile(join(dir, 'tracked.txt'), 'base\nchange\n')
+  await stageGitPaths({ cwd: dir, paths: ['tracked.txt'] })
+  let out = await getGitStatus({ cwd: dir })
+  assert.equal(out.entries.some((entry) => entry.path === 'tracked.txt' && entry.x === 'M'), true)
+
+  await unstageGitPaths({ cwd: dir, paths: ['tracked.txt'] })
+  out = await getGitStatus({ cwd: dir })
+  assert.equal(out.entries.some((entry) => entry.path === 'tracked.txt' && entry.y === 'M'), true)
+})
+
+test('git branch helpers create and switch branches', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'rootgrid-runner-git-branch-'))
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  await run('git', ['init'], { cwd: dir })
+  await run('git', ['config', 'user.email', 'rootgrid@example.test'], { cwd: dir })
+  await run('git', ['config', 'user.name', 'Rootgrid Test'], { cwd: dir })
+  await writeFile(join(dir, 'tracked.txt'), 'base\n')
+  await run('git', ['add', 'tracked.txt'], { cwd: dir })
+  await run('git', ['commit', '-m', 'init'], { cwd: dir })
+
+  await createGitBranch({ cwd: dir, branch: 'feature/test-branch' })
+  let status = await getGitStatus({ cwd: dir })
+  assert.equal(status.branch, 'feature/test-branch')
+
+  await switchGitBranch({ cwd: dir, branch: 'master' })
+  status = await getGitStatus({ cwd: dir })
+  assert.equal(['master', 'main'].includes(status.branch), true)
+
+  const branches = await listGitBranches({ cwd: dir })
+  assert.equal(branches.branches.some((branch) => branch.name === 'feature/test-branch'), true)
 })
 
 test('execTerminalCommand captures stdout and exit status', async () => {

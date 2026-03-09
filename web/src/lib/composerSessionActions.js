@@ -48,7 +48,7 @@ export function createComposerSessionActions({
     defaultsError.value = ''
     if (!String(defaults.cwd ?? '').trim()) {
       defaultsError.value = 'Workspace (cwd) is required.'
-      if (typeof openSettings === 'function') openSettings('defaults')
+      if (typeof openSettings === 'function') openSettings('machines')
       return false
     }
     return true

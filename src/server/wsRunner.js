@@ -208,6 +208,7 @@ export function createRunnerWsServer({
         }
 
         store.upsertMachine({ machineId, machineName, platform, capabilities })
+        const machineRow = store.getMachine(machineId)
 
         // Ensure at most one active WS per machineId (prevents duplicate event streams).
         const prev = connections.get(machineId)
@@ -248,7 +249,11 @@ export function createRunnerWsServer({
         sse.send(makeEnvelope({
           type: 'registry.machine.upsert',
           scope: { machineId },
-          payload: { machineId, machineName, platform, lastSeenMs: Date.now(), capabilities, connected: true, upgrade: null }
+          payload: {
+            ...(machineRow ?? { machineId, machineName, platform, lastSeenMs: Date.now(), capabilities }),
+            connected: true,
+            upgrade: null
+          }
         }))
 
         return

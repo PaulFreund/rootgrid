@@ -17,6 +17,15 @@ export function buildRecentWorkspaces(sessions, machineId, getLabel) {
   return out
 }
 
+export function machineDisplayName(machine) {
+  const alias = String(machine?.machineAlias ?? '').trim()
+  if (alias) return alias
+  const name = String(machine?.machineName ?? '').trim()
+  if (name) return name
+  const machineId = String(machine?.machineId ?? '').trim()
+  return machineId ? machineId.slice(0, 8) : 'unknown'
+}
+
 export function indicatorDotClass(color) {
   if (color === 'red') return 'bg-red-500'
   if (color === 'orange') return 'bg-amber-500'

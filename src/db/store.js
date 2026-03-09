@@ -312,6 +312,15 @@ export class Store {
         continue
       }
 
+      if (v === 10) {
+        // v10 -> v11: optional machine aliases for UI display.
+        try { this.db.exec(`ALTER TABLE machines ADD COLUMN machine_alias TEXT`) } catch { }
+
+        v = 11
+        this.db.exec(`PRAGMA user_version = ${v}`)
+        continue
+      }
+
       throw new Error(`No migration available: ${v} -> ${v + 1}`)
     }
   }
@@ -320,14 +329,20 @@ export class Store {
     const now = Date.now()
     const capabilitiesJson = capabilities ? JSON.stringify(capabilities) : null
     this.db.prepare(`
-      INSERT INTO machines(machine_id, machine_name, platform, last_seen_ms, capabilities_json)
-      VALUES(?, ?, ?, ?, ?)
+      INSERT INTO machines(machine_id, machine_name, machine_alias, platform, last_seen_ms, capabilities_json)
+      VALUES(?, ?, NULL, ?, ?, ?)
       ON CONFLICT(machine_id) DO UPDATE SET
         machine_name=excluded.machine_name,
         platform=excluded.platform,
         last_seen_ms=excluded.last_seen_ms,
         capabilities_json=excluded.capabilities_json
     `).run(machineId, machineName, platform, now, capabilitiesJson)
+  }
+
+  setMachineAlias(machineId, machineAlias) {
+    const alias = String(machineAlias ?? '').trim() || null
+    const res = this.db.prepare(`UPDATE machines SET machine_alias=? WHERE machine_id=?`).run(alias, machineId)
+    return Number(res?.changes ?? 0) > 0
   }
 
   updateMachineLastSeen(machineId) {
@@ -337,9 +352,9 @@ export class Store {
 
   listMachines() {
     const rows = this.db.prepare(`
-      SELECT machine_id, machine_name, platform, last_seen_ms, capabilities_json
+      SELECT machine_id, machine_name, machine_alias, platform, last_seen_ms, capabilities_json
       FROM machines
-      ORDER BY machine_name ASC
+      ORDER BY COALESCE(NULLIF(TRIM(machine_alias), ''), machine_name) ASC
     `).all()
     return rows.map(machineRowToRecord)
   }
@@ -349,7 +364,7 @@ export class Store {
    */
   getMachine(machineId) {
     const row = this.db.prepare(`
-      SELECT machine_id, machine_name, platform, last_seen_ms, capabilities_json
+      SELECT machine_id, machine_name, machine_alias, platform, last_seen_ms, capabilities_json
       FROM machines
       WHERE machine_id=?
     `).get(machineId)
