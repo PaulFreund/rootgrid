@@ -3,6 +3,7 @@ import { mkdir, open, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { getUploadsDir } from '../lib/paths.js'
+import { writeAll } from '../lib/writeAll.js'
 
 export function safeRunnerUploadFilename(input) {
   const raw = String(input ?? 'upload')
@@ -122,8 +123,7 @@ export class RunnerUploadManager {
 
       const buf = Buffer.from(chunkBase64, 'base64')
       state.queue = state.queue.then(async () => {
-        await state.file.write(buf, 0, buf.length, state.sizeBytes)
-        state.sizeBytes += buf.length
+        state.sizeBytes += await writeAll(state.file, buf, state.sizeBytes)
       })
 
       try {

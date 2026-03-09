@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 
+import { getRunnerUploadsDir } from '../lib/paths.js'
 import { CodexAppServerSession } from './sessions/CodexAppServerSession.js'
 import { RunnerIdeManager } from './ideManager.js'
 import { RunnerReleaseManager } from './runnerReleaseManager.js'
@@ -36,6 +37,7 @@ export class RunnerSessionManager {
     })
     this.uploads = new RunnerUploadManager({
       machineId,
+      uploadsDir: getRunnerUploadsDir(machineId),
       emit: (type, scope, payload, options) => this.#emit(type, scope, payload, options)
     })
     this.terminals = new RunnerTerminalManager({

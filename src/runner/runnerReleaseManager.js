@@ -11,6 +11,7 @@ import {
   switchCurrentRelease
 } from '../lib/managedRelease.js'
 import { dispatchUserServiceRestart } from '../lib/userServiceRuntime.js'
+import { writeAll } from '../lib/writeAll.js'
 
 function trimText(value) {
   const text = String(value ?? '').trim()
@@ -117,7 +118,7 @@ export class RunnerReleaseManager {
 
     const buf = Buffer.from(chunkBase64, 'base64')
     this.transfer.queue = this.transfer.queue.then(async () => {
-      await this.transfer.file.write(buf, 0, buf.length, this.transfer.receivedBytes)
+      await writeAll(this.transfer.file, buf, this.transfer.receivedBytes)
       this.transfer.hash.update(buf)
       this.transfer.receivedBytes += buf.length
     })

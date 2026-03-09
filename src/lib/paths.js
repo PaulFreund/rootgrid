@@ -27,6 +27,11 @@ export function getUploadsDir() {
   return join(getRootgridDir(), 'uploads')
 }
 
+export function getRunnerUploadsDir(machineId = 'default') {
+  const segment = String(machineId ?? 'default').replace(/[/\\]/g, '_').trim() || 'default'
+  return join(getUploadsDir(), 'runner', segment)
+}
+
 export function getCodexDebugDir() {
   return join(getRootgridDir(), 'debug', 'codex')
 }

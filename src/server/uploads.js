@@ -4,6 +4,7 @@ import { mkdir, open, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { getUploadsDir } from '../lib/paths.js'
+import { writeAll } from '../lib/writeAll.js'
 
 function safeFilename(input) {
   const raw = String(input ?? 'upload')
@@ -199,8 +200,7 @@ export function createUploadService({ runnerWs, store, makeEnvelope, httpError }
         if (total > maxBytes) {
           throw httpError(413, `attachment too large: ${filename} (${total} bytes)`)
         }
-        await fh.write(buf, 0, buf.length, writeOffset)
-        writeOffset += buf.length
+        writeOffset += await writeAll(fh, buf, writeOffset)
       }
 
       await fh.close()
