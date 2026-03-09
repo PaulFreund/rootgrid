@@ -5,6 +5,8 @@
 It must write configuration to:
 - `~/.rootgrid/config.json`
 
+For local source development, `npm run dev` intentionally uses a separate Rootgrid home at `~/.rootgrid-dev/` by default (override with `ROOTGRID_HOME_DIR=/path npm run dev`) so development does not mutate your normal `~/.rootgrid` install. On first run it auto-seeds that dev config from `~/.rootgrid/config.json` when available, while disabling autostart and shifting the machine identity/host port for safety.
+
 ---
 
 ## Wizard flow (v0)

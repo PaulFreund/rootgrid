@@ -360,6 +360,24 @@ export function createComposerModelSettings({
     }
   }
 
+  function rememberComposerDefaults(patch) {
+    if (!patch || typeof patch !== 'object') return
+    if (Object.prototype.hasOwnProperty.call(patch, 'model')) {
+      defaults.model = String(patch.model ?? '').trim()
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'reasoningEffort')) {
+      defaults.reasoningEffort = String(patch.reasoningEffort ?? '').trim()
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'approvalPolicy')) {
+      const next = String(patch.approvalPolicy ?? '').trim()
+      if (next) defaults.approvalPolicy = next
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'sandbox')) {
+      const next = String(patch.sandbox ?? '').trim()
+      if (next) defaults.sandbox = next
+    }
+  }
+
   const composerModel = computed({
     get() {
       return composerModelValue.value
@@ -368,8 +386,8 @@ export function createComposerModelSettings({
       const next = String(value ?? '').trim()
       const current = String(composerModelValue.value ?? '').trim()
       if (next === current) return
+      rememberComposerDefaults({ model: next })
       if (selectedSession.value) patchSelectedSessionOptions({ model: next || null })
-      else defaults.model = next
     }
   })
 
@@ -381,8 +399,8 @@ export function createComposerModelSettings({
       const next = String(value ?? '').trim()
       const current = String(composerReasoningEffortValue.value ?? '').trim()
       if (next === current) return
+      rememberComposerDefaults({ reasoningEffort: next })
       if (selectedSession.value) patchSelectedSessionOptions({ reasoningEffort: next || null })
-      else defaults.reasoningEffort = next
     }
   })
 
@@ -398,8 +416,8 @@ export function createComposerModelSettings({
         (selectedSession.value ? selectedSession.value.approvalPolicy : defaults.approvalPolicy) ?? ''
       ).trim()
       if (next === current) return
+      rememberComposerDefaults({ approvalPolicy: next })
       if (selectedSession.value) patchSelectedSessionOptions({ approvalPolicy: next })
-      else defaults.approvalPolicy = next
     }
   })
 
@@ -413,8 +431,8 @@ export function createComposerModelSettings({
       if (!next) return
       const current = String((selectedSession.value ? selectedSession.value.sandbox : defaults.sandbox) ?? '').trim()
       if (next === current) return
+      rememberComposerDefaults({ sandbox: next })
       if (selectedSession.value) patchSelectedSessionOptions({ sandbox: next })
-      else defaults.sandbox = next
     }
   })
 

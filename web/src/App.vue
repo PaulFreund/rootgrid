@@ -117,6 +117,9 @@ import {
   createSystemSettingsActions
 } from './lib/systemSettings.js'
 import {
+  createPwaInstallPromptActions
+} from './lib/pwaInstallPrompt.js'
+import {
   createSessionAdminActions
 } from './lib/sessionAdminActions.js'
 import {
@@ -763,6 +766,19 @@ const {
   defaultsOpen
 })
 
+const {
+  pwaInstallCanPrompt,
+  pwaInstallMessage,
+  pwaInstallWorking,
+  showPwaInstallPrompt,
+  dismissPwaInstallPrompt,
+  attachPwaInstallPrompt,
+  disposePwaInstallPrompt,
+  triggerPwaInstallPrompt
+} = createPwaInstallPromptActions({
+  isMobileLayout
+})
+
 function openSettings(tab = 'machines') {
   const nextTab = tab === 'defaults' ? 'machines' : tab
   forceEmptyHomeScreen.value = false
@@ -1302,7 +1318,6 @@ const {
 schedulePostVisibility = schedulePostVisibilityImpl
 onLoginConnect = () => {
   connectSse()
-  autoEnablePushOnLoad().catch(() => {})
 }
 
 watch(selectedSessionId, async (sid, prevSid) => {
@@ -2034,7 +2049,6 @@ function showInitialNewThreadIfNeeded() {
 
 onLoginConnect = () => {
   connectSse()
-  autoEnablePushOnLoad().catch(() => {})
   if (deepLinkSessionId.value) {
     openSession(deepLinkSessionId.value)
     deepLinkSessionId.value = null
@@ -2042,6 +2056,16 @@ onLoginConnect = () => {
   }
   showInitialNewThreadIfNeeded()
 }
+
+watch(
+  () => [authed.value, appSettingsLoaded.value, String(appSettings.notifications?.webPush ?? '')],
+  ([isAuthed, settingsLoaded, webPushPolicy]) => {
+    if (!isAuthed || !settingsLoaded) return
+    if (String(webPushPolicy ?? '').trim() === 'never') return
+    autoEnablePushOnLoad({ force: true }).catch(() => {})
+  },
+  { immediate: true }
+)
 
 watch(
   () => mainPaneMode.value,
@@ -2731,6 +2755,7 @@ const {
 
 onMounted(async () => {
   refreshNotificationPermission()
+  attachPwaInstallPrompt()
   try {
     const u = new URL(window.location.href)
     const sid = u.searchParams.get('session')
@@ -2878,6 +2903,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   clearComposerAttachments()
   disposeSse()
+  disposePwaInstallPrompt()
   stopSessionSidebarDrag()
   stopWorkspacePaneDrag()
   if (workspaceTerminalInputFlushTimer) {
@@ -2967,33 +2993,90 @@ watch(
 
 <template>
   <div class="h-screen w-screen bg-[#f7f7f4] text-slate-900">
-    <div v-if="!authed" class="h-full flex items-center justify-center px-6">
-      <div class="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-        <div class="text-xl font-semibold tracking-tight text-slate-900">Rootgrid</div>
-        <div class="mt-1 text-sm text-slate-600">Enter your client token to connect.</div>
-
-        <div class="mt-6">
-          <label class="text-xs uppercase tracking-wider text-slate-500">Client token</label>
-          <input
-            v-model="authToken"
-            type="password"
-            class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-            placeholder="paste token from ~/.rootgrid/config.json"
-            @keydown.enter.prevent="login"
-          />
-          <div v-if="authError" class="mt-2 text-sm text-red-600">{{ authError }}</div>
+    <div v-if="!authed" class="h-full flex flex-col">
+      <div v-if="showPwaInstallPrompt" class="shrink-0 px-4 pt-4">
+        <div class="mx-auto flex max-w-xl items-start justify-between gap-3 rounded-2xl border border-indigo-200 bg-indigo-50/80 px-4 py-3 text-left shadow-sm">
+          <div class="min-w-0">
+            <div class="text-sm font-medium text-slate-900">Install Rootgrid</div>
+            <div class="mt-0.5 text-xs leading-5 text-slate-600">{{ pwaInstallMessage }}</div>
+          </div>
+          <div class="flex shrink-0 items-center gap-2">
+            <button
+              v-if="pwaInstallCanPrompt"
+              class="inline-flex items-center rounded-full bg-slate-900 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
+              :disabled="pwaInstallWorking"
+              @click="triggerPwaInstallPrompt"
+            >
+              {{ pwaInstallWorking ? 'Opening…' : 'Install' }}
+            </button>
+            <button
+              class="inline-flex items-center justify-center rounded-full p-1.5 text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600"
+              @click="dismissPwaInstallPrompt"
+              aria-label="Dismiss install prompt"
+            >
+              <X class="h-4 w-4" />
+            </button>
+          </div>
         </div>
+      </div>
 
-        <button
-          class="mt-4 w-full rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
-          @click="login"
-        >
-          Connect
-        </button>
+      <div class="flex flex-1 items-center justify-center px-6 pb-6">
+        <div class="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+          <div class="text-xl font-semibold tracking-tight text-slate-900">Rootgrid</div>
+          <div class="mt-1 text-sm text-slate-600">Enter your client token to connect.</div>
+
+          <div class="mt-6">
+            <label class="text-xs uppercase tracking-wider text-slate-500">Client token</label>
+            <input
+              v-model="authToken"
+              type="password"
+              class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
+              placeholder="paste token from ~/.rootgrid/config.json"
+              @keydown.enter.prevent="login"
+            />
+            <div v-if="authError" class="mt-2 text-sm text-red-600">{{ authError }}</div>
+          </div>
+
+          <button
+            class="mt-4 w-full rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
+            @click="login"
+          >
+            Connect
+          </button>
+        </div>
       </div>
     </div>
 
     <div v-else class="h-full flex flex-col bg-white">
+      <div
+        v-if="showPwaInstallPrompt"
+        class="shrink-0 border-b border-black/5 bg-indigo-50/70"
+      >
+        <div class="mx-auto flex max-w-3xl items-start justify-between gap-3 px-4 py-3 sm:px-6">
+          <div class="min-w-0">
+            <div class="text-sm font-medium text-slate-900">Install Rootgrid</div>
+            <div class="mt-0.5 text-xs leading-5 text-slate-600">{{ pwaInstallMessage }}</div>
+          </div>
+          <div class="flex shrink-0 items-center gap-2">
+            <button
+              v-if="pwaInstallCanPrompt"
+              class="inline-flex items-center rounded-full bg-slate-900 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
+              :disabled="pwaInstallWorking"
+              @click="triggerPwaInstallPrompt"
+            >
+              {{ pwaInstallWorking ? 'Opening…' : 'Install' }}
+            </button>
+            <button
+              class="inline-flex items-center justify-center rounded-full p-1.5 text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600"
+              @click="dismissPwaInstallPrompt"
+              aria-label="Dismiss install prompt"
+            >
+              <X class="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+      </div>
+
       <div
         v-if="connectionBanner"
         class="shrink-0 bg-white/80 backdrop-blur supports-[backdrop-filter]:bg-white/60"

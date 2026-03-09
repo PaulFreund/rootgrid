@@ -247,3 +247,83 @@ test('autoEnablePushOnLoad does nothing when web push policy is never', async ()
   assert.equal(ok, false)
   assert.equal(apiCalls, 0)
 })
+
+test('autoEnablePushOnLoad can retry when permission stays default', async () => {
+  let requestCalls = 0
+  let subscribeCalls = 0
+  let allowSubscribe = false
+  let subscription = null
+
+  const actions = createSystemSettingsActions({
+    apiFetch: async (path) => {
+      if (path === '/api/push/vapid-public-key') {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { publicKey: 'SGVsbG8td29ybGQ' }
+          }
+        }
+      }
+      if (path === '/api/push/subscribe') {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { ok: true }
+          }
+        }
+      }
+      throw new Error(`unexpected request: ${path}`)
+    },
+    authed: ref(true),
+    appSettings: {
+      notifications: {
+        webPush: 'if-not-visible'
+      }
+    },
+    appSettingsLoaded: ref(true),
+    loadAppSettings: async () => {},
+    settingsTab: ref('system'),
+    defaultsOpen: ref(false),
+    windowObj: { isSecureContext: true, PushManager: function PushManager() {} },
+    navigatorObj: {
+      serviceWorker: {
+        ready: Promise.resolve({
+          pushManager: {
+            async getSubscription() {
+              return subscription
+            },
+            async subscribe() {
+              subscribeCalls += 1
+              if (!allowSubscribe) throw new Error('permission still default')
+              subscription = {
+                endpoint: 'https://push.example.test/sub/retry'
+              }
+              return subscription
+            }
+          }
+        })
+      }
+    },
+    notificationCtor: {
+      permission: 'default',
+      async requestPermission() {
+        requestCalls += 1
+        if (allowSubscribe) this.permission = 'granted'
+        return this.permission
+      }
+    }
+  })
+
+  const firstOk = await actions.autoEnablePushOnLoad()
+  assert.equal(firstOk, false)
+  assert.equal(requestCalls, 1)
+
+  allowSubscribe = true
+  const secondOk = await actions.autoEnablePushOnLoad()
+  assert.equal(secondOk, true)
+  assert.equal(requestCalls, 2)
+  assert.equal(subscribeCalls, 1)
+  assert.equal(actions.pushStatus.value, 'subscribed')
+})

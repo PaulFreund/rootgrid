@@ -1,11 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { reactive, ref } from 'vue'
 
 import {
   buildComposerModelOptions,
   buildComposerReasoningEffortOptions,
   buildRecentModels,
   composerModelsMachineIsOnline,
+  createComposerModelSettings,
   labelReasoningEffort,
   resolveComposerModelsMachineId
 } from '../web/src/lib/composerModels.js'
@@ -107,4 +109,69 @@ test('buildComposerReasoningEffortOptions normalizes supported effort entries an
     { value: 'high', label: 'High', description: null }
   ])
   assert.equal(labelReasoningEffort('extra_high'), 'Extra High')
+})
+
+test('composer option changes in a selected session also update remembered defaults for new sessions', async () => {
+  const defaults = reactive({
+    machineId: 'machine-1',
+    cwd: '/workspace',
+    model: 'gpt-5',
+    reasoningEffort: 'medium',
+    approvalPolicy: 'on-request',
+    sandbox: 'workspace-write'
+  })
+  const selectedSession = ref({
+    sessionId: 'session-1',
+    machineId: 'machine-1',
+    cwd: '/workspace',
+    model: 'gpt-5',
+    reasoningEffort: 'medium',
+    approvalPolicy: 'on-request',
+    sandbox: 'workspace-write'
+  })
+  const patchedBodies = []
+
+  const settings = createComposerModelSettings({
+    apiFetch: async (_path, init = {}) => {
+      patchedBodies.push(JSON.parse(String(init.body ?? '{}')))
+      return {
+        ok: true,
+        async json() {
+          return {
+            session: {
+              ...selectedSession.value,
+              ...(patchedBodies.at(-1)?.options ?? {})
+            }
+          }
+        }
+      }
+    },
+    authed: ref(false),
+    defaults,
+    machines: ref([{ machineId: 'machine-1', connected: true }]),
+    machinesForSelect: ref([{ machineId: 'machine-1', connected: true }]),
+    machineIsOnline: (machine) => Boolean(machine?.connected),
+    selectedSession,
+    selectedSessionId: ref('session-1'),
+    sessions: ref([]),
+    upsertSessionRow: () => {}
+  })
+
+  settings.composerModel.value = 'gpt-5.4'
+  settings.composerReasoningEffort.value = 'xhigh'
+  settings.composerApprovalPolicy.value = 'never'
+  settings.composerSandbox.value = 'danger-full-access'
+
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  assert.equal(defaults.model, 'gpt-5.4')
+  assert.equal(defaults.reasoningEffort, 'xhigh')
+  assert.equal(defaults.approvalPolicy, 'never')
+  assert.equal(defaults.sandbox, 'danger-full-access')
+  assert.deepEqual(patchedBodies.map((entry) => entry.options), [
+    { model: 'gpt-5.4' },
+    { reasoningEffort: 'xhigh' },
+    { approvalPolicy: 'never' },
+    { sandbox: 'danger-full-access' }
+  ])
 })

@@ -33,6 +33,15 @@ node src/cli.js setup
 node src/cli.js
 ```
 
+For local development:
+
+```bash
+npm run dev
+```
+
+`npm run dev` now uses a separate Rootgrid home directory at `~/.rootgrid-dev/` by default, so it does not touch your real `~/.rootgrid`. You can override that with `ROOTGRID_HOME_DIR=/some/path npm run dev`.
+On first run, it auto-seeds `~/.rootgrid-dev/config.json` from your real `~/.rootgrid/config.json` when available (with autostart disabled, a dev-suffixed machine identity, and a shifted host port to avoid collisions).
+
 For later local updates without rerunning setup:
 
 ```bash

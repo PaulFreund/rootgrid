@@ -3,23 +3,33 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { join, dirname } from 'node:path'
 import process from 'node:process'
+import { ensureDevConfig, resolveDevEnvironment } from './devEnvironment.js'
 
 const repoDir = join(dirname(fileURLToPath(import.meta.url)), '..')
 const node = process.execPath
+const devConfig = await ensureDevConfig({ repoDir, env: process.env })
+const devEnv = resolveDevEnvironment({ repoDir, env: process.env })
 
 const viteBin = join(repoDir, 'node_modules', 'vite', 'bin', 'vite.js')
 const webDir = join(repoDir, 'web')
 
 const host = spawn(node, [join(repoDir, 'src', 'cli.js')], {
   stdio: 'inherit',
-  cwd: repoDir
+  cwd: repoDir,
+  env: devEnv
 })
 
 const web = spawn(node, [viteBin, '--config', 'vite.config.js'], {
   stdio: 'inherit',
   cwd: webDir,
-  env: process.env
+  env: devEnv
 })
+
+console.log(`Rootgrid dev home: ${devEnv.ROOTGRID_HOME_DIR}`)
+if (devConfig.created) {
+  console.log(`Seeded dev config: ${devConfig.configPath}`)
+  if (devConfig.sourcePath) console.log(`Seed source: ${devConfig.sourcePath}`)
+}
 
 const shutdown = (code = 0) => {
   try { host.kill('SIGTERM') } catch {}

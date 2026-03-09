@@ -157,14 +157,32 @@ export function createSystemSettingsActions({
     if (!authed.value || !appSettingsLoaded.value) return false
     if (currentWebPushPolicy() === 'never') return false
     if (autoEnablePushAttempted && !force) return false
-    autoEnablePushAttempted = true
 
     await refreshPushSubscription()
-    if (pushStatus.value === 'subscribed') return true
-    if (pushStatus.value === 'unsupported' || pushStatus.value === 'insecure') return false
-    if (notificationPermission.value === 'denied') return false
+    if (pushStatus.value === 'subscribed') {
+      autoEnablePushAttempted = true
+      return true
+    }
+    if (pushStatus.value === 'unsupported' || pushStatus.value === 'insecure') {
+      autoEnablePushAttempted = true
+      return false
+    }
+    if (notificationPermission.value === 'denied') {
+      autoEnablePushAttempted = true
+      return false
+    }
 
-    return await enablePush({ silent: true })
+    const ok = await enablePush({ silent: true })
+    if (
+      ok ||
+      pushStatus.value === 'subscribed' ||
+      pushStatus.value === 'unsupported' ||
+      pushStatus.value === 'insecure' ||
+      notificationPermission.value === 'denied'
+    ) {
+      autoEnablePushAttempted = true
+    }
+    return ok
   }
 
   async function disablePush() {
