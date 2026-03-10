@@ -1,12 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { reactive, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 
 import {
   approvalAllowsDecision,
   buildApprovalExtraActions,
+  countApprovalsOutsideSession,
   collectUserInputAnswers,
   createSessionDialogActions,
+  findApprovalForSession,
+  findApprovalOutsideSession,
   resetUserInputFormState
 } from '../web/src/lib/sessionDialogs.js'
 
@@ -84,6 +87,19 @@ test('resetUserInputFormState seeds first options for userInput approvals', () =
     q1: { choice: 'One', other: '', text: '' },
     q2: { choice: '', other: '', text: '' }
   })
+})
+
+test('approval queue helpers resolve current-session and outside-session approvals', () => {
+  const queue = [
+    { approvalId: 'a-1', sessionId: 'session-2' },
+    { approvalId: 'a-2', sessionId: 'session-1' },
+    { approvalId: 'a-3', sessionId: 'session-3' }
+  ]
+
+  assert.deepEqual(findApprovalForSession(queue, 'session-1'), { approvalId: 'a-2', sessionId: 'session-1' })
+  assert.deepEqual(findApprovalOutsideSession(queue, 'session-1'), { approvalId: 'a-1', sessionId: 'session-2' })
+  assert.equal(countApprovalsOutsideSession(queue, 'session-1'), 2)
+  assert.equal(findApprovalForSession(queue, 'missing'), null)
 })
 
 test('createSessionDialogActions opens and saves rename + session policy dialogs', async () => {
@@ -211,4 +227,59 @@ test('createSessionDialogActions opens and saves rename + session policy dialogs
       sandbox: 'danger-full-access'
     }
   })
+})
+
+test('createSessionDialogActions can target the selected-session approval instead of the global queue head', async () => {
+  const requests = []
+  const approvalQueue = ref([
+    { approvalId: 'approval-other', sessionId: 'session-2', kind: 'command' },
+    { approvalId: 'approval-selected', sessionId: 'session-1', kind: 'command' }
+  ])
+  const activeApproval = computed(() => findApprovalForSession(approvalQueue.value, 'session-1'))
+
+  const actions = createSessionDialogActions({
+    apiFetch: async (path, init = {}) => {
+      requests.push({ path, init })
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {}
+        }
+      }
+    },
+    defaults: reactive({
+      approvalPolicy: 'on-request',
+      sandbox: 'workspace-write'
+    }),
+    selectedSession: ref({ sessionId: 'session-1' }),
+    selectedSessionId: ref('session-1'),
+    upsertSessionRow: () => {},
+    sessionListTitle: () => 'Session 1',
+    renameOpen: ref(false),
+    renameSessionId: ref(null),
+    renameTitleValue: ref(''),
+    renameProjectValue: ref(''),
+    renameFocus: ref('title'),
+    renameError: ref(''),
+    sessionPolicyOpen: ref(false),
+    sessionPolicySaving: ref(false),
+    sessionPolicyError: ref(''),
+    sessionApprovalDraft: ref(''),
+    sessionSandboxDraft: ref(''),
+    activeApproval,
+    approvalQueue,
+    approvalIds: new Set(['approval-other', 'approval-selected']),
+    approvalResponding: ref(false),
+    approvalRespondError: ref(''),
+    userInputSubmitting: ref(false),
+    userInputError: ref(''),
+    userInputForm: reactive({})
+  })
+
+  assert.equal(await actions.respondApproval('accept'), true)
+  assert.equal(requests[0]?.path, '/api/approvals/approval-selected')
+  assert.deepEqual(approvalQueue.value, [
+    { approvalId: 'approval-other', sessionId: 'session-2', kind: 'command' }
+  ])
 })

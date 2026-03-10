@@ -1,6 +1,39 @@
 import { computed, watch } from 'vue'
 import { removeApproval } from './approvalQueue.js'
 
+export function findApprovalForSession(approvalQueue, sessionId) {
+  const sid = String(sessionId ?? '').trim()
+  if (!sid) return null
+  const list = Array.isArray(approvalQueue) ? approvalQueue : []
+  for (const approval of list) {
+    if (String(approval?.sessionId ?? '').trim() === sid) return approval
+  }
+  return null
+}
+
+export function findApprovalOutsideSession(approvalQueue, sessionId) {
+  const sid = String(sessionId ?? '').trim()
+  const list = Array.isArray(approvalQueue) ? approvalQueue : []
+  for (const approval of list) {
+    const approvalSessionId = String(approval?.sessionId ?? '').trim()
+    if (!approvalSessionId) continue
+    if (!sid || approvalSessionId !== sid) return approval
+  }
+  return null
+}
+
+export function countApprovalsOutsideSession(approvalQueue, sessionId) {
+  const sid = String(sessionId ?? '').trim()
+  const list = Array.isArray(approvalQueue) ? approvalQueue : []
+  let count = 0
+  for (const approval of list) {
+    const approvalSessionId = String(approval?.sessionId ?? '').trim()
+    if (!approvalSessionId) continue
+    if (!sid || approvalSessionId !== sid) count += 1
+  }
+  return count
+}
+
 export function approvalAllowsDecision(approval, decision) {
   const allowed = approval?.availableDecisions
   if (!Array.isArray(allowed) || allowed.length === 0) return true
@@ -150,6 +183,7 @@ export function createSessionDialogActions({
   sessionPolicyError,
   sessionApprovalDraft,
   sessionSandboxDraft,
+  activeApproval = null,
   approvalQueue,
   approvalIds = null,
   approvalResponding,
@@ -240,15 +274,16 @@ export function createSessionDialogActions({
   }
 
   const pendingApproval = computed(() => approvalQueue.value[0] ?? null)
+  const targetApproval = activeApproval ?? pendingApproval
 
   function approvalAllows(decision) {
-    return approvalAllowsDecision(pendingApproval.value, decision)
+    return approvalAllowsDecision(targetApproval.value, decision)
   }
 
-  const approvalExtraActions = computed(() => buildApprovalExtraActions(pendingApproval.value))
+  const approvalExtraActions = computed(() => buildApprovalExtraActions(targetApproval.value))
 
-  async function respondApproval(decision) {
-    const approval = pendingApproval.value
+  async function respondApproval(decision, approvalOverride = null) {
+    const approval = approvalOverride ?? targetApproval.value
     if (!approval || approvalResponding.value) return false
     approvalRespondError.value = ''
     approvalResponding.value = true
@@ -278,13 +313,13 @@ export function createSessionDialogActions({
     })
   }
 
-  watch(pendingApproval, (approval) => {
+  watch(targetApproval, (approval) => {
     approvalRespondError.value = ''
     resetUserInputForm(approval)
   }, { immediate: true })
 
-  async function submitUserInput() {
-    const approval = pendingApproval.value
+  async function submitUserInput(approvalOverride = null) {
+    const approval = approvalOverride ?? targetApproval.value
     if (!approval || approval.kind !== 'userInput' || userInputSubmitting.value) return false
     userInputError.value = ''
     userInputSubmitting.value = true
@@ -311,8 +346,8 @@ export function createSessionDialogActions({
     }
   }
 
-  async function cancelUserInput() {
-    const approval = pendingApproval.value
+  async function cancelUserInput(approvalOverride = null) {
+    const approval = approvalOverride ?? targetApproval.value
     if (!approval || approval.kind !== 'userInput' || userInputSubmitting.value) return false
     userInputError.value = ''
     userInputSubmitting.value = true

@@ -21,6 +21,8 @@ export function createSessionStoreState() {
     pendingAfter: [],
     lastRealtimeSeqSeen: 0,
     messageViewVersion: 0,
+    chatScrollTop: 0,
+    chatStickToBottom: true,
     queuedPrompts: [],
     queueSending: false,
     toolOutputByItemId: new Map(),

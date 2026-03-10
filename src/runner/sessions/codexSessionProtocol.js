@@ -32,16 +32,18 @@ export function approvalPolicyCandidates(input) {
   const raw = String(input).trim()
   if (!raw) return []
 
-  const out = []
-  if (raw === 'untrusted') out.push('unlessTrusted')
-  if (raw === 'on-request') out.push('onRequest')
-  if (raw === 'on-failure') out.push('onFailure')
-  if (raw === 'never') out.push('never')
+  const variants = {
+    untrusted: ['untrusted', 'unlessTrusted'],
+    unlessTrusted: ['untrusted', 'unlessTrusted'],
+    'on-request': ['on-request', 'onRequest'],
+    onRequest: ['on-request', 'onRequest'],
+    'on-failure': ['on-failure', 'onFailure'],
+    onFailure: ['on-failure', 'onFailure'],
+    never: ['never'],
+    reject: ['reject']
+  }
 
-  if (raw === 'unlessTrusted' || raw === 'onRequest' || raw === 'onFailure' || raw === 'never') out.push(raw)
-  if (raw === 'untrusted' || raw === 'on-request' || raw === 'on-failure' || raw === 'never') out.push(raw)
-
-  return uniqStrings(out)
+  return uniqStrings(variants[raw] ?? [raw])
 }
 
 export function sandboxCandidates(input) {

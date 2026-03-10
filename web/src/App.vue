@@ -105,7 +105,10 @@ import {
   resolveSessionLoadStrategy
 } from './lib/sessionSelection.js'
 import {
-  createSessionDialogActions
+  countApprovalsOutsideSession,
+  createSessionDialogActions,
+  findApprovalForSession,
+  findApprovalOutsideSession
 } from './lib/sessionDialogs.js'
 import {
   createSessionSseActions,
@@ -427,6 +430,7 @@ let sidebarDragUpHandler = null
 let workspaceDragMoveHandler = null
 let workspaceDragUpHandler = null
 let sessionListResizeObserver = null
+let chatResizeObserver = null
 let sessionMenuOutsideHandler = null
 
 function getSessionStore(sessionId) {
@@ -503,6 +507,14 @@ function sessionHostName(s) {
 
 function sessionTooltip(s) {
   return sessionTooltipForRow(s, machineRowsById)
+}
+
+function approvalCardTitle(approval) {
+  const kind = String(approval?.kind ?? '').trim()
+  if (kind === 'userInput') return 'Input requested'
+  if (kind === 'fileChange') return 'File change approval'
+  if (kind === 'command') return 'Command approval'
+  return 'Approval requested'
 }
 
 function closeSessionMenu() {
@@ -1252,6 +1264,24 @@ const selectedSession = computed(() => {
   if (!sid) return null
   return sessionRowsById.get(sid) ?? null
 })
+const selectedComposerApproval = computed(() => {
+  return findApprovalForSession(approvalQueue.value, selectedSessionId.value)
+})
+const nextOtherPendingApproval = computed(() => {
+  return findApprovalOutsideSession(approvalQueue.value, selectedSessionId.value)
+})
+const otherPendingApprovalsCount = computed(() => {
+  return countApprovalsOutsideSession(approvalQueue.value, selectedSessionId.value)
+})
+const nextOtherPendingApprovalLabel = computed(() => {
+  const count = Number(otherPendingApprovalsCount.value ?? 0)
+  if (!count) return ''
+  if (count > 1) return `${count} approvals are waiting in other threads.`
+  const next = nextOtherPendingApproval.value
+  const sid = String(next?.sessionId ?? '').trim()
+  const session = sid ? (sessionRowsById.get(sid) ?? { sessionId: sid }) : null
+  return `Approval waiting in ${session ? sessionListTitle(session) : 'another thread'}.`
+})
 const selectedStore = computed(() => selectedSessionId.value ? sessionStores.get(selectedSessionId.value) : null)
 const selectedTokenUsage = computed(() => selectedSessionId.value ? (tokenUsageBySessionId.get(selectedSessionId.value) ?? null) : null)
 const selectedQueuedPrompts = computed(() => {
@@ -1321,6 +1351,9 @@ onLoginConnect = () => {
 }
 
 watch(selectedSessionId, async (sid, prevSid) => {
+  if (String(prevSid ?? '').trim()) {
+    rememberChatScrollState(prevSid)
+  }
   closeSessionMenu()
   composerContextPopoverOpen.value = false
   composerContextPopoverHover.value = false
@@ -1347,8 +1380,9 @@ watch(selectedSessionId, async (sid, prevSid) => {
     })
   }
   if (s?.cwd) defaults.cwd = s.cwd
-  stickToBottom.value = true
-  await nextTick()
+  const nextStore = getSessionStore(sid)
+  stickToBottom.value = Boolean(nextStore.chatStickToBottom ?? true)
+  await restoreChatScrollState(sid)
   scheduleMarkRead(sid)
 })
 
@@ -2111,6 +2145,74 @@ function onSessionListScroll() {
   updateSessionListMetrics()
 }
 
+function chatNearBottom(el, threshold = 80) {
+  if (!el) return true
+  return (el.scrollTop + el.clientHeight) >= (el.scrollHeight - threshold)
+}
+
+function clampChatScrollTop(el, value) {
+  if (!el) return 0
+  const maxTop = Math.max(0, Number(el.scrollHeight ?? 0) - Number(el.clientHeight ?? 0))
+  const top = Number(value ?? 0)
+  return Math.max(0, Math.min(maxTop, Number.isFinite(top) ? top : 0))
+}
+
+function captureChatScrollSnapshot(sessionId = selectedSessionId.value) {
+  const sid = String(sessionId ?? '').trim()
+  const el = chatScrollEl.value
+  if (!sid || !el) return null
+  return {
+    sessionId: sid,
+    scrollTop: Number(el.scrollTop ?? 0) || 0,
+    stickToBottom: Boolean(stickToBottom.value)
+  }
+}
+
+function rememberChatScrollState(sessionId = selectedSessionId.value, snapshot = null) {
+  const sid = String(sessionId ?? '').trim()
+  if (!sid) return null
+  const store = getSessionStore(sid)
+  const state = snapshot ?? captureChatScrollSnapshot(sid)
+  if (!state) return store
+  store.chatScrollTop = Math.max(0, Number(state.scrollTop ?? 0) || 0)
+  store.chatStickToBottom = Boolean(state.stickToBottom)
+  return store
+}
+
+async function restoreChatScrollState(sessionId = selectedSessionId.value, snapshot = null) {
+  const sid = String(sessionId ?? '').trim()
+  if (!sid) return
+  await nextTick()
+  await waitForNextPaint()
+  const el = chatScrollEl.value
+  if (!el) return
+
+  const store = getSessionStore(sid)
+  const state = (snapshot && String(snapshot.sessionId ?? '').trim() === sid)
+    ? snapshot
+    : {
+        sessionId: sid,
+        scrollTop: Number(store.chatScrollTop ?? 0) || 0,
+        stickToBottom: Boolean(store.chatStickToBottom ?? true)
+      }
+
+  if (state.stickToBottom) {
+    el.scrollTop = el.scrollHeight
+    await waitForNextPaint()
+    el.scrollTop = el.scrollHeight
+    stickToBottom.value = true
+  } else {
+    const top = clampChatScrollTop(el, state.scrollTop)
+    el.scrollTop = top
+    await waitForNextPaint()
+    el.scrollTop = clampChatScrollTop(el, top)
+    stickToBottom.value = chatNearBottom(el)
+  }
+
+  store.chatScrollTop = Math.max(0, Number(el.scrollTop ?? 0) || 0)
+  store.chatStickToBottom = Boolean(stickToBottom.value)
+}
+
 function onChatScroll() {
   const el = chatScrollEl.value
   if (!el) return
@@ -2118,9 +2220,14 @@ function onChatScroll() {
   if (selectedSessionId.value && el.scrollTop <= 500) {
     loadMoreBefore(selectedSessionId.value, { pages: 3, limit: 500 }).catch(() => {})
   }
-  const nearBottom = (el.scrollTop + el.clientHeight) >= (el.scrollHeight - 80)
+  const nearBottom = chatNearBottom(el)
   const was = stickToBottom.value
   stickToBottom.value = nearBottom
+  rememberChatScrollState(selectedSessionId.value, {
+    sessionId: selectedSessionId.value,
+    scrollTop: el.scrollTop,
+    stickToBottom: nearBottom
+  })
   if (!was && nearBottom && selectedSessionId.value) {
     scheduleMarkRead(selectedSessionId.value)
   }
@@ -2131,6 +2238,11 @@ function scrollToBottom() {
   if (!el) return
   el.scrollTop = el.scrollHeight
   stickToBottom.value = true
+  rememberChatScrollState(selectedSessionId.value, {
+    sessionId: selectedSessionId.value,
+    scrollTop: el.scrollTop,
+    stickToBottom: true
+  })
   if (selectedSessionId.value) scheduleMarkRead(selectedSessionId.value)
 }
 
@@ -2150,6 +2262,11 @@ async function onChatAssetLoad() {
   el.scrollTop = el.scrollHeight
   await waitForNextPaint()
   el.scrollTop = el.scrollHeight
+  rememberChatScrollState(selectedSessionId.value, {
+    sessionId: selectedSessionId.value,
+    scrollTop: el.scrollTop,
+    stickToBottom: true
+  })
 }
 
 watch(
@@ -2163,6 +2280,11 @@ watch(
     el.scrollTop = el.scrollHeight
     await waitForNextPaint()
     el.scrollTop = el.scrollHeight
+    rememberChatScrollState(sessionId, {
+      sessionId,
+      scrollTop: el.scrollTop,
+      stickToBottom: true
+    })
     scheduleMarkRead(sessionId)
   },
   { flush: 'post' }
@@ -2720,7 +2842,6 @@ function onIdeFrameLoad() {
 const {
   openRenameSession,
   saveRenameSession,
-  pendingApproval,
   approvalAllows,
   approvalExtraActions,
   respondApproval,
@@ -2744,6 +2865,7 @@ const {
   sessionPolicyError,
   sessionApprovalDraft,
   sessionSandboxDraft,
+  activeApproval: selectedComposerApproval,
   approvalQueue,
   approvalIds,
   approvalResponding,
@@ -2816,10 +2938,14 @@ onMounted(async () => {
   try { window.addEventListener('online', onOnline) } catch {}
   try { window.addEventListener('offline', onOffline) } catch {}
   const onResize = () => {
+    const chatSnapshot = captureChatScrollSnapshot()
     refreshMobileLayout()
     applySessionSidebarWidth(sessionSidebarWidth.value)
     applyWorkspaceChatPaneWidth(workspaceChatWidth.value)
     updateSessionListMetrics()
+    if (chatSnapshot) {
+      restoreChatScrollState(chatSnapshot.sessionId, chatSnapshot).catch(() => {})
+    }
   }
   windowResizeHandler = onResize
   try { window.addEventListener('resize', onResize) } catch {}
@@ -2870,6 +2996,15 @@ onMounted(async () => {
       if (sessionListScrollEl.value) sessionListResizeObserver.observe(sessionListScrollEl.value)
     } catch {
     }
+    try {
+      chatResizeObserver = new ResizeObserver(() => {
+        const sid = String(selectedSessionId.value ?? '').trim()
+        if (!sid) return
+        restoreChatScrollState(sid).catch(() => {})
+      })
+      if (chatScrollEl.value) chatResizeObserver.observe(chatScrollEl.value)
+    } catch {
+    }
   }
 
   const onVisibility = () => schedulePostVisibility()
@@ -2916,6 +3051,8 @@ onBeforeUnmount(() => {
   }
   try { sessionListResizeObserver?.disconnect?.() } catch {}
   sessionListResizeObserver = null
+  try { chatResizeObserver?.disconnect?.() } catch {}
+  chatResizeObserver = null
   if (nowTimer) {
     try { clearInterval(nowTimer) } catch {}
     nowTimer = null
@@ -4019,8 +4156,214 @@ watch(
               <div v-if="sendError" class="mb-2 text-sm text-red-600">{{ sendError }}</div>
               <div v-if="composerOptionsError" class="mb-2 text-sm text-red-600">{{ composerOptionsError }}</div>
               <div v-if="modelCatalogError" class="mb-2 text-sm text-red-600">{{ modelCatalogError }}</div>
+              <div
+                v-if="!selectedComposerApproval && nextOtherPendingApproval"
+                class="mb-2 flex items-center justify-between gap-3 rounded-2xl border border-amber-200 bg-amber-50/80 px-4 py-3 text-sm"
+              >
+                <div class="min-w-0">
+                  <div class="text-[11px] font-semibold uppercase tracking-wider text-amber-700">Approval waiting elsewhere</div>
+                  <div class="mt-1 text-amber-950">{{ nextOtherPendingApprovalLabel }}</div>
+                </div>
+                <button
+                  type="button"
+                  class="shrink-0 rounded-full bg-white px-3 py-1.5 text-[12px] font-medium text-amber-900 ring-1 ring-amber-200 transition-colors hover:bg-amber-100"
+                  @click="nextOtherPendingApproval?.sessionId ? openSession(nextOtherPendingApproval.sessionId) : null"
+                >
+                  Open thread
+                </button>
+              </div>
 
               <div class="overflow-hidden rounded-[24px] border border-black/[0.06] bg-white shadow-[0_1px_2px_rgba(0,0,0,0.05)] transition-colors focus-within:border-black/[0.12] focus-within:ring-2 focus-within:ring-slate-400/20">
+                <div
+                  v-if="selectedComposerApproval"
+                  class="border-b border-black/[0.06] bg-[#f5f5f2]"
+                >
+                  <div class="flex items-center justify-between gap-3 px-4 py-2 text-left text-xs text-slate-700">
+                    <div class="min-w-0">
+                      <div class="text-[11px] font-medium uppercase tracking-[0.16em] text-slate-500">
+                        {{ approvalCardTitle(selectedComposerApproval) }}
+                      </div>
+                    </div>
+                    <div
+                      class="shrink-0"
+                      :class="selectedComposerApproval.kind === 'userInput' ? 'text-right' : 'flex flex-wrap items-center justify-end gap-1'"
+                    >
+                      <template v-if="selectedComposerApproval.kind !== 'userInput'">
+                        <button
+                          v-if="approvalAllows('accept')"
+                          type="button"
+                          class="inline-flex h-6 items-center rounded-full bg-white px-2.5 text-[11px] font-medium leading-none text-emerald-700 ring-1 ring-emerald-300 transition-colors hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-40"
+                          :disabled="approvalResponding"
+                          @click="respondApproval('accept', selectedComposerApproval)"
+                        >
+                          Accept
+                        </button>
+                        <button
+                          v-for="a in approvalExtraActions"
+                          :key="a.id"
+                          type="button"
+                          class="inline-flex h-6 items-center rounded-full px-2.5 text-[11px] font-medium leading-none transition-colors disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2"
+                          :class="a.variant === 'emerald-solid'
+                            ? 'bg-white text-slate-800 ring-1 ring-black/8 hover:bg-slate-50 focus-visible:ring-slate-500/30'
+                            : (a.variant === 'red-outline'
+                              ? 'bg-white text-red-700 ring-1 ring-red-200 hover:bg-red-50 focus-visible:ring-red-500/30'
+                              : 'bg-white text-emerald-700 ring-1 ring-emerald-200 hover:bg-emerald-50 focus-visible:ring-emerald-500/30')"
+                          :disabled="approvalResponding"
+                          @click="respondApproval(a.decision, selectedComposerApproval)"
+                        >
+                          {{ a.label }}
+                        </button>
+                        <button
+                          v-if="approvalAllows('cancel')"
+                          type="button"
+                          class="inline-flex h-6 items-center rounded-full bg-white px-2.5 text-[11px] font-medium leading-none text-slate-700 ring-1 ring-black/8 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                          :disabled="approvalResponding"
+                          @click="respondApproval('cancel', selectedComposerApproval)"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          v-if="approvalAllows('decline')"
+                          type="button"
+                          class="inline-flex h-6 items-center rounded-full bg-white px-2.5 text-[11px] font-medium leading-none text-red-700 ring-1 ring-red-200 transition-colors hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-40"
+                          :disabled="approvalResponding"
+                          @click="respondApproval('decline', selectedComposerApproval)"
+                        >
+                          Decline
+                        </button>
+                      </template>
+                      <button
+                        v-if="otherPendingApprovalsCount"
+                        type="button"
+                        class="inline-flex h-6 items-center rounded-full bg-white px-2.5 text-[11px] font-medium leading-none text-slate-700 ring-1 ring-black/8 transition-colors hover:bg-slate-50"
+                        @click="nextOtherPendingApproval?.sessionId ? openSession(nextOtherPendingApproval.sessionId) : null"
+                      >
+                        {{ otherPendingApprovalsCount }} more waiting
+                      </button>
+                    </div>
+                  </div>
+
+                  <div class="border-t border-black/[0.05] bg-[#fbfbfa] px-4 py-3">
+                    <div v-if="selectedComposerApproval.kind === 'userInput'">
+                      <div
+                        v-if="Array.isArray(selectedComposerApproval.questions) && selectedComposerApproval.questions.length"
+                        class="space-y-4"
+                      >
+                        <div v-for="(q, idx) in selectedComposerApproval.questions" :key="q?.id ?? idx">
+                          <div v-if="q?.id && userInputForm[String(q.id)]">
+                            <div class="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                              {{ q.header || q.id }}
+                            </div>
+                            <div class="mt-1 whitespace-pre-wrap text-sm text-slate-900">{{ q.question }}</div>
+
+                            <div v-if="Array.isArray(q.options) && q.options.length" class="mt-3 space-y-2">
+                              <label
+                                v-for="opt in q.options"
+                                :key="opt.label"
+                                class="flex cursor-pointer gap-3 rounded-2xl border border-black/[0.06] bg-white px-3 py-3 text-sm text-slate-800 transition-colors hover:bg-slate-50"
+                              >
+                                <input
+                                  v-model="userInputForm[String(q.id)].choice"
+                                  type="radio"
+                                  class="mt-0.5 accent-slate-900"
+                                  :name="`q-${q.id}`"
+                                  :value="opt.label"
+                                />
+                                <div class="min-w-0">
+                                  <div class="text-sm text-slate-900">{{ opt.label }}</div>
+                                  <div class="text-xs text-slate-500">{{ opt.description }}</div>
+                                </div>
+                              </label>
+
+                              <label
+                                v-if="q.isOther"
+                                class="flex cursor-pointer gap-3 rounded-2xl border border-black/[0.06] bg-white px-3 py-3 text-sm text-slate-800 transition-colors hover:bg-slate-50"
+                              >
+                                <input
+                                  v-model="userInputForm[String(q.id)].choice"
+                                  type="radio"
+                                  class="mt-0.5 accent-slate-900"
+                                  :name="`q-${q.id}`"
+                                  value="__other__"
+                                />
+                                <div class="min-w-0 w-full">
+                                  <div class="text-sm text-slate-900">Other</div>
+                                  <input
+                                    v-if="userInputForm[String(q.id)].choice === '__other__'"
+                                    v-model="userInputForm[String(q.id)].other"
+                                    :type="q.isSecret ? 'password' : 'text'"
+                                    class="mt-2 w-full rounded-xl border border-black/[0.08] bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-black/[0.14]"
+                                    placeholder="Type an answer…"
+                                  />
+                                </div>
+                              </label>
+                            </div>
+
+                            <div v-else class="mt-3">
+                              <input
+                                v-model="userInputForm[String(q.id)].text"
+                                :type="q.isSecret ? 'password' : 'text'"
+                                class="w-full rounded-xl border border-black/[0.08] bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-black/[0.14]"
+                                placeholder="Type an answer…"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div v-if="userInputError" class="mt-3 text-sm text-red-600">{{ userInputError }}</div>
+
+                      <div class="mt-4 flex items-center justify-end gap-2">
+                        <button
+                          type="button"
+                          class="rounded-full bg-white px-3 py-1.5 text-sm text-slate-800 ring-1 ring-black/8 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                          :disabled="userInputSubmitting"
+                          @click="cancelUserInput(selectedComposerApproval)"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          class="inline-flex items-center gap-2 rounded-full bg-slate-900 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                          :disabled="userInputSubmitting"
+                          @click="submitUserInput(selectedComposerApproval)"
+                        >
+                          <Loader2 v-if="userInputSubmitting" class="h-4 w-4 animate-spin" />
+                          Submit
+                        </button>
+                      </div>
+                    </div>
+
+                    <div v-else class="space-y-2.5">
+                      <div v-if="selectedComposerApproval.reason">
+                        <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Reason</div>
+                        <div class="mt-1 rounded-2xl border border-black/[0.06] bg-white px-3 py-2 text-[12px] leading-5 text-slate-800 whitespace-pre-wrap">
+                          {{ selectedComposerApproval.reason }}
+                        </div>
+                      </div>
+
+                      <div v-if="selectedComposerApproval.command">
+                        <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Command</div>
+                        <pre class="mt-1 overflow-x-auto rounded-2xl border border-black/[0.06] bg-white px-3 py-2 text-[11px] font-mono leading-5 text-slate-800 whitespace-pre-wrap">{{ selectedComposerApproval.command }}</pre>
+                      </div>
+
+                      <div v-if="selectedComposerApproval.cwd">
+                        <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Working directory</div>
+                        <pre class="mt-1 overflow-x-auto rounded-2xl border border-black/[0.06] bg-white px-3 py-2 text-[11px] font-mono leading-5 text-slate-800 whitespace-pre-wrap">{{ selectedComposerApproval.cwd }}</pre>
+                      </div>
+
+                      <div v-if="selectedComposerApproval.grantRoot">
+                        <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Grant root</div>
+                        <pre class="mt-1 overflow-x-auto rounded-2xl border border-black/[0.06] bg-white px-3 py-2 text-[11px] font-mono leading-5 text-slate-800 whitespace-pre-wrap">{{ selectedComposerApproval.grantRoot }}</pre>
+                      </div>
+
+                      <div v-if="approvalRespondError" class="pt-0.5 text-[12px] text-red-600">
+                        {{ approvalRespondError }}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
                 <div
                   v-if="selectedSessionId && selectedQueuedPrompts.length"
                   class="border-b border-black/[0.06] bg-[#f5f5f2]"
@@ -5160,214 +5503,6 @@ watch(
 	              >
 	                Save
 	              </button>
-	            </div>
-	          </div>
-	        </div>
-	      </transition>
-
-	      <!-- Approvals modal -->
-	      <transition name="rg-fade">
-	        <div v-if="pendingApproval" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-	          <div class="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
-	            <div class="text-sm font-semibold text-slate-900">
-	              {{ pendingApproval.kind === 'userInput' ? 'Input requested' : 'Approval requested' }}
-	            </div>
-	            <div class="mt-1 text-xs text-slate-600">
-	              Session: {{ pendingApproval.sessionId }} · Kind: {{ pendingApproval.kind }}<span v-if="pendingApproval.itemId"> · Item: {{ pendingApproval.itemId }}</span>
-	            </div>
-	
-	            <!-- EXPERIMENTAL: user input request -->
-	            <div v-if="pendingApproval.kind === 'userInput'" class="mt-4">
-	              <div v-if="Array.isArray(pendingApproval.questions) && pendingApproval.questions.length" class="space-y-4">
-	                <div v-for="(q, idx) in pendingApproval.questions" :key="q?.id ?? idx">
-	                  <div v-if="q?.id && userInputForm[String(q.id)]">
-	                    <div class="text-xs uppercase tracking-wider text-slate-500">{{ q.header || q.id }}</div>
-	                    <div class="mt-1 text-sm text-slate-900 whitespace-pre-wrap">{{ q.question }}</div>
-	
-	                    <div v-if="Array.isArray(q.options) && q.options.length" class="mt-3 space-y-2">
-	                      <label
-	                        v-for="opt in q.options"
-	                        :key="opt.label"
-	                        class="flex gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-800 hover:bg-slate-100 cursor-pointer"
-	                      >
-	                        <input
-	                          type="radio"
-	                          class="mt-0.5 accent-indigo-500"
-	                          :name="`q-${q.id}`"
-	                          :value="opt.label"
-	                          v-model="userInputForm[String(q.id)].choice"
-	                        />
-	                        <div class="min-w-0">
-	                          <div class="text-sm text-slate-900">{{ opt.label }}</div>
-	                          <div class="text-xs text-slate-400">{{ opt.description }}</div>
-	                        </div>
-	                      </label>
-	
-	                      <label
-	                        v-if="q.isOther"
-	                        class="flex gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-800 hover:bg-slate-100 cursor-pointer"
-	                      >
-	                        <input
-	                          type="radio"
-	                          class="mt-0.5 accent-indigo-500"
-	                          :name="`q-${q.id}`"
-	                          value="__other__"
-	                          v-model="userInputForm[String(q.id)].choice"
-	                        />
-	                        <div class="min-w-0 w-full">
-	                          <div class="text-sm text-slate-900">Other</div>
-	                          <input
-	                            v-if="userInputForm[String(q.id)].choice === '__other__'"
-	                            v-model="userInputForm[String(q.id)].other"
-	                            :type="q.isSecret ? 'password' : 'text'"
-	                            class="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-	                            placeholder="Type an answer…"
-	                          />
-	                        </div>
-	                      </label>
-	                    </div>
-	
-	                    <div v-else class="mt-3">
-	                      <input
-	                        v-model="userInputForm[String(q.id)].text"
-	                        :type="q.isSecret ? 'password' : 'text'"
-	                        class="w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500/20"
-	                        placeholder="Type an answer…"
-	                      />
-	                    </div>
-	                  </div>
-	                </div>
-	              </div>
-	
-	              <div v-if="userInputError" class="mt-3 text-sm text-red-600">{{ userInputError }}</div>
-	
-	              <div class="mt-5 flex items-center justify-end gap-2">
-	                <button
-	                  class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-	                  @click="cancelUserInput"
-	                  :disabled="userInputSubmitting"
-	                >
-	                  Cancel
-	                </button>
-	                <button
-	                  class="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
-	                  @click="submitUserInput"
-	                  :disabled="userInputSubmitting"
-	                >
-	                  <Loader2 v-if="userInputSubmitting" class="h-4 w-4 animate-spin" />
-	                  Submit
-	                </button>
-	              </div>
-	            </div>
-	
-	            <!-- command / file-change approvals -->
-	            <div v-else>
-	              <div v-if="pendingApproval.reason" class="mt-4">
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Reason</div>
-	                <div class="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-800 whitespace-pre-wrap">{{ pendingApproval.reason }}</div>
-	              </div>
-	
-	              <div v-if="pendingApproval.command" class="mt-4">
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Command</div>
-	                <pre class="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ pendingApproval.command }}</pre>
-	              </div>
-
-	              <div v-if="pendingApproval.cwd" class="mt-4">
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Working directory</div>
-	                <pre class="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ pendingApproval.cwd }}</pre>
-	              </div>
-
-	              <div v-if="pendingApproval.grantRoot" class="mt-4">
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Grant root</div>
-	                <pre class="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ pendingApproval.grantRoot }}</pre>
-	              </div>
-
-	              <div v-if="pendingApproval.additionalPermissions" class="mt-4">
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Additional permissions</div>
-	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.additionalPermissions, null, 2) }}</pre>
-	              </div>
-
-	              <div v-if="pendingApproval.availableDecisions" class="mt-4">
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Available decisions</div>
-	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.availableDecisions, null, 2) }}</pre>
-	              </div>
-
-	              <div v-if="pendingApproval.commandActions" class="mt-4">
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Command actions</div>
-	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.commandActions, null, 2) }}</pre>
-	              </div>
-
-	              <div v-if="pendingApproval.proposedExecpolicyAmendment" class="mt-4">
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Proposed execpolicy amendment</div>
-	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.proposedExecpolicyAmendment, null, 2) }}</pre>
-	              </div>
-
-	              <div v-if="pendingApproval.proposedNetworkPolicyAmendments" class="mt-4">
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Proposed network policy amendments</div>
-	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.proposedNetworkPolicyAmendments, null, 2) }}</pre>
-	              </div>
-
-	              <div v-if="pendingApproval.networkApprovalContext" class="mt-4">
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Network approval context</div>
-	                <pre class="mt-2 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono text-slate-800 whitespace-pre-wrap">{{ JSON.stringify(pendingApproval.networkApprovalContext, null, 2) }}</pre>
-	              </div>
-
-	              <div v-if="approvalExtraActions.length" class="mt-4">
-	                <div class="text-xs uppercase tracking-wider text-slate-500">Quick actions</div>
-	                <div class="mt-2 flex flex-wrap items-center justify-end gap-2">
-	                  <button
-	                    v-for="a in approvalExtraActions"
-	                    :key="a.id"
-	                    class="rounded-md px-3 py-2 text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2"
-	                    :class="a.variant === 'emerald-solid'
-	                      ? 'bg-emerald-600 text-white hover:bg-emerald-500 focus-visible:ring-emerald-500/30'
-	                      : (a.variant === 'red-outline'
-	                        ? 'bg-red-50 text-red-700 hover:bg-red-100 focus-visible:ring-red-500/30'
-	                        : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 focus-visible:ring-emerald-500/30')"
-	                    @click="respondApproval(a.decision)"
-	                    :disabled="approvalResponding"
-	                  >
-	                    {{ a.label }}
-	                  </button>
-	                </div>
-	              </div>
-	
-	              <div v-if="approvalRespondError" class="mt-3 text-sm text-red-600">{{ approvalRespondError }}</div>
-	
-	              <div class="mt-5 flex items-center justify-end gap-2">
-	                <button
-	                  v-if="approvalAllows('cancel')"
-	                  class="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-800 transition-colors hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
-	                  @click="respondApproval('cancel')"
-	                  :disabled="approvalResponding"
-	                >
-	                  Cancel
-	                </button>
-	                <button
-	                  v-if="approvalAllows('decline')"
-	                  class="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700 transition-colors hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
-	                  @click="respondApproval('decline')"
-	                  :disabled="approvalResponding"
-	                >
-	                  Decline
-	                </button>
-	                <button
-	                  v-if="approvalAllows('accept')"
-	                  class="rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/30"
-	                  @click="respondApproval('accept')"
-	                  :disabled="approvalResponding"
-	                >
-	                  Accept
-	                </button>
-	                <button
-	                  v-if="approvalAllows('acceptForSession')"
-	                  class="rounded-md bg-emerald-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/30"
-	                  @click="respondApproval('acceptForSession')"
-	                  :disabled="approvalResponding"
-	                >
-	                  Accept for session
-	                </button>
-	              </div>
 	            </div>
 	          </div>
 	        </div>

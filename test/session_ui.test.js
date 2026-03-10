@@ -26,6 +26,8 @@ test('createSessionStoreState returns fresh mutable containers', () => {
   assert.deepEqual(b.events, [])
   assert.equal(a.historyLoaded, false)
   assert.equal(a.lastLoadedSeq, 0)
+  assert.equal(a.chatScrollTop, 0)
+  assert.equal(a.chatStickToBottom, true)
 })
 
 test('session UI helpers derive labels and indicator state', () => {

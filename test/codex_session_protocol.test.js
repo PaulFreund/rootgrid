@@ -13,8 +13,11 @@ import {
   tryExtractReasoningText
 } from '../src/runner/sessions/codexSessionProtocol.js'
 
-test('approval and sandbox compatibility helpers preserve useful fallback variants', () => {
-  assert.deepEqual(approvalPolicyCandidates('on-failure'), ['onFailure', 'on-failure'])
+test('approval and sandbox compatibility helpers prefer current variants before legacy fallbacks', () => {
+  assert.deepEqual(approvalPolicyCandidates('untrusted'), ['untrusted', 'unlessTrusted'])
+  assert.deepEqual(approvalPolicyCandidates('on-failure'), ['on-failure', 'onFailure'])
+  assert.deepEqual(approvalPolicyCandidates('onRequest'), ['on-request', 'onRequest'])
+  assert.deepEqual(approvalPolicyCandidates('reject'), ['reject'])
   assert.deepEqual(sandboxPolicyCandidates('workspace-write', '/repo'), [
     { type: 'workspaceWrite', writableRoots: ['/repo'] },
     { type: 'workspaceWrite' },
