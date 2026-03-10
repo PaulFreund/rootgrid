@@ -43,7 +43,8 @@ export function createSessionEnvelopeHandler({
   bumpSessionToTop,
   updateTokenUsage = null,
   appendToolOutput,
-  addSessionEvent
+  addSessionEvent,
+  onQueuedPromptRestoreRequested = null
 }) {
   let toastSeq = 0
   const seenToastIds = new Set()
@@ -167,6 +168,24 @@ export function createSessionEnvelopeHandler({
       store.queuedPrompts = Array.isArray(env.payload?.queuedPrompts) ? env.payload.queuedPrompts : []
       store.queueSending = false
       store.messageViewVersion = Number(store.messageViewVersion ?? 0) + 1
+      return
+    }
+
+    if (env.type === 'session.queuedPrompt.restoreRequested') {
+      const store = sessionStores.get(sessionId) ?? getSessionStore(sessionId)
+      if (!store) return
+      store.restoredPrompt = env.payload?.prompt ?? null
+      store.restoredPromptError = String(env.payload?.error ?? '').trim()
+      store.queueSending = false
+      store.messageViewVersion = Number(store.messageViewVersion ?? 0) + 1
+      try {
+        onQueuedPromptRestoreRequested?.({
+          sessionId,
+          prompt: env.payload?.prompt ?? null,
+          error: String(env.payload?.error ?? '').trim()
+        })
+      } catch {
+      }
       return
     }
 

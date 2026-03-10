@@ -32,6 +32,15 @@
     },
     "publicUrl": null,
     "trustProxy": false,
+    "selfUpdate": {
+      "enabled": false,
+      "repoUrl": null,
+      "branch": "main",
+      "workdir": null,
+      "installCommand": "npm ci",
+      "buildCommand": "npm run build",
+      "restartCommand": null
+    },
     "auth": {
       "clientToken": "replace-with-a-long-random-client-token",
       "runnerToken": "replace-with-a-long-random-runner-token"

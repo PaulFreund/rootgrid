@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  buildComposerAttachmentRefs,
   buildComposerAttachments,
   clearComposerAttachments,
   uploadComposerAttachments
@@ -41,6 +42,53 @@ test('clearComposerAttachments revokes blob previews and empties the list', () =
 
   assert.deepEqual(revoked, ['blob:one', 'blob:three'])
   assert.equal(list.length, 0)
+})
+
+test('buildComposerAttachmentRefs restores reusable upload refs for the composer', () => {
+  const restored = buildComposerAttachmentRefs([
+    {
+      uploadId: 'upload-1',
+      filename: 'photo.png',
+      mimeType: 'image/png',
+      sizeBytes: 42,
+      url: '/api/sessions/session-1/uploads/upload-1'
+    },
+    {
+      uploadId: 'upload-2',
+      filename: 'note.txt',
+      mimeType: 'text/plain',
+      sizeBytes: 12,
+      url: '/api/sessions/session-1/uploads/upload-2'
+    }
+  ], 'session-1', {
+    createId: (() => {
+      let next = 0
+      return () => `att-${++next}`
+    })()
+  })
+
+  assert.deepEqual(restored, [
+    {
+      id: 'att-1',
+      filename: 'photo.png',
+      mimeType: 'image/png',
+      sizeBytes: 42,
+      file: null,
+      previewUrl: '/api/sessions/session-1/uploads/upload-1',
+      uploadId: 'upload-1',
+      uploadedForSessionId: 'session-1'
+    },
+    {
+      id: 'att-2',
+      filename: 'note.txt',
+      mimeType: 'text/plain',
+      sizeBytes: 12,
+      file: null,
+      previewUrl: null,
+      uploadId: 'upload-2',
+      uploadedForSessionId: 'session-1'
+    }
+  ])
 })
 
 test('uploadComposerAttachments reuses session-local upload refs and uploads missing files', async () => {

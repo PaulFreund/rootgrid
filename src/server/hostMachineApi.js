@@ -35,6 +35,24 @@ export function createHostMachineApi({
   pendingIdeStarts,
   requestMachineUpgrade
 }) {
+  function countMachineWorkingSessions(machineId) {
+    const mid = String(machineId ?? '').trim()
+    if (!mid) return 0
+    let count = 0
+    let sessionIds = []
+    try {
+      sessionIds = store.listSessionIdsByMachine(mid)
+    } catch {
+      return 0
+    }
+    for (const sessionId of sessionIds) {
+      const session = store.getSession(sessionId)
+      if (!session) continue
+      if (session.turnState === 'running' || session.status === 'starting') count += 1
+    }
+    return count
+  }
+
   function deriveTrustedOrigins(req) {
     const out = new Set()
     try {
@@ -202,6 +220,14 @@ export function createHostMachineApi({
         const machineId = parts[2]
         if (!runnerWs.listConnectedMachineIds().includes(machineId)) {
           json(res, 404, { error: 'runner not connected' })
+          return true
+        }
+        const activeSessionCount = countMachineWorkingSessions(machineId)
+        if (activeSessionCount > 0) {
+          json(res, 409, {
+            error: `finish ${activeSessionCount} running ${activeSessionCount === 1 ? 'session' : 'sessions'} before upgrading this runner`,
+            activeSessionCount
+          })
           return true
         }
 

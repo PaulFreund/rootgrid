@@ -25,6 +25,7 @@ import {
   buildThreadTokenUsageEvent,
   buildToolCompletedEvent,
   buildToolStartedEvent,
+  normalizeRetryDisplayMessage,
   normalizeWrappedNotification
 } from './codexSessionNotifications.js'
 import {
@@ -599,7 +600,10 @@ export class CodexAppServerSession {
 
     if (method === 'error') {
       const willRetry = Boolean(params?.willRetry ?? params?.will_retry)
-      const message = safeString(params?.error?.message ?? params?.message) ?? 'Unknown error'
+      const message = normalizeRetryDisplayMessage(
+        params?.error?.message ?? params?.message,
+        { willRetry }
+      ) ?? 'Unknown error'
       const details = safeString(params?.error?.additionalDetails ?? params?.details)
       const codexErrorInfo = params?.error?.codexErrorInfo ?? params?.codexErrorInfo ?? null
       const turnId = safeString(params?.turnId ?? params?.turn?.id) ?? this.activeTurnId

@@ -265,3 +265,172 @@ test('host system serves a runner bootstrap shell script by install token', asyn
   assert.equal(res.headers.get('content-type'), 'text/x-shellscript; charset=utf-8')
   assert.equal(res.writes.join(''), '#!/usr/bin/env bash\necho rootgrid\n')
 })
+
+test('host system settings payload includes sanitized host self-update details', async () => {
+  let payload = null
+  const api = createHostSystemApi({
+    auth: {
+      requireAuth() { return true }
+    },
+    store: {
+      listMachines() { return [] },
+      listSessionsPage() { return { sessions: [], hasMoreBefore: false, nextBeforeUpdatedMs: null, nextBeforeSessionId: null } },
+      listApprovals() { return [] }
+    },
+    runnerWs: {
+      listConnectedMachineIds() {
+        return []
+      }
+    },
+    sse: {
+      canReplayFrom() { return false },
+      addClient() {},
+      sendDirect() { return true },
+      activateClient() { return true }
+    },
+    push: null,
+    config: {
+      retentionDays: 30,
+      notifications: { sseToasts: 'if-not-visible', webPush: 'if-not-visible' },
+      host: {
+        enabled: true,
+        listen: { host: '127.0.0.1', port: 7337 },
+        publicUrl: null,
+        trustProxy: false,
+        selfUpdate: {
+          enabled: true,
+          repoUrl: 'https://token@example.com/org/rootgrid.git',
+          branch: 'stable',
+          workdir: '/srv/rootgrid',
+          installCommand: 'npm ci',
+          buildCommand: 'npm run build',
+          restartCommand: null
+        }
+      },
+      runner: {
+        enabled: true,
+        machineId: 'm-1',
+        machineName: 'runner'
+      }
+    },
+    hostSelfUpdate: {
+      getPublicState() {
+        return {
+          enabled: true,
+          repo: 'https://example.com/org/rootgrid.git',
+          branch: 'stable',
+          workdir: '/srv/rootgrid',
+          installCommand: 'npm ci',
+          buildCommand: 'npm run build',
+          restartMode: 'exit',
+          working: false,
+          awaitingRestart: false,
+          lastError: '',
+          lastStartedAtMs: null,
+          lastCompletedAtMs: null
+        }
+      }
+    },
+    readJsonBody: async () => ({}),
+    json(_res, _code, body) {
+      payload = body
+    }
+  })
+
+  const handled = await api.handle({ method: 'GET', headers: {} }, new FakeResponse(), new URL('http://127.0.0.1/api/settings'), [])
+  assert.equal(handled, true)
+  assert.equal(payload?.host?.selfUpdate?.enabled, true)
+  assert.equal(payload?.host?.selfUpdate?.repo, 'https://example.com/org/rootgrid.git')
+  assert.equal(payload?.host?.selfUpdate?.branch, 'stable')
+})
+
+test('host system starts host self-update and schedules restart after responding', async () => {
+  let payload = null
+  let scheduled = 0
+  const api = createHostSystemApi({
+    auth: {
+      requireAuth() { return true }
+    },
+    store: {
+      listMachines() { return [] },
+      listSessionsPage() { return { sessions: [], hasMoreBefore: false, nextBeforeUpdatedMs: null, nextBeforeSessionId: null } },
+      listApprovals() { return [] }
+    },
+    runnerWs: {
+      listConnectedMachineIds() {
+        return []
+      }
+    },
+    sse: {
+      canReplayFrom() { return false },
+      addClient() {},
+      sendDirect() { return true },
+      activateClient() { return true }
+    },
+    push: null,
+    config: {},
+    hostSelfUpdate: {
+      async start() {
+        return { ok: true, message: 'Host update succeeded. Rootgrid is restarting.' }
+      },
+      scheduleExit() {
+        scheduled += 1
+      }
+    },
+    readJsonBody: async () => ({}),
+    json(_res, _code, body) {
+      payload = body
+    }
+  })
+
+  const handled = await api.handle({ method: 'POST', headers: {} }, new FakeResponse(), new URL('http://127.0.0.1/api/host/self-update'), [])
+  assert.equal(handled, true)
+  assert.equal(payload?.ok, true)
+  assert.equal(scheduled, 1)
+})
+
+test('host system returns active session lock details when host self-update is blocked', async () => {
+  let statusCode = null
+  let payload = null
+  const api = createHostSystemApi({
+    auth: {
+      requireAuth() { return true }
+    },
+    store: {
+      listMachines() { return [] },
+      listSessionsPage() { return { sessions: [], hasMoreBefore: false, nextBeforeUpdatedMs: null, nextBeforeSessionId: null } },
+      listApprovals() { return [] }
+    },
+    runnerWs: {
+      listConnectedMachineIds() {
+        return []
+      }
+    },
+    sse: {
+      canReplayFrom() { return false },
+      addClient() {},
+      sendDirect() { return true },
+      activateClient() { return true }
+    },
+    push: null,
+    config: {},
+    hostSelfUpdate: {
+      async start() {
+        const err = new Error('finish 2 running sessions before updating the host')
+        err.statusCode = 409
+        err.activeSessionCount = 2
+        throw err
+      }
+    },
+    readJsonBody: async () => ({}),
+    json(_res, code, body) {
+      statusCode = code
+      payload = body
+    }
+  })
+
+  const handled = await api.handle({ method: 'POST', headers: {} }, new FakeResponse(), new URL('http://127.0.0.1/api/host/self-update'), [])
+  assert.equal(handled, true)
+  assert.equal(statusCode, 409)
+  assert.equal(payload?.activeSessionCount, 2)
+})

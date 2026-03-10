@@ -20,6 +20,24 @@ const RunnerSchema = z.object({
   upgrade: RunnerUpgradeSchema
 })
 
+const HostSelfUpdateSchema = z.object({
+  enabled: z.boolean().default(false),
+  repoUrl: z.string().min(1).nullable().default(null),
+  branch: z.string().min(1).default('main'),
+  workdir: z.string().min(1).nullable().default(null),
+  installCommand: z.string().min(1).default('npm ci'),
+  buildCommand: z.string().min(1).default('npm run build'),
+  restartCommand: z.string().min(1).nullable().default(null)
+}).default({
+  enabled: false,
+  repoUrl: null,
+  branch: 'main',
+  workdir: null,
+  installCommand: 'npm ci',
+  buildCommand: 'npm run build',
+  restartCommand: null
+})
+
 export const RootgridConfigSchema = z.object({
   version: z.number().int().min(1),
   retentionDays: z.number().int().min(1).default(30),
@@ -43,6 +61,7 @@ export const RootgridConfigSchema = z.object({
     listen: ListenSchema,
     publicUrl: z.string().url().nullable(),
     trustProxy: z.boolean(),
+    selfUpdate: HostSelfUpdateSchema,
     auth: z.object({
       clientToken: z.string().min(16),
       runnerToken: z.string().min(16)

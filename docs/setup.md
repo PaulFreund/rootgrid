@@ -155,6 +155,15 @@ This is a **proposed** starting point; adjust as implementation realities land. 
     "listen": { "host": "127.0.0.1", "port": 7337 },
     "publicUrl": null,
     "trustProxy": false,
+    "selfUpdate": {
+      "enabled": false,
+      "repoUrl": null,
+      "branch": "main",
+      "workdir": null,
+      "installCommand": "npm ci",
+      "buildCommand": "npm run build",
+      "restartCommand": null
+    },
     "auth": {
       "clientToken": "replace-with-random",
       "runnerToken": "replace-with-random"
@@ -188,6 +197,7 @@ Notes:
 - In host mode:
   - `host.auth.clientToken` protects **browser/web UI** access.
   - `host.auth.runnerToken` protects **runner registration**.
+  - `host.selfUpdate` optionally enables the **Settings → System → Host self-update** button for git-based host installs. `repoUrl` may already include credentials when needed; the UI only shows a sanitized remote.
 - In upstream mode, `upstream.url` and `upstream.runnerToken` are required.
 - v0 recommendation: `host.enabled=true` and `upstream.enabled=true` should be treated as **mutually exclusive** (either you host the UI here, or you connect to an upstream host).
 

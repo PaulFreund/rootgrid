@@ -214,6 +214,17 @@ export function machineSupportsWebUpgrade(machine) {
   return Boolean(machine?.capabilities?.upgrade?.enabled)
 }
 
+export function countMachineWorkingSessions(sessions, machineId) {
+  const mid = String(machineId ?? '').trim()
+  if (!mid) return 0
+  let count = 0
+  for (const session of (Array.isArray(sessions) ? sessions : [])) {
+    if (String(session?.machineId ?? '').trim() !== mid) continue
+    if (session?.turnState === 'running' || session?.status === 'starting') count += 1
+  }
+  return count
+}
+
 export function machineUpgradeStatusText(machine) {
   const state = String(machine?.upgrade?.state ?? '').trim()
   if (!state) return ''

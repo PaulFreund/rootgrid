@@ -988,7 +988,13 @@ function buildChatMessagesSlow(store) {
       if (stream === 'normalized') {
         ensureAssistant(currentAssistant?.id ?? event.eventId).text += text
       } else if ((stream === 'stderr' || stream === 'stdout') && !event.payload?.itemId) {
-        msgs.push({ id: event.eventId, role: 'system', stream, text: String(text ?? '') })
+        msgs.push({
+          id: event.eventId,
+          role: 'system',
+          stream,
+          text: String(text ?? ''),
+          ...(stream === 'stderr' ? { tone: 'error' } : {})
+        })
       }
       continue
     }
@@ -1021,13 +1027,19 @@ function buildChatMessagesSlow(store) {
       msgs.push({
         id: event.eventId,
         role: 'system',
-        text: parts.filter(Boolean).join('\n') || 'Unknown error'
+        text: parts.filter(Boolean).join('\n') || 'Unknown error',
+        tone: 'error'
       })
       continue
     }
 
     if (event.type === 'session.status' && event.payload?.status === 'failed') {
-      msgs.push({ id: event.eventId, role: 'system', text: `Session failed: ${event.payload?.error ?? 'unknown error'}` })
+      msgs.push({
+        id: event.eventId,
+        role: 'system',
+        text: `Session failed: ${event.payload?.error ?? 'unknown error'}`,
+        tone: 'error'
+      })
       continue
     }
 

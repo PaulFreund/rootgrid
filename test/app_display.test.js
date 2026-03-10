@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import {
   buildContextUsageSummary,
   buildRecentWorkspaces,
+  countMachineWorkingSessions,
   finalizeCompletedPlan,
   formatAgeShort,
   formatAgo,
@@ -112,4 +113,13 @@ test('machine status and plan helpers derive labels consistently', () => {
   ]
   assert.strictEqual(finalizeCompletedPlan(pendingPlan, 'completed'), pendingPlan)
   assert.strictEqual(finalizeCompletedPlan(pendingPlan, 'interrupted'), pendingPlan)
+})
+
+test('countMachineWorkingSessions only counts running turns on the target machine', () => {
+  assert.equal(countMachineWorkingSessions([
+    { sessionId: 's-1', machineId: 'machine-1', turnState: 'running', status: 'running' },
+    { sessionId: 's-2', machineId: 'machine-1', turnState: 'idle', status: 'starting' },
+    { sessionId: 's-3', machineId: 'machine-1', turnState: 'idle', status: 'running' },
+    { sessionId: 's-4', machineId: 'machine-2', turnState: 'running', status: 'running' }
+  ], 'machine-1'), 2)
 })

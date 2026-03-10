@@ -25,6 +25,8 @@ export function createSessionStoreState() {
     chatStickToBottom: true,
     queuedPrompts: [],
     queueSending: false,
+    restoredPrompt: null,
+    restoredPromptError: '',
     toolOutputByItemId: new Map(),
     toolExpanded: new Map(),
     diffExpandedByEventId: new Map(),

@@ -68,6 +68,24 @@ Setup also installs a managed runtime under:
 
 That managed runtime is used for **runner-only installs** and remote runner upgrades. Host-mode installs run directly from the current package checkout/install so a normal `git pull` + restart picks up the new UI/code.
 
+If your host runs from a git checkout or a container-managed worktree, you can also configure a web-triggered host self-update in `~/.rootgrid/config.json`:
+
+```json
+"host": {
+  "selfUpdate": {
+    "enabled": true,
+    "repoUrl": "https://example.com/org/rootgrid.git",
+    "branch": "main",
+    "workdir": "/srv/rootgrid",
+    "installCommand": "npm ci",
+    "buildCommand": "npm run build",
+    "restartCommand": null
+  }
+}
+```
+
+Then use **Settings → System → Host self-update**. `repoUrl` may already include credentials/PAT if needed; the UI only shows a sanitized remote.
+
 To add a new remote runner without `git` or `npm`, open **Settings → Machines** on the host and use the generated one-liner:
 
 ```bash

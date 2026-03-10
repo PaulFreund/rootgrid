@@ -23,5 +23,7 @@ test('config.example.json includes all config fields and validates against the s
   assert.ok(Object.hasOwn(parsed.host, 'listen'))
   assert.ok(Object.hasOwn(parsed.host, 'publicUrl'))
   assert.ok(Object.hasOwn(parsed.host, 'trustProxy'))
+  assert.ok(Object.hasOwn(parsed.host, 'selfUpdate'))
   assert.ok(Object.hasOwn(parsed.host, 'auth'))
+  assert.ok(Object.hasOwn(parsed.host.selfUpdate, 'branch'))
 })

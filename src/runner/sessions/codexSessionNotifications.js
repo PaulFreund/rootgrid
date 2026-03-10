@@ -8,6 +8,16 @@ function fromWrappedParams(params) {
   return { __rgFromWrapped: true, ...(params ?? {}) }
 }
 
+export function normalizeRetryDisplayMessage(message, { willRetry = false } = {}) {
+  const text = safeString(message)
+  if (!text || !willRetry) return text
+  const match = text.match(/^(Reconnecting\.\.\.\s*)(\d+)(\/\d+)(.*)$/i)
+  if (!match) return text
+  const attempt = Number(match[2])
+  if (!Number.isFinite(attempt) || attempt <= 1) return text
+  return `${match[1]}${attempt - 1}${match[3]}${match[4]}`
+}
+
 export function normalizeWrappedNotification({ method, params, sessionId }) {
   if (typeof method !== 'string' || !method.startsWith('codex/event/')) return null
 
@@ -137,7 +147,7 @@ export function normalizeWrappedNotification({ method, params, sessionId }) {
 
   if (msgType === 'error') {
     const willRetry = Boolean(wrapped?.will_retry ?? wrapped?.willRetry)
-    const message = safeString(wrapped?.message)
+    const message = normalizeRetryDisplayMessage(wrapped?.message, { willRetry })
     const details = safeString(wrapped?.additional_details ?? wrapped?.additionalDetails)
     const codexErrorInfo = wrapped?.codex_error_info ?? wrapped?.codexErrorInfo ?? null
     return {

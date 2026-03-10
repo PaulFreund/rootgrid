@@ -8,6 +8,7 @@ import {
   buildThreadTokenUsageEvent,
   buildToolCompletedEvent,
   buildToolStartedEvent,
+  normalizeRetryDisplayMessage,
   normalizeWrappedNotification
 } from '../src/runner/sessions/codexSessionNotifications.js'
 
@@ -78,12 +79,31 @@ test('normalizeWrappedNotification remaps wrapped deltas and token counts', () =
         __rgFromWrapped: true,
         turnId: 'turn-1',
         willRetry: true,
-        message: 'Reconnecting... 2/5',
+        message: 'Reconnecting... 1/5',
         details: 'stream disconnected',
         codexErrorInfo: { response_stream_disconnected: { http_status_code: null } }
       }
     }]
   })
+})
+
+test('normalizeRetryDisplayMessage shifts reconnect attempt labels to retry labels', () => {
+  assert.equal(
+    normalizeRetryDisplayMessage('Reconnecting... 2/5', { willRetry: true }),
+    'Reconnecting... 1/5'
+  )
+  assert.equal(
+    normalizeRetryDisplayMessage('Reconnecting... 1/5', { willRetry: true }),
+    'Reconnecting... 1/5'
+  )
+  assert.equal(
+    normalizeRetryDisplayMessage('Something else', { willRetry: true }),
+    'Something else'
+  )
+  assert.equal(
+    normalizeRetryDisplayMessage('Reconnecting... 2/5', { willRetry: false }),
+    'Reconnecting... 2/5'
+  )
 })
 
 test('notification helpers build stderr/plan/thread/tool payloads', () => {

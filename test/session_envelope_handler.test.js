@@ -30,6 +30,7 @@ test('session envelope handler keeps registry maps in sync for snapshot/update/d
   const toasts = { value: [] }
   const tokenUpdates = []
   const addedEvents = []
+  const restoredPrompts = []
 
   const handleEnvelope = createSessionEnvelopeHandler({
     currentVisibility: () => 'visible',
@@ -63,6 +64,7 @@ test('session envelope handler keeps registry maps in sync for snapshot/update/d
     bumpSessionToTop: () => {},
     updateTokenUsage: (sessionId, payload) => tokenUpdates.push({ sessionId, payload }),
     appendToolOutput: () => {},
+    onQueuedPromptRestoreRequested: (payload) => restoredPrompts.push(payload),
     addSessionEvent: (sessionId, event) => {
       addedEvents.push({ sessionId, event })
     }
@@ -183,6 +185,34 @@ test('session envelope handler keeps registry maps in sync for snapshot/update/d
   })
   assert.equal(sessionStores.get('s-1').queuedPrompts?.length ?? 0, 1)
   assert.equal(sessionStores.get('s-1').queueSending, false)
+
+  handleEnvelope({
+    type: 'session.queuedPrompt.restoreRequested',
+    scope: { sessionId: 's-1' },
+    payload: {
+      sessionId: 's-1',
+      prompt: {
+        id: 'qp-restore-1',
+        promptId: 'qp-restore-1',
+        text: 'retry me',
+        attachments: [{ uploadId: 'upload-1', filename: 'note.txt', mimeType: 'text/plain' }]
+      },
+      error: 'runner not connected'
+    }
+  })
+  assert.equal(sessionStores.get('s-1').restoredPrompt?.text, 'retry me')
+  assert.equal(sessionStores.get('s-1').restoredPromptError, 'runner not connected')
+  assert.equal(sessionStores.get('s-1').queueSending, false)
+  assert.deepEqual(restoredPrompts, [{
+    sessionId: 's-1',
+    prompt: {
+      id: 'qp-restore-1',
+      promptId: 'qp-restore-1',
+      text: 'retry me',
+      attachments: [{ uploadId: 'upload-1', filename: 'note.txt', mimeType: 'text/plain' }]
+    },
+    error: 'runner not connected'
+  }])
 
   handleEnvelope({
     type: 'turn.completed',

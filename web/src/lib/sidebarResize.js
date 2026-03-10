@@ -1,6 +1,14 @@
 export const DEFAULT_SESSION_SIDEBAR_WIDTH = 300
 export const MIN_SESSION_SIDEBAR_WIDTH = 220
 export const MAX_SESSION_SIDEBAR_WIDTH = 420
+export const COMPACT_SESSION_SIDEBAR_WIDTH = 56
+export const DEFAULT_DESKTOP_SIDEBAR_MODE = 'expanded'
+export const DESKTOP_SIDEBAR_MODES = Object.freeze(['expanded', 'collapsed', 'hover'])
+
+export function normalizeDesktopSidebarMode(value) {
+  const mode = String(value ?? '').trim().toLowerCase()
+  return DESKTOP_SIDEBAR_MODES.includes(mode) ? mode : DEFAULT_DESKTOP_SIDEBAR_MODE
+}
 
 export function clampSessionSidebarWidth(value, viewportWidth = 0) {
   const maxByViewport = Math.floor(Number(viewportWidth ?? 0) * 0.45)
@@ -36,4 +44,21 @@ export function persistSessionSidebarWidth(value, storage = globalThis.localStor
   } catch {
   }
   return width
+}
+
+export function readStoredDesktopSidebarMode(storage = globalThis.localStorage) {
+  try {
+    return normalizeDesktopSidebarMode(storage?.getItem?.('rootgrid.desktopSidebarMode'))
+  } catch {
+    return DEFAULT_DESKTOP_SIDEBAR_MODE
+  }
+}
+
+export function persistDesktopSidebarMode(value, storage = globalThis.localStorage) {
+  const mode = normalizeDesktopSidebarMode(value)
+  try {
+    storage?.setItem?.('rootgrid.desktopSidebarMode', mode)
+  } catch {
+  }
+  return mode
 }

@@ -401,7 +401,7 @@ test('buildChatMessages keeps session errors inside Thinking and preserves compl
       type: 'session.error',
       payload: {
         turnId: 'turn-err',
-        message: 'Reconnecting... 2/5',
+        message: 'Reconnecting... 1/5',
         details: 'stream disconnected before completion: idle timeout waiting for websocket',
         willRetry: true
       }
@@ -421,9 +421,40 @@ test('buildChatMessages keeps session errors inside Thinking and preserves compl
   assert.equal(messages[1].title, 'Thought for 5m 3s')
   assert.equal(messages[1].active, false)
   assert.equal(messages[1].timeline[0]?.kind, 'error')
-  assert.equal(messages[1].timeline[0]?.message, 'Reconnecting... 2/5')
+  assert.equal(messages[1].timeline[0]?.message, 'Reconnecting... 1/5')
   assert.match(String(messages[1].timeline[0]?.details ?? ''), /idle timeout waiting for websocket/)
   assert.equal(messages[1].timeline[0]?.willRetry, true)
+})
+
+test('buildChatMessages renders top-level stderr and failed status as error-toned system blocks', () => {
+  const store = createSessionStoreState()
+
+  store.events.push(
+    {
+      eventId: 'stderr-1',
+      type: 'session.output',
+      payload: {
+        stream: 'stderr',
+        text: '[codex] stream disconnected before completion'
+      }
+    },
+    {
+      eventId: 'fail-1',
+      type: 'session.status',
+      payload: {
+        status: 'failed',
+        error: 'stream disconnected before completion'
+      }
+    }
+  )
+
+  const messages = buildChatMessages(store)
+  assert.deepEqual(messages.map((message) => message.role), ['system', 'system'])
+  assert.equal(messages[0].stream, 'stderr')
+  assert.equal(messages[0].tone, 'error')
+  assert.match(messages[0].text, /stream disconnected before completion/)
+  assert.equal(messages[1].tone, 'error')
+  assert.match(messages[1].text, /Session failed:/)
 })
 
 test('buildChatMessages interleaves live reasoning chunks with command steps by seq', () => {

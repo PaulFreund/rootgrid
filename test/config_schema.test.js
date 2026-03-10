@@ -9,4 +9,6 @@ test('runner web upgrade config is enabled by default with managed release reten
   const parsed = RootgridConfigSchema.parse(config)
   assert.equal(parsed.runner.upgrade.enabled, true)
   assert.equal(parsed.runner.upgrade.keepReleases, 3)
+  assert.equal(parsed.host.selfUpdate.enabled, false)
+  assert.equal(parsed.host.selfUpdate.branch, 'main')
 })

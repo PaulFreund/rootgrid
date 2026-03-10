@@ -209,6 +209,7 @@ export class SSEManager {
     if (
       type === 'approval.request'
       || type === 'approval.resolved'
+      || type === 'session.queuedPrompt.restoreRequested'
       || type === 'session.status'
       || type === 'session.input'
       || type === 'turn.started'

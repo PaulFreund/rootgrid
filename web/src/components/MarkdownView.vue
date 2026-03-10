@@ -16,17 +16,31 @@ function escapeHtml(str) {
     .replaceAll("'", '&#39;')
 }
 
+function normalizeCodeBlockInput(code, infostring) {
+  if (code && typeof code === 'object') {
+    return {
+      text: String(code.text ?? ''),
+      lang: String(code.lang ?? '')
+    }
+  }
+  return {
+    text: String(code ?? ''),
+    lang: String(infostring ?? '')
+  }
+}
+
 const renderer = new marked.Renderer()
 renderer.code = (code, infostring) => {
-  const lang = String(infostring ?? '').trim().split(/\s+/)[0]
-  const encoded = encodeURIComponent(String(code ?? ''))
+  const normalized = normalizeCodeBlockInput(code, infostring)
+  const lang = normalized.lang.trim().split(/\s+/)[0]
+  const encoded = encodeURIComponent(normalized.text)
   return [
     `<div class="rg-codeblock" data-code="${encoded}">`,
     '  <div class="rg-codeblock__header">',
     `    <div class="rg-codeblock__lang">${escapeHtml(lang || 'code')}</div>`,
     '    <button type="button" class="rg-codeblock__copy">Copy</button>',
     '  </div>',
-    `  <pre><code class="language-${escapeHtml(lang)}">${escapeHtml(code ?? '')}</code></pre>`,
+    `  <pre><code class="language-${escapeHtml(lang)}">${escapeHtml(normalized.text)}</code></pre>`,
     '</div>'
   ].join('\n')
 }

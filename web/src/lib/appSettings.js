@@ -113,6 +113,9 @@ export function createAppSettingsActions({
   retentionDraft,
   sseToastsDraft,
   webPushDraft,
+  hostSelfUpdateWorking = { value: false },
+  hostSelfUpdateError = { value: '' },
+  hostSelfUpdateStatus = { value: '' },
   onLogin
 }) {
   async function loadAppSettings() {
@@ -194,6 +197,36 @@ export function createAppSettingsActions({
     }
   }
 
+  async function startHostSelfUpdate() {
+    hostSelfUpdateError.value = ''
+    hostSelfUpdateStatus.value = ''
+    if (hostSelfUpdateWorking.value) return false
+
+    hostSelfUpdateWorking.value = true
+    let ok = false
+    try {
+      const res = await apiFetch('/api/host/self-update', {
+        method: 'POST',
+        body: JSON.stringify({})
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => null)
+        hostSelfUpdateError.value = err?.error ?? `HTTP ${res.status}`
+        return false
+      }
+
+      const data = await res.json().catch(() => null)
+      hostSelfUpdateStatus.value = String(data?.message ?? 'Host update started.')
+      ok = true
+      return true
+    } catch (err) {
+      hostSelfUpdateError.value = String(err?.message ?? err)
+      return false
+    } finally {
+      if (!ok) hostSelfUpdateWorking.value = false
+    }
+  }
+
   async function login() {
     authError.value = ''
     const res = await apiFetch('/api/auth', {
@@ -214,6 +247,7 @@ export function createAppSettingsActions({
     loadAppSettings,
     checkAuth,
     saveRetentionDays,
+    startHostSelfUpdate,
     login
   }
 }

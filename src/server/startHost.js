@@ -11,6 +11,7 @@ import { makeEnvelope } from './envelope.js'
 import { createHostApprovalApi } from './hostApprovalApi.js'
 import { createHostMachineApi } from './hostMachineApi.js'
 import { createHostRunnerEventHandlers } from './hostRunnerEvents.js'
+import { createHostSelfUpdateManager } from './hostSelfUpdateManager.js'
 import { createHostSystemApi } from './hostSystemApi.js'
 import { readJsonBody, json } from './httpUtil.js'
 import { createModelCatalogCache } from './modelCatalogCache.js'
@@ -63,6 +64,10 @@ export async function startHost({ config }) {
   const runnerInstall = createRunnerInstallManager({
     config,
     releaseBundles
+  })
+  const hostSelfUpdate = createHostSelfUpdateManager({
+    config,
+    store
   })
 
   const tunnelHub = new TunnelHub()
@@ -217,6 +222,23 @@ export async function startHost({ config }) {
     return queuedPrompts
   }
 
+  function sendQueuedPromptRestoreRequested(sessionId, prompt, error = '') {
+    const sid = String(sessionId ?? '').trim()
+    if (!sid) return false
+    const session = store.getSession(sid)
+    if (!session) return false
+    sse.send(makeEnvelope({
+      type: 'session.queuedPrompt.restoreRequested',
+      scope: { machineId: session.machineId, sessionId: sid },
+      payload: {
+        sessionId: sid,
+        prompt: (prompt && typeof prompt === 'object') ? prompt : null,
+        error: String(error ?? '').trim()
+      }
+    }), { recordHistory: false })
+    return true
+  }
+
   async function sendRunnerCommandAndAwait({
     machineId,
     sessionId = null,
@@ -260,6 +282,8 @@ export async function startHost({ config }) {
       ? store.getQueuedPrompt({ sessionId: sid, promptId: pid })
       : (store.listQueuedPrompts(sid)?.[0] ?? null)
     if (!row) throw httpError(404, 'queued prompt not found')
+    const failedPrompt = listQueuedPromptPayloads(sid)
+      .find((prompt) => String(prompt?.promptId ?? prompt?.id ?? '').trim() === String(row?.promptId ?? '').trim()) ?? null
 
     const text = String(row?.text ?? '')
     const attachments = (Array.isArray(row?.attachmentIds) ? row.attachmentIds : [])
@@ -304,20 +328,27 @@ export async function startHost({ config }) {
         ...(session.sandbox ? { sandbox: session.sandbox } : {})
       }
 
-      await sendRunnerCommandAndAwait({
-        machineId: session.machineId,
-        sessionId: sid,
-        type: 'session.send',
-        payload: {
+      try {
+        await sendRunnerCommandAndAwait({
+          machineId: session.machineId,
           sessionId: sid,
-          text,
-          input: inputItems,
-          cwd: session.cwd,
-          codexThreadId: session.codexThreadId ?? null,
-          ...(Object.keys(options).length ? { options } : {})
-        },
-        timeoutMs: 10_000
-      })
+          type: 'session.send',
+          payload: {
+            sessionId: sid,
+            text,
+            input: inputItems,
+            cwd: session.cwd,
+            codexThreadId: session.codexThreadId ?? null,
+            ...(Object.keys(options).length ? { options } : {})
+          },
+          timeoutMs: 10_000
+        })
+      } catch (err) {
+        try { store.deleteQueuedPrompt({ sessionId: sid, promptId: row.promptId }) } catch { }
+        sendQueuedPromptsUpdated(sid)
+        sendQueuedPromptRestoreRequested(sid, failedPrompt, String(err?.message ?? err))
+        throw err
+      }
 
       persistSessionEvent(input, { sessionId: sid })
       try { store.deleteQueuedPrompt({ sessionId: sid, promptId: row.promptId }) } catch { }
@@ -620,6 +651,7 @@ export async function startHost({ config }) {
     push,
     config,
     runnerInstall,
+    hostSelfUpdate,
     readJsonBody,
     json
   })

@@ -124,6 +124,64 @@ async function apiJson({ port, path, method = 'GET', cookie = null, body = null 
   return { res, data }
 }
 
+async function openEventsStream({ port, cookie, sessionId = null, machineId = null, all = false } = {}) {
+  const params = new URLSearchParams({ visibility: 'visible' })
+  if (sessionId) params.set('sessionId', sessionId)
+  if (machineId) params.set('machineId', machineId)
+  if (all) params.set('all', '1')
+
+  const res = await fetch(`http://127.0.0.1:${port}/api/events?${params.toString()}`, {
+    headers: cookie ? { cookie } : {}
+  })
+  assert.equal(res.status, 200)
+  assert.ok(res.body)
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  function takeEnvelope() {
+    const boundary = buffer.indexOf('\n\n')
+    if (boundary < 0) return null
+    const rawBlock = buffer.slice(0, boundary)
+    buffer = buffer.slice(boundary + 2)
+    const dataLine = rawBlock
+      .split('\n')
+      .find((line) => line.startsWith('data: '))
+    if (!dataLine) return null
+    try {
+      return JSON.parse(dataLine.slice(6))
+    } catch {
+      return null
+    }
+  }
+
+  async function nextEnvelope({ timeoutMs = 5_000, predicate = null } = {}) {
+    const start = Date.now()
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      let next = takeEnvelope()
+      while (next) {
+        if (!predicate || predicate(next)) return next
+        next = takeEnvelope()
+      }
+      if (Date.now() - start > timeoutMs) {
+        throw new Error('timeout waiting for SSE event')
+      }
+      const { value, done } = await reader.read()
+      if (done) throw new Error('SSE stream closed')
+      buffer += decoder.decode(value, { stream: true })
+    }
+  }
+
+  return {
+    nextEnvelope,
+    async close() {
+      try { await reader.cancel() } catch { }
+    }
+  }
+}
+
 async function connectRunner({ port, token, machineId, capabilities = {} }) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/runner/ws`)
   await new Promise((resolve, reject) => {
@@ -738,6 +796,263 @@ test('queued prompts persist in bootstrap payloads and auto-drain after turn com
     .filter((event) => event?.type === 'session.input')
     .map((event) => String(event?.payload?.text ?? ''))
   assert.deepEqual(inputs, ['first turn', 'after completion'])
+})
+
+test('failed queued prompts restore over SSE and resend before later queued prompts', async (t) => {
+  const svc = await startHostProcess({ cwd: process.cwd() })
+  t.after(async () => {
+    await svc.stop()
+  })
+
+  const port = svc.config.host.listen.port
+  const cookie = await login({ port, token: svc.config.host.auth.clientToken })
+  const machineId = 'machine-queue-restore-1'
+  let runner = await connectRunner({
+    port,
+    token: svc.config.host.auth.runnerToken,
+    machineId
+  })
+  t.after(() => {
+    try { runner.close() } catch {}
+  })
+
+  let sendCount = 0
+  const uploads = new Map()
+  runner.on('message', (buf) => {
+    let msg
+    try {
+      msg = JSON.parse(String(buf))
+    } catch {
+      return
+    }
+
+    if (msg.type === 'session.upload.begin') {
+      uploads.set(String(msg.payload.uploadId), {
+        chunks: [],
+        filename: String(msg.payload.filename ?? ''),
+        mimeType: String(msg.payload.mimeType ?? '')
+      })
+      return
+    }
+
+    if (msg.type === 'session.upload.chunk') {
+      const state = uploads.get(String(msg.payload.uploadId))
+      if (!state) return
+      state.chunks.push(Buffer.from(String(msg.payload.chunkBase64 ?? ''), 'base64'))
+      return
+    }
+
+    if (msg.type === 'session.upload.end') {
+      const uploadId = String(msg.payload.uploadId)
+      const state = uploads.get(uploadId)
+      if (!state) return
+      runner.send(JSON.stringify({
+        v: 1,
+        type: 'session.uploaded',
+        ts: Date.now(),
+        id: crypto.randomUUID(),
+        scope: { machineId, sessionId: msg.payload.sessionId },
+        payload: {
+          sessionId: msg.payload.sessionId,
+          uploadId,
+          path: `/runner/${uploadId}/${state.filename}`,
+          filename: state.filename,
+          mimeType: state.mimeType,
+          sizeBytes: Buffer.concat(state.chunks).length
+        }
+      }))
+      return
+    }
+
+    if (msg.type !== 'session.send') return
+    sendCount += 1
+    if (sendCount === 1) {
+      runner.send(JSON.stringify({
+        v: 1,
+        type: 'session.command.accepted',
+        ts: Date.now(),
+        id: crypto.randomUUID(),
+        scope: { machineId, sessionId: msg.payload.sessionId },
+        payload: {
+          requestId: msg.payload.requestId,
+          sessionId: msg.payload.sessionId,
+          kind: 'send'
+        }
+      }))
+      return
+    }
+
+    try { runner.close() } catch {}
+  })
+
+  const draft = await apiJson({
+    port,
+    path: '/api/sessions/draft',
+    method: 'POST',
+    cookie,
+    body: {
+      machineId,
+      cwd: process.cwd()
+    }
+  })
+  assert.equal(draft.res.status, 200)
+  const sessionId = draft.data?.sessionId
+  assert.ok(sessionId)
+
+  const events = await openEventsStream({ port, cookie, sessionId })
+  t.after(async () => {
+    await events.close()
+  })
+  await events.nextEnvelope({
+    predicate: (env) => env?.type === 'registry.snapshot'
+  })
+
+  const firstSend = await apiJson({
+    port,
+    path: `/api/sessions/${sessionId}/messages`,
+    method: 'POST',
+    cookie,
+    body: { text: 'first turn' }
+  })
+  assert.equal(firstSend.res.status, 200)
+
+  const uploadRes = await fetch(`http://127.0.0.1:${port}/api/sessions/${sessionId}/uploads?filename=${encodeURIComponent('retry.txt')}`, {
+    method: 'POST',
+    headers: {
+      cookie,
+      'Content-Type': 'text/plain'
+    },
+    body: Buffer.from('retry attachment')
+  })
+  assert.equal(uploadRes.status, 200)
+  const upload = await uploadRes.json()
+  assert.ok(upload?.uploadId)
+
+  const queueRetry = await apiJson({
+    port,
+    path: `/api/sessions/${sessionId}/queued-prompts`,
+    method: 'POST',
+    cookie,
+    body: {
+      text: 'retry me',
+      attachments: [{ uploadId: upload.uploadId }]
+    }
+  })
+  assert.equal(queueRetry.res.status, 200)
+
+  const queueLater = await apiJson({
+    port,
+    path: `/api/sessions/${sessionId}/queued-prompts`,
+    method: 'POST',
+    cookie,
+    body: { text: 'later prompt' }
+  })
+  assert.equal(queueLater.res.status, 200)
+  assert.equal(queueLater.data?.queuedPrompts?.length, 2)
+
+  runner.send(JSON.stringify({
+    v: 1,
+    type: 'turn.completed',
+    ts: Date.now(),
+    id: crypto.randomUUID(),
+    scope: { machineId, sessionId },
+    payload: {
+      sessionId,
+      turnId: 'turn-queue-fail-1',
+      status: 'completed',
+      preview: 'done'
+    }
+  }))
+
+  const restoreRequested = await events.nextEnvelope({
+    predicate: (env) => env?.type === 'session.queuedPrompt.restoreRequested'
+  })
+  assert.equal(restoreRequested.payload?.prompt?.text, 'retry me')
+  assert.equal(restoreRequested.payload?.prompt?.attachments?.length, 1)
+  assert.equal(restoreRequested.payload?.prompt?.attachments?.[0]?.uploadId, upload.uploadId)
+  assert.match(String(restoreRequested.payload?.error ?? ''), /runner disconnected/i)
+
+  const bootstrapAfterFailure = await apiJson({
+    port,
+    path: `/api/sessions/${sessionId}?bootstrap=1`,
+    cookie
+  })
+  assert.equal(bootstrapAfterFailure.res.status, 200)
+  assert.deepEqual(
+    (bootstrapAfterFailure.data?.queuedPrompts ?? []).map((prompt) => prompt?.text),
+    ['later prompt']
+  )
+
+  const resentTexts = []
+  runner = await connectRunner({
+    port,
+    token: svc.config.host.auth.runnerToken,
+    machineId
+  })
+  runner.on('message', (buf) => {
+    let msg
+    try {
+      msg = JSON.parse(String(buf))
+    } catch {
+      return
+    }
+
+    if (msg.type !== 'session.send') return
+    resentTexts.push(String(msg.payload?.text ?? ''))
+    runner.send(JSON.stringify({
+      v: 1,
+      type: 'session.command.accepted',
+      ts: Date.now(),
+      id: crypto.randomUUID(),
+      scope: { machineId, sessionId: msg.payload.sessionId },
+      payload: {
+        requestId: msg.payload.requestId,
+        sessionId: msg.payload.sessionId,
+        kind: 'send'
+      }
+    }))
+  })
+
+  const resend = await apiJson({
+    port,
+    path: `/api/sessions/${sessionId}/messages`,
+    method: 'POST',
+    cookie,
+    body: {
+      text: restoreRequested.payload?.prompt?.text,
+      attachments: restoreRequested.payload?.prompt?.attachments
+    }
+  })
+  assert.equal(resend.res.status, 200)
+  await waitFor(() => resentTexts[0] === 'retry me', { timeoutMs: 5_000, intervalMs: 50 })
+
+  runner.send(JSON.stringify({
+    v: 1,
+    type: 'turn.completed',
+    ts: Date.now(),
+    id: crypto.randomUUID(),
+    scope: { machineId, sessionId },
+    payload: {
+      sessionId,
+      turnId: 'turn-queue-fail-2',
+      status: 'completed',
+      preview: 'retried'
+    }
+  }))
+
+  await waitFor(() => resentTexts[1] === 'later prompt', { timeoutMs: 5_000, intervalMs: 50 })
+  assert.deepEqual(resentTexts, ['retry me', 'later prompt'])
+
+  const inputEvents = await apiJson({
+    port,
+    path: `/api/sessions/${sessionId}/events?mode=full&limit=100`,
+    cookie
+  })
+  assert.equal(inputEvents.res.status, 200)
+  const inputTexts = (inputEvents.data?.events ?? [])
+    .filter((event) => event?.type === 'session.input')
+    .map((event) => String(event?.payload?.text ?? ''))
+  assert.deepEqual(inputTexts, ['first turn', 'retry me', 'later prompt'])
 })
 
 test('session metadata routes rename, patch options, archive, unarchive, and delete sessions', async (t) => {
@@ -1392,6 +1707,86 @@ test('machine upgrade route waits for runner acceptance', async (t) => {
   assert.equal(out.data?.ok, true)
   assert.equal(out.data?.machineId, machineId)
   assert.equal(out.data?.accepted, true)
+})
+
+test('machine upgrade route rejects while the runner has a running session', async (t) => {
+  const svc = await startHostProcess({ cwd: process.cwd() })
+  t.after(async () => {
+    await svc.stop()
+  })
+
+  const port = svc.config.host.listen.port
+  const cookie = await login({ port, token: svc.config.host.auth.clientToken })
+  const machineId = 'machine-upgrade-busy-1'
+  const runner = await connectRunner({
+    port,
+    token: svc.config.host.auth.runnerToken,
+    machineId,
+    capabilities: {
+      rootgridVersion: '0.0.0-old',
+      upgrade: { enabled: true }
+    }
+  })
+  t.after(() => {
+    try { runner.close() } catch {}
+  })
+
+  const draft = await apiJson({
+    port,
+    path: '/api/sessions/draft',
+    method: 'POST',
+    cookie,
+    body: {
+      machineId,
+      cwd: process.cwd()
+    }
+  })
+  assert.equal(draft.res.status, 200)
+  const sessionId = draft.data?.sessionId
+  assert.ok(sessionId)
+
+  const upgradeStarts = []
+  runner.on('message', (buf) => {
+    let msg
+    try {
+      msg = JSON.parse(String(buf))
+    } catch {
+      return
+    }
+    if (msg.type === 'machine.upgrade.start') upgradeStarts.push(msg)
+  })
+
+  runner.send(JSON.stringify({
+    v: 1,
+    type: 'turn.started',
+    ts: Date.now(),
+    id: crypto.randomUUID(),
+    scope: { machineId, sessionId },
+    payload: {
+      sessionId,
+      turnId: 'turn-busy-1'
+    }
+  }))
+
+  await waitFor(async () => {
+    const out = await apiJson({ port, path: `/api/sessions/${sessionId}`, cookie })
+    return out.data?.session?.turnState === 'running' ? out.data.session : null
+  }, { timeoutMs: 5_000, intervalMs: 50 })
+
+  const out = await apiJson({
+    port,
+    path: `/api/machines/${machineId}/upgrade`,
+    method: 'POST',
+    cookie,
+    body: { hostVersion: '0.0.0-new' }
+  })
+
+  assert.equal(out.res.status, 409)
+  assert.equal(out.data?.activeSessionCount, 1)
+  assert.equal(out.data?.error, 'finish 1 running session before upgrading this runner')
+
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  assert.equal(upgradeStarts.length, 0)
 })
 
 test('system settings and push subscription routes persist config + subscriptions', async (t) => {

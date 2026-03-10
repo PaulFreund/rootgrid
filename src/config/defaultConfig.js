@@ -38,6 +38,15 @@ export function buildDefaultConfig() {
       listen: { host: '127.0.0.1', port: 7337 },
       publicUrl: null,
       trustProxy: false,
+      selfUpdate: {
+        enabled: false,
+        repoUrl: null,
+        branch: 'main',
+        workdir: null,
+        installCommand: 'npm ci',
+        buildCommand: 'npm run build',
+        restartCommand: null
+      },
       auth: {
         clientToken: randomToken(),
         runnerToken: randomToken()

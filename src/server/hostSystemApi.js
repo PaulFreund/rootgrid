@@ -5,10 +5,13 @@ import { chmod, rename, writeFile } from 'node:fs/promises'
 import { RootgridConfigSchema } from '../config/schema.js'
 import { ROOTGRID_VERSION } from '../lib/rootgridVersion.js'
 import { getConfigPath } from '../lib/paths.js'
+import { buildHostSelfUpdatePublicState } from './hostSelfUpdateManager.js'
 
 const SNAPSHOT_SESSION_LIMIT = 150
 
-function buildSettingsPayload(config) {
+function buildSettingsPayload(config, {
+  hostSelfUpdate = null
+} = {}) {
   return {
     appVersion: ROOTGRID_VERSION,
     retentionDays: config.retentionDays,
@@ -20,7 +23,9 @@ function buildSettingsPayload(config) {
       enabled: config.host.enabled,
       listen: config.host.listen,
       publicUrl: config.host.publicUrl,
-      trustProxy: config.host.trustProxy
+      trustProxy: config.host.trustProxy,
+      selfUpdate: hostSelfUpdate?.getPublicState?.()
+        ?? buildHostSelfUpdatePublicState(config)
     },
     runner: {
       enabled: config.runner.enabled,
@@ -38,6 +43,7 @@ export function createHostSystemApi({
   push,
   config,
   runnerInstall = null,
+  hostSelfUpdate = null,
   readJsonBody,
   json
 }) {
@@ -339,14 +345,33 @@ export function createHostSystemApi({
 
         json(res, 200, {
           ok: true,
-          ...buildSettingsPayload(config)
+          ...buildSettingsPayload(config, { hostSelfUpdate })
         })
+        return true
+      }
+
+      if (url.pathname === '/api/host/self-update' && req.method === 'POST') {
+        if (!auth.requireAuth(req, res)) return true
+        if (!hostSelfUpdate?.start) {
+          json(res, 503, { error: 'host self-update is unavailable' })
+          return true
+        }
+        try {
+          const result = await hostSelfUpdate.start()
+          json(res, 200, result)
+          try { hostSelfUpdate.scheduleExit?.() } catch {}
+        } catch (err) {
+          const code = Number(err?.statusCode) || 500
+          const payload = { error: String(err?.message ?? err) }
+          if (Number(err?.activeSessionCount) > 0) payload.activeSessionCount = Number(err.activeSessionCount)
+          json(res, code, payload)
+        }
         return true
       }
 
       if (url.pathname === '/api/settings' && req.method === 'GET') {
         if (!auth.requireAuth(req, res)) return true
-        json(res, 200, buildSettingsPayload(config))
+        json(res, 200, buildSettingsPayload(config, { hostSelfUpdate }))
         return true
       }
 

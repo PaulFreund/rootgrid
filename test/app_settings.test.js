@@ -151,3 +151,49 @@ test('createAppSettingsActions login loads settings and connects SSE on success'
   assert.equal(connected, 1)
   assert.deepEqual(requests.map((req) => req.path), ['/api/auth', '/api/settings'])
 })
+
+test('createAppSettingsActions starts host self-update and keeps the working flag set while restart is pending', async () => {
+  const hostSelfUpdateWorking = ref(false)
+  const hostSelfUpdateError = ref('')
+  const hostSelfUpdateStatus = ref('')
+
+  const { startHostSelfUpdate } = createAppSettingsActions({
+    apiFetch: async (path, init = {}) => {
+      assert.equal(path, '/api/host/self-update')
+      assert.equal(init.method, 'POST')
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { ok: true, message: 'Host update succeeded. Rootgrid is restarting.' }
+        }
+      }
+    },
+    authed: ref(true),
+    authToken: ref(''),
+    authError: ref(''),
+    appSettings: reactive({
+      appVersion: '1.2.3',
+      retentionDays: 30,
+      notifications: { sseToasts: 'if-not-visible', webPush: 'if-not-visible' },
+      host: null,
+      runner: null
+    }),
+    appSettingsLoaded: ref(true),
+    appSettingsError: ref(''),
+    appSettingsSaving: ref(false),
+    retentionDraft: ref('30'),
+    sseToastsDraft: ref('if-not-visible'),
+    webPushDraft: ref('if-not-visible'),
+    hostSelfUpdateWorking,
+    hostSelfUpdateError,
+    hostSelfUpdateStatus
+  })
+
+  const ok = await startHostSelfUpdate()
+
+  assert.equal(ok, true)
+  assert.equal(hostSelfUpdateError.value, '')
+  assert.equal(hostSelfUpdateStatus.value, 'Host update succeeded. Rootgrid is restarting.')
+  assert.equal(hostSelfUpdateWorking.value, true)
+})

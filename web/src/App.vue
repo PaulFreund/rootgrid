@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Archive, ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FileText, FolderClosed, GitBranch, Loader2, MoreHorizontal, Pencil, Plus, Settings, Square, Terminal, Trash2, X } from 'lucide-vue-next'
+import { Archive, ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FileText, FolderClosed, GitBranch, Loader2, Menu, MoreHorizontal, Pencil, Plus, Settings, Sidebar, Square, Terminal, Trash2, X } from 'lucide-vue-next'
 
 import MarkdownView from './components/MarkdownView.vue'
 import ComposerPillSelect from './components/ComposerPillSelect.vue'
@@ -17,6 +17,7 @@ import {
 import {
   buildContextUsageSummary,
   buildRecentWorkspaces,
+  countMachineWorkingSessions as countMachineWorkingSessionsAt,
   formatAgeShort as formatAgeShortValue,
   formatCompactInt,
   finalizeCompletedPlan,
@@ -72,6 +73,8 @@ import {
   createComposerSessionActions
 } from './lib/composerSessionActions.js'
 import {
+  buildComposerAttachmentRefs,
+  clearComposerAttachments as clearComposerAttachmentList,
   isImageMimeType
 } from './lib/composerAttachments.js'
 import {
@@ -129,14 +132,19 @@ import {
   createSessionStoreState,
   sessionHostName as sessionHostNameForRow,
   sessionIndicator,
+  sessionInitial,
   sessionListTitle,
   sessionProject,
   sessionTooltip as sessionTooltipForRow
 } from './lib/sessionUi.js'
 import {
+  DEFAULT_DESKTOP_SIDEBAR_MODE,
+  COMPACT_SESSION_SIDEBAR_WIDTH,
   clampSessionSidebarWidth,
   DEFAULT_SESSION_SIDEBAR_WIDTH,
+  persistDesktopSidebarMode,
   persistSessionSidebarWidth,
+  readStoredDesktopSidebarMode,
   readStoredSessionSidebarWidth
 } from './lib/sidebarResize.js'
 import {
@@ -190,6 +198,9 @@ const sessionSidebarDragging = ref(false)
 const workspaceChatWidth = ref(DEFAULT_WORKSPACE_CHAT_WIDTH)
 const workspaceSplitDragging = ref(false)
 const isMobileLayout = ref(false)
+const desktopSidebarMode = ref(DEFAULT_DESKTOP_SIDEBAR_MODE)
+const desktopSidebarFlyoutOpen = ref(false)
+const desktopSidebarModeMenuOpen = ref(false)
 const mobilePane = ref('list')
 const sessionListGroupingMode = ref(readSessionListGroupingMode())
 const sessionListLoading = ref(false)
@@ -197,6 +208,11 @@ const sessionListHasMore = ref(false)
 const sessionListNextBeforeUpdatedMs = ref(null)
 const sessionListNextBeforeSessionId = ref(null)
 const NEW_THREAD_ROOT_PATH = '/'
+const desktopSidebarModeOptions = Object.freeze([
+  { value: 'expanded', label: 'Expanded' },
+  { value: 'collapsed', label: 'Collapsed' },
+  { value: 'hover', label: 'Expand on hover' }
+])
 
 const visibleSessions = computed(() => sessions.value.filter((s) => !s?.archivedMs))
 
@@ -226,6 +242,7 @@ const composerContextPopoverOpen = ref(false)
 const composerContextPopoverHover = ref(false)
 const composerMachinePopoverOpen = ref(false)
 const composerMachinePopoverHover = ref(false)
+const mobileWorkspaceMenuOpen = ref(false)
 
 function isImageType(mimeType) {
   return isImageMimeType(mimeType)
@@ -318,6 +335,9 @@ const deleteMachineRow = computed(() => {
 const appSettingsLoaded = ref(false)
 const appSettingsError = ref('')
 const appSettingsSaving = ref(false)
+const hostSelfUpdateWorking = ref(false)
+const hostSelfUpdateError = ref('')
+const hostSelfUpdateStatus = ref('')
 const runnerInstallCommand = ref('')
 const runnerInstallUrl = ref('')
 const runnerInstallExpiresAtMs = ref(null)
@@ -337,6 +357,8 @@ const appSettings = reactive({
   host: null,
   runner: null
 })
+const hostSelfUpdateInfo = computed(() => appSettings.host?.selfUpdate ?? null)
+const hostSelfUpdateEnabled = computed(() => Boolean(hostSelfUpdateInfo.value?.enabled))
 
 const deepLinkSessionId = ref(null)
 
@@ -648,7 +670,7 @@ function updateWorkspacePaneWidthFromClientX(clientX) {
 }
 
 function beginSessionSidebarDrag(ev) {
-  if (isMobileLayout.value) return
+  if (isMobileLayout.value || desktopSidebarCompact.value) return
   const clientX = Number(ev?.clientX)
   if (!Number.isFinite(clientX)) return
   stopSessionSidebarDrag()
@@ -695,6 +717,7 @@ function beginWorkspacePaneDrag(ev) {
 
 function showMobileSessionList() {
   if (!isMobileLayout.value) return
+  mobileWorkspaceMenuOpen.value = false
   workspacePaneOpen.value = false
   mobilePane.value = 'list'
 }
@@ -717,6 +740,27 @@ function openSession(sessionId) {
   if (isMobileLayout.value) mobilePane.value = 'session'
 }
 
+function openDesktopSidebarFlyout() {
+  if (!desktopSidebarExpandOnHover.value) return
+  desktopSidebarFlyoutOpen.value = true
+}
+
+function closeDesktopSidebarFlyout(ev = null) {
+  if (ev?.currentTarget?.contains?.(ev?.relatedTarget)) return
+  desktopSidebarFlyoutOpen.value = false
+}
+
+function toggleDesktopSidebarModeMenu() {
+  if (isMobileLayout.value) return
+  desktopSidebarModeMenuOpen.value = !desktopSidebarModeMenuOpen.value
+}
+
+function setDesktopSidebarMode(mode) {
+  desktopSidebarMode.value = persistDesktopSidebarMode(mode)
+  desktopSidebarModeMenuOpen.value = false
+  desktopSidebarFlyoutOpen.value = false
+}
+
 const {
   applySessionPageInfo,
   loadMoreSessions,
@@ -737,6 +781,7 @@ const {
   loadAppSettings,
   checkAuth,
   saveRetentionDays,
+  startHostSelfUpdate,
   login
 } = createAppSettingsActions({
   apiFetch,
@@ -750,6 +795,9 @@ const {
   retentionDraft,
   sseToastsDraft,
   webPushDraft,
+  hostSelfUpdateWorking,
+  hostSelfUpdateError,
+  hostSelfUpdateStatus,
   onLogin: () => onLoginConnect()
 })
 
@@ -866,6 +914,28 @@ function machineSupportsWebUpgrade(m) {
 
 function machineUpgradeStatusText(m) {
   return machineUpgradeStatusTextAt(m)
+}
+
+function machineWorkingSessionCount(machineId) {
+  return countMachineWorkingSessionsAt(sessions.value, machineId)
+}
+
+function machineUpgradeBusy(m) {
+  return ['starting', 'receiving', 'installing', 'updating', 'restarting'].includes(String(m?.upgrade?.state ?? ''))
+}
+
+function machineUpgradeLockReason(m) {
+  const count = machineWorkingSessionCount(m?.machineId)
+  if (count <= 0) return ''
+  return `Finish ${count} running ${pluralize(count, 'session')} before upgrading this runner.`
+}
+
+function machineUpgradeButtonTitle(m) {
+  const lockReason = machineUpgradeLockReason(m)
+  if (lockReason) return lockReason
+  return machineHasUnknownVersion(m)
+    ? 'Try a remote runner upgrade. If this legacy runner does not support it, update it manually.'
+    : 'Pull, rebuild, and restart this runner using its configured upgrade commands.'
 }
 
 async function markSessionRead(sessionId) {
@@ -1178,6 +1248,29 @@ function handleSelectedSessionDeleted(session = null) {
   if (isMobileLayout.value) showMobileSessionList()
 }
 
+function applyRestoredQueuedPromptToComposer({ sessionId, prompt = null, error = '' } = {}) {
+  const sid = String(sessionId ?? '').trim()
+  if (!sid) return false
+  if (String(selectedSessionId.value ?? '').trim() !== sid) return false
+  const store = getSessionStore(sid)
+  const restoredPrompt = (prompt && typeof prompt === 'object') ? prompt : store?.restoredPrompt
+  if (!restoredPrompt || typeof restoredPrompt !== 'object') return false
+
+  const nextError = String(error ?? store?.restoredPromptError ?? '').trim()
+  messageDraft.value = String(restoredPrompt?.text ?? '')
+  queuedPromptEditingId.value = null
+  queuedPromptEditDraft.value = ''
+  clearComposerAttachmentList(attachments.value)
+  attachments.value.push(...buildComposerAttachmentRefs(restoredPrompt?.attachments, sid))
+  if (nextError) sendError.value = nextError
+  if (store) {
+    store.restoredPrompt = null
+    store.restoredPromptError = ''
+    store.messageViewVersion = Number(store.messageViewVersion ?? 0) + 1
+  }
+  return true
+}
+
 const baseHandleEnvelope = createSessionEnvelopeHandler({
   currentVisibility,
   notificationPermission,
@@ -1210,7 +1303,10 @@ const baseHandleEnvelope = createSessionEnvelopeHandler({
   bumpSessionToTop,
   updateTokenUsage: maybeUpdateTokenUsage,
   appendToolOutput,
-  addSessionEvent
+  addSessionEvent,
+  onQueuedPromptRestoreRequested: ({ sessionId, prompt, error }) => {
+    applyRestoredQueuedPromptToComposer({ sessionId, prompt, error })
+  }
 })
 
 function handleTerminalEnvelope(env) {
@@ -1264,6 +1360,24 @@ const selectedSession = computed(() => {
   if (!sid) return null
   return sessionRowsById.get(sid) ?? null
 })
+const compactSidebarPreviewSessions = computed(() => {
+  const out = []
+  const seen = new Set()
+  const push = (session) => {
+    const sid = String(session?.sessionId ?? '').trim()
+    if (!sid || seen.has(sid)) return
+    seen.add(sid)
+    out.push(session)
+  }
+
+  push(selectedSession.value)
+  for (const session of visibleSessions.value) {
+    push(session)
+    if (out.length >= 8) break
+  }
+  return out
+})
+const compactSidebarOverflowCount = computed(() => Math.max(0, visibleSessions.value.length - compactSidebarPreviewSessions.value.length))
 const selectedComposerApproval = computed(() => {
   return findApprovalForSession(approvalQueue.value, selectedSessionId.value)
 })
@@ -1351,6 +1465,7 @@ onLoginConnect = () => {
 }
 
 watch(selectedSessionId, async (sid, prevSid) => {
+  mobileWorkspaceMenuOpen.value = false
   if (String(prevSid ?? '').trim()) {
     rememberChatScrollState(prevSid)
   }
@@ -1383,6 +1498,7 @@ watch(selectedSessionId, async (sid, prevSid) => {
   const nextStore = getSessionStore(sid)
   stickToBottom.value = Boolean(nextStore.chatStickToBottom ?? true)
   await restoreChatScrollState(sid)
+  applyRestoredQueuedPromptToComposer({ sessionId: sid })
   scheduleMarkRead(sid)
 })
 
@@ -1424,6 +1540,7 @@ watch(selectedSessionId, (sid, prevSid) => {
 })
 
 watch(isMobileLayout, (mobile) => {
+  mobileWorkspaceMenuOpen.value = false
   if (mobile) {
     mobilePane.value = preferredMobilePane(selectedSessionId.value)
     nextTick(() => updateSessionListMetrics())
@@ -1457,6 +1574,10 @@ const layoutTrackStyle = computed(() => {
 })
 const sessionSidebarStyle = computed(() => {
   if (isMobileLayout.value) return null
+  return { width: `${desktopSidebarCompact.value ? COMPACT_SESSION_SIDEBAR_WIDTH : sessionSidebarWidth.value}px` }
+})
+const sessionSidebarPanelStyle = computed(() => {
+  if (!desktopSidebarCompact.value) return null
   return { width: `${sessionSidebarWidth.value}px` }
 })
 const workspaceMainStyle = computed(() => {
@@ -1499,6 +1620,9 @@ const composerMachineUpgradeAvailable = computed(() => (
   && (composerMachineVersionMismatch.value || composerMachineUnknownVersion.value)
   && (composerMachineUpgradeSupported.value || composerMachineUnknownVersion.value)
 ))
+const composerMachineUpgradeLockedReason = computed(() => machineUpgradeLockReason(composerMachine.value))
+const composerMachineUpgradeLocked = computed(() => Boolean(composerMachineUpgradeLockedReason.value))
+const composerMachineUpgradeBusy = computed(() => machineUpgradeBusy(composerMachine.value))
 const composerMachineUpgradeWorking = computed(() => {
   const machineId = String(composerMachine.value?.machineId ?? '').trim()
   return Boolean(machineId && machineUpgradeWorkingId.value === machineId)
@@ -1547,6 +1671,28 @@ const showWorkspacePane = computed(() => {
   if (isMobileLayout.value) return false
   if (mainPaneMode.value !== 'chat') return false
   return workspacePaneOpen.value
+})
+const desktopSidebarCompact = computed(() => {
+  if (isMobileLayout.value) return false
+  return desktopSidebarMode.value !== 'expanded'
+})
+const desktopSidebarExpandOnHover = computed(() => (
+  desktopSidebarCompact.value && desktopSidebarMode.value === 'hover'
+))
+const desktopSidebarFlyoutVisible = computed(() => (
+  desktopSidebarCompact.value && desktopSidebarExpandOnHover.value && desktopSidebarFlyoutOpen.value
+))
+watch(desktopSidebarMode, () => {
+  desktopSidebarModeMenuOpen.value = false
+  desktopSidebarFlyoutOpen.value = false
+  nextTick(() => updateSessionListMetrics())
+})
+watch(desktopSidebarCompact, (compact) => {
+  if (!compact) {
+    desktopSidebarFlyoutOpen.value = false
+    desktopSidebarModeMenuOpen.value = false
+  }
+  nextTick(() => updateSessionListMetrics())
 })
 const composerContextUsage = computed(() => buildContextUsageSummary(selectedTokenUsage.value))
 const composerContextPopoverVisible = computed(() => (
@@ -2374,6 +2520,7 @@ const {
 })
 
 function activateWorkspacePane(tab) {
+  mobileWorkspaceMenuOpen.value = false
   workspacePaneOpen.value = true
   workspacePaneTab.value = tab
   if (isMobileLayout.value) mobilePane.value = 'workspace'
@@ -2381,6 +2528,7 @@ function activateWorkspacePane(tab) {
 
 function restoreMobileSessionPane() {
   if (!isMobileLayout.value) return
+  mobileWorkspaceMenuOpen.value = false
   workspacePaneOpen.value = false
   mobilePane.value = preferredMobilePane(selectedSessionId.value)
 }
@@ -2774,6 +2922,7 @@ async function reopenWorkspaceTerminal() {
 }
 
 async function openWorkspaceTool(tab) {
+  mobileWorkspaceMenuOpen.value = false
   if (tab === 'files') {
     await loadWorkspaceFiles()
     return
@@ -2802,7 +2951,15 @@ function workspaceToolButtonClass(tab) {
     : 'border-black/[0.06] bg-white text-slate-700 hover:bg-black/[0.03]'
 }
 
+function mobileWorkspaceMenuItemClass(tab) {
+  const active = workspacePaneOpen.value && workspacePaneTab.value === tab
+  return active
+    ? 'bg-slate-900 text-white'
+    : 'text-slate-700 hover:bg-black/[0.04]'
+}
+
 async function openWorkspace() {
+  mobileWorkspaceMenuOpen.value = false
   ideError.value = ''
   activateWorkspacePane('code')
   const ctx = resolveWorkspaceContext()
@@ -2825,6 +2982,7 @@ async function openWorkspace() {
 }
 
 async function closeWorkspacePane() {
+  mobileWorkspaceMenuOpen.value = false
   ideError.value = ''
   const existingIdeId = String(activeIdeSession.value?.ideId ?? '').trim()
   await closeWorkspaceTerminalSession()
@@ -2911,6 +3069,7 @@ onMounted(async () => {
   defaultsOpen.value = false
   workspacePaneOpen.value = false
   refreshMobileLayout()
+  desktopSidebarMode.value = readStoredDesktopSidebarMode()
   sessionSidebarWidth.value = readSessionSidebarWidth()
   workspaceChatWidth.value = readWorkspaceChatPaneWidth()
 
@@ -2952,10 +3111,15 @@ onMounted(async () => {
 
   const onKeyDown = (ev) => {
     if (ev.key === 'Escape') {
+      const hadMobileWorkspaceMenuOpen = mobileWorkspaceMenuOpen.value
+      mobileWorkspaceMenuOpen.value = false
       composerContextPopoverOpen.value = false
       composerContextPopoverHover.value = false
       composerMachinePopoverOpen.value = false
       composerMachinePopoverHover.value = false
+      desktopSidebarModeMenuOpen.value = false
+      desktopSidebarFlyoutOpen.value = false
+      if (hadMobileWorkspaceMenuOpen) return
       if (sessionSidebarDragging.value) stopSessionSidebarDrag()
       else if (workspaceSplitDragging.value) stopWorkspacePaneDrag()
       else if (workspacePaneOpen.value) closeWorkspacePane()
@@ -2975,6 +3139,8 @@ onMounted(async () => {
     const inSessionMenu = Boolean(target?.closest?.('[data-session-menu-root="true"]'))
     const inContextPopover = Boolean(target?.closest?.('[data-context-usage-root="true"]'))
     const inMachinePopover = Boolean(target?.closest?.('[data-machine-upgrade-root="true"]'))
+    const inSidebarModeMenu = Boolean(target?.closest?.('[data-sidebar-mode-root="true"]'))
+    const inMobileWorkspaceMenu = Boolean(target?.closest?.('[data-mobile-workspace-menu-root="true"]'))
     if (!inSessionMenu) closeSessionMenu()
     if (!inContextPopover) {
       composerContextPopoverOpen.value = false
@@ -2984,6 +3150,8 @@ onMounted(async () => {
       composerMachinePopoverOpen.value = false
       composerMachinePopoverHover.value = false
     }
+    if (!inSidebarModeMenu) desktopSidebarModeMenuOpen.value = false
+    if (!inMobileWorkspaceMenu) mobileWorkspaceMenuOpen.value = false
   }
   sessionMenuOutsideHandler = onSessionMenuOutside
   try { document.addEventListener('pointerdown', onSessionMenuOutside) } catch {}
@@ -3240,169 +3408,304 @@ watch(
         >
         <!-- Sidebar -->
         <aside
-          class="flex flex-col bg-[#efefec]"
-          :class="isMobileLayout ? 'min-h-0 h-full w-1/2 min-w-0 shrink-0 basis-1/2 overflow-hidden' : 'shrink-0'"
+          class="relative bg-[#efefec]"
+          :class="isMobileLayout
+            ? 'min-h-0 h-full w-1/2 min-w-0 shrink-0 basis-1/2 overflow-hidden'
+            : (desktopSidebarCompact ? 'min-h-0 shrink-0 overflow-visible' : 'min-h-0 shrink-0 overflow-hidden')"
           :style="sessionSidebarStyle"
+          @mouseenter="openDesktopSidebarFlyout"
+          @mouseleave="closeDesktopSidebarFlyout"
+          @focusin="openDesktopSidebarFlyout"
+          @focusout="closeDesktopSidebarFlyout"
         >
-          <div class="shrink-0 px-3 pb-2 pt-3">
-            <div class="space-y-0.5">
-              <button
-                class="w-full inline-flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-slate-700 transition-colors hover:bg-black/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                @click="openNewThreadDialog"
-              >
-                <Plus class="h-3.5 w-3.5 text-slate-400" />
-                New thread
-              </button>
-            </div>
-          </div>
+          <div
+            v-if="desktopSidebarCompact"
+            class="flex h-full w-full flex-col items-center gap-2 border-r border-black/[0.05] bg-[#efefec] px-1.5 py-3"
+          >
+            <button
+              class="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-white text-slate-700 ring-1 ring-black/[0.06] transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+              @click="openNewThreadDialog"
+              title="New thread"
+            >
+              <Plus class="h-4 w-4" />
+            </button>
 
-          <div class="shrink-0 px-2 pb-2 pt-3">
-            <div class="flex items-center justify-between gap-2 px-2">
-              <div class="flex h-7 items-center text-[11px] text-slate-400">Threads</div>
+            <div class="flex-1 overflow-hidden pt-1">
+              <div class="flex h-full flex-col items-center gap-2 overflow-y-auto pb-1">
+                <button
+                  v-for="session in compactSidebarPreviewSessions"
+                  :key="session.sessionId"
+                  class="relative inline-flex h-9 w-9 items-center justify-center rounded-xl text-[11px] font-semibold uppercase transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  :class="selectedSessionId === session.sessionId
+                    ? 'bg-white text-slate-800 shadow-sm ring-1 ring-black/[0.08]'
+                    : 'text-slate-500 hover:bg-white/75'"
+                  :title="sessionTooltip(session)"
+                  @click="openSession(session.sessionId)"
+                >
+                  <span>{{ sessionInitial(session) }}</span>
+                  <span
+                    class="absolute bottom-1 right-1 h-1.5 w-1.5 rounded-full ring-2 ring-[#efefec]"
+                    :class="indicatorDotClass(sessionIndicator(session))"
+                  />
+                </button>
+
+                <div
+                  v-if="compactSidebarOverflowCount"
+                  class="pt-0.5 text-[10px] font-medium text-slate-400"
+                  :title="`${compactSidebarOverflowCount} more threads`"
+                >
+                  +{{ compactSidebarOverflowCount }}
+                </div>
+              </div>
+            </div>
+
+            <button
+              class="inline-flex h-9 w-9 items-center justify-center rounded-xl text-slate-500 transition-colors hover:bg-white/75 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+              @click="openSettings('machines')"
+              title="Settings"
+            >
+              <Settings class="h-4 w-4" />
+            </button>
+
+            <div class="relative" data-sidebar-mode-root="true">
               <button
-                class="inline-flex h-7 items-center justify-center gap-1 rounded-md px-2 text-[11px] text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                :class="sessionListGroupingMode === 'project' ? 'bg-black/[0.05] text-slate-700' : ''"
-                :title="sessionListGroupingMode === 'project' ? 'Show a flat thread list' : 'Group by host + project'"
-                @click="toggleSessionListGrouping"
+                type="button"
+                class="inline-flex h-9 w-9 items-center justify-center rounded-xl text-slate-500 transition-colors hover:bg-white/75 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                title="Sidebar control"
+                @click.stop="toggleDesktopSidebarModeMenu"
               >
-                <FolderClosed class="h-3.5 w-3.5" />
-                {{ sessionListGroupingMode === 'project' ? 'Grouped' : 'Flat' }}
+                <Sidebar class="h-4 w-4" />
               </button>
+
+              <div
+                v-if="desktopSidebarModeMenuOpen"
+                class="absolute bottom-0 left-full z-40 ml-2 w-44 rounded-2xl border border-black/[0.08] bg-white p-2 shadow-[0_12px_30px_rgba(15,23,42,0.14)]"
+              >
+                <div class="px-2 pb-1.5 text-[11px] font-medium text-slate-500">Sidebar control</div>
+                <button
+                  v-for="option in desktopSidebarModeOptions"
+                  :key="option.value"
+                  type="button"
+                  class="flex w-full items-center gap-2 rounded-xl px-2 py-2 text-left text-[12px] text-slate-700 transition-colors hover:bg-black/[0.04]"
+                  @click.stop="setDesktopSidebarMode(option.value)"
+                >
+                  <span class="inline-flex h-4 w-4 items-center justify-center">
+                    <span
+                      class="h-2 w-2 rounded-full"
+                      :class="desktopSidebarMode === option.value ? 'bg-slate-800' : 'bg-transparent ring-1 ring-slate-300'"
+                    />
+                  </span>
+                  <span class="truncate">{{ option.label }}</span>
+                </button>
+              </div>
             </div>
           </div>
 
           <div
-            ref="sessionListScrollEl"
-            class="flex-1 overflow-auto px-2 pb-2"
-            @scroll="onSessionListScroll"
+            class="flex h-full flex-col bg-[#efefec]"
+            :class="desktopSidebarCompact
+              ? (desktopSidebarFlyoutVisible
+                ? 'absolute inset-y-0 left-0 z-30 overflow-hidden rounded-r-[18px] border-r border-black/[0.05] opacity-100 shadow-[0_14px_32px_rgba(15,23,42,0.16)] pointer-events-auto translate-x-0 transition-all duration-150 ease-out'
+                : 'absolute inset-y-0 left-0 z-30 overflow-hidden rounded-r-[18px] border-r border-black/[0.05] opacity-0 shadow-[0_14px_32px_rgba(15,23,42,0.16)] pointer-events-none -translate-x-2 transition-all duration-150 ease-out')
+              : 'relative w-full'"
+            :style="sessionSidebarPanelStyle"
           >
-            <div v-if="!hasSnapshot" class="space-y-2 px-2 py-2">
-              <div
-                v-for="i in 7"
-                :key="i"
-                class="h-11 animate-pulse rounded-lg bg-slate-100"
-              />
+            <div class="shrink-0 px-3 pb-2 pt-3">
+              <div class="space-y-0.5">
+                <button
+                  class="w-full inline-flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-slate-700 transition-colors hover:bg-black/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  @click="openNewThreadDialog"
+                >
+                  <Plus class="h-3.5 w-3.5 text-slate-400" />
+                  New thread
+                </button>
+              </div>
             </div>
 
-            <div v-else>
-              <div v-if="!visibleSessions.length" class="px-3 py-10 text-center text-xs text-slate-500">
-                No threads yet.
+            <div class="shrink-0 px-2 pb-2 pt-3">
+              <div class="flex items-center justify-between gap-2 px-2">
+                <div class="flex h-7 items-center text-[11px] text-slate-400">Threads</div>
+                <button
+                  class="inline-flex h-7 items-center justify-center gap-1 rounded-md px-2 text-[11px] text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  :class="sessionListGroupingMode === 'project' ? 'bg-black/[0.05] text-slate-700' : ''"
+                  :title="sessionListGroupingMode === 'project' ? 'Show a flat thread list' : 'Group by host + project'"
+                  @click="toggleSessionListGrouping"
+                >
+                  <FolderClosed class="h-3.5 w-3.5" />
+                  {{ sessionListGroupingMode === 'project' ? 'Grouped' : 'Flat' }}
+                </button>
+              </div>
+            </div>
+
+            <div
+              ref="sessionListScrollEl"
+              class="flex-1 overflow-auto px-2 pb-2"
+              @scroll="onSessionListScroll"
+            >
+              <div v-if="!hasSnapshot" class="space-y-2 px-2 py-2">
+                <div
+                  v-for="i in 7"
+                  :key="i"
+                  class="h-11 animate-pulse rounded-lg bg-slate-100"
+                />
               </div>
 
               <div v-else>
-                <div v-if="visibleSessionWindow.offsetTop > 0" :style="{ height: `${visibleSessionWindow.offsetTop}px` }" />
+                <div v-if="!visibleSessions.length" class="px-3 py-10 text-center text-xs text-slate-500">
+                  No threads yet.
+                </div>
 
-                <template v-for="entry in visibleSessionWindow.items" :key="entry.key">
-                  <div
-                    v-if="entry.kind === 'group'"
-                    class="px-2.5 pb-1 pt-3"
-                  >
+                <div v-else>
+                  <div v-if="visibleSessionWindow.offsetTop > 0" :style="{ height: `${visibleSessionWindow.offsetTop}px` }" />
+
+                  <template v-for="entry in visibleSessionWindow.items" :key="entry.key">
                     <div
-                      class="inline-flex min-w-0 max-w-full items-center rounded-full border border-black/[0.08] px-2 py-0.5 text-[10px] font-medium text-slate-500"
-                      :title="`${entry.host} / ${entry.project}`"
+                      v-if="entry.kind === 'group'"
+                      class="px-2.5 pb-1 pt-3"
                     >
-                      <span class="truncate">{{ entry.host }} / {{ entry.project }}</span>
+                      <div
+                        class="inline-flex min-w-0 max-w-full items-center rounded-full border border-black/[0.08] px-2 py-0.5 text-[10px] font-medium text-slate-500"
+                        :title="`${entry.host} / ${entry.project}`"
+                      >
+                        <span class="truncate">{{ entry.host }} / {{ entry.project }}</span>
+                      </div>
                     </div>
-                  </div>
 
-                  <button
-                    v-else
-                    class="group w-full rounded-lg px-2.5 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-slate-400/30"
-                    :class="selectedSessionId === entry.session.sessionId ? 'bg-[#ecece8]' : 'hover:bg-black/[0.035]'"
-                    :title="sessionTooltip(entry.session)"
-                    @click="openSession(entry.session.sessionId)"
-                  >
-                    <div class="flex items-start gap-2.5">
-                      <span
-                        class="mt-[0.38rem] h-2 w-2 shrink-0 rounded-full"
-                        :class="indicatorDotClass(sessionIndicator(entry.session))"
-                      />
+                    <button
+                      v-else
+                      class="group w-full rounded-lg px-2.5 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-slate-400/30"
+                      :class="selectedSessionId === entry.session.sessionId ? 'bg-[#ecece8]' : 'hover:bg-black/[0.035]'"
+                      :title="sessionTooltip(entry.session)"
+                      @click="openSession(entry.session.sessionId)"
+                    >
+                      <div class="flex items-start gap-2.5">
+                        <span
+                          class="mt-[0.38rem] h-2 w-2 shrink-0 rounded-full"
+                          :class="indicatorDotClass(sessionIndicator(entry.session))"
+                        />
 
-                      <div class="min-w-0 flex-1">
-                        <div class="flex items-center justify-between gap-2">
-                          <div class="truncate text-[13px] font-medium text-slate-700">{{ sessionListTitle(entry.session) }}</div>
-                          <div class="flex shrink-0 items-center gap-1">
-                            <div
-                              v-if="sessionListGroupingMode === 'project'"
-                              class="text-[11px] text-slate-400"
-                            >
-                              {{ formatAgeShort(entry.session.updatedMs) }}
-                            </div>
-                            <div class="relative shrink-0" data-session-menu-root="true">
-                              <button
-                                class="inline-flex h-6 w-6 items-center justify-center rounded-md text-slate-300 transition-colors hover:bg-black/[0.05] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                                :class="sessionMenuId === entry.session.sessionId ? 'bg-black/[0.05] text-slate-600 opacity-100' : (isMobileLayout ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100')"
-                                title="Thread actions"
-                                @click.stop="toggleSessionMenu(entry.session.sessionId)"
-                              >
-                                <MoreHorizontal class="h-3.5 w-3.5" />
-                              </button>
-
+                        <div class="min-w-0 flex-1">
+                          <div class="flex items-center justify-between gap-2">
+                            <div class="truncate text-[13px] font-medium text-slate-700">{{ sessionListTitle(entry.session) }}</div>
+                            <div class="flex shrink-0 items-center gap-1">
                               <div
-                                v-if="sessionMenuId === entry.session.sessionId"
-                                class="absolute right-0 top-7 z-20 w-44 rounded-xl border border-black/[0.06] bg-white p-1 shadow-lg shadow-black/10"
+                                v-if="sessionListGroupingMode === 'project'"
+                                class="text-[11px] text-slate-400"
                               >
+                                {{ formatAgeShort(entry.session.updatedMs) }}
+                              </div>
+                              <div class="relative shrink-0" data-session-menu-root="true">
                                 <button
-                                  class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
-                                  @click.stop="openSessionMenuEdit(entry.session)"
+                                  class="inline-flex h-6 w-6 items-center justify-center rounded-md text-slate-300 transition-colors hover:bg-black/[0.05] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                                  :class="sessionMenuId === entry.session.sessionId ? 'bg-black/[0.05] text-slate-600 opacity-100' : (isMobileLayout ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100')"
+                                  title="Thread actions"
+                                  @click.stop="toggleSessionMenu(entry.session.sessionId)"
                                 >
-                                  Edit
+                                  <MoreHorizontal class="h-3.5 w-3.5" />
                                 </button>
-                                <button
-                                  class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
-                                  @click.stop="archiveFromSessionMenu(entry.session.sessionId)"
+
+                                <div
+                                  v-if="sessionMenuId === entry.session.sessionId"
+                                  class="absolute right-0 top-7 z-20 w-44 rounded-xl border border-black/[0.06] bg-white p-1 shadow-lg shadow-black/10"
                                 >
-                                  Archive
-                                </button>
-                                <button
-                                  class="w-full rounded-lg px-3 py-2 text-left text-sm text-red-600 transition-colors hover:bg-red-50"
-                                  @click.stop="openSessionMenuDelete(entry.session.sessionId)"
-                                >
-                                  Delete
-                                </button>
+                                  <button
+                                    class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
+                                    @click.stop="openSessionMenuEdit(entry.session)"
+                                  >
+                                    Edit
+                                  </button>
+                                  <button
+                                    class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
+                                    @click.stop="archiveFromSessionMenu(entry.session.sessionId)"
+                                  >
+                                    Archive
+                                  </button>
+                                  <button
+                                    class="w-full rounded-lg px-3 py-2 text-left text-sm text-red-600 transition-colors hover:bg-red-50"
+                                    @click.stop="openSessionMenuDelete(entry.session.sessionId)"
+                                  >
+                                    Delete
+                                  </button>
+                                </div>
                               </div>
                             </div>
                           </div>
-                        </div>
 
-                        <div
-                          v-if="sessionListGroupingMode !== 'project'"
-                          class="mt-1 flex min-w-0 items-center justify-between gap-2 text-[11px] text-slate-400"
-                        >
-                          <span
-                            class="inline-flex min-w-0 max-w-[170px] shrink-0 items-center rounded-full border border-black/[0.08] px-2 py-0.5 text-[10px] font-medium text-slate-500"
-                            :title="`${sessionHostName(entry.session)} / ${sessionProject(entry.session)}`"
+                          <div
+                            v-if="sessionListGroupingMode !== 'project'"
+                            class="mt-1 flex min-w-0 items-center justify-between gap-2 text-[11px] text-slate-400"
                           >
-                            <span class="truncate">{{ sessionHostName(entry.session) }} / {{ sessionProject(entry.session) }}</span>
-                          </span>
-                          <span class="shrink-0 text-right">{{ formatAgeShort(entry.session.updatedMs) }}</span>
+                            <span
+                              class="inline-flex min-w-0 max-w-[170px] shrink-0 items-center rounded-full border border-black/[0.08] px-2 py-0.5 text-[10px] font-medium text-slate-500"
+                              :title="`${sessionHostName(entry.session)} / ${sessionProject(entry.session)}`"
+                            >
+                              <span class="truncate">{{ sessionHostName(entry.session) }} / {{ sessionProject(entry.session) }}</span>
+                            </span>
+                            <span class="shrink-0 text-right">{{ formatAgeShort(entry.session.updatedMs) }}</span>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  </button>
-                </template>
+                    </button>
+                  </template>
 
-                <div v-if="visibleSessionWindow.offsetBottom > 0" :style="{ height: `${visibleSessionWindow.offsetBottom}px` }" />
-                <div v-if="sessionListLoading || sessionListHasMore" class="px-3 py-2 text-center text-[11px] text-slate-400">
-                  {{ sessionListLoading ? 'Loading more threads…' : 'Scroll for older threads' }}
+                  <div v-if="visibleSessionWindow.offsetBottom > 0" :style="{ height: `${visibleSessionWindow.offsetBottom}px` }" />
+                  <div v-if="sessionListLoading || sessionListHasMore" class="px-3 py-2 text-center text-[11px] text-slate-400">
+                    {{ sessionListLoading ? 'Loading more threads…' : 'Scroll for older threads' }}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="relative z-20 shrink-0 p-2">
+              <div class="space-y-1.5">
+                <button
+                  class="min-w-0 inline-flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  @click="openSettings('machines')"
+                >
+                  <Settings class="h-3.5 w-3.5" />
+                  Settings
+                </button>
+
+                <div v-if="!isMobileLayout" class="relative w-full" data-sidebar-mode-root="true">
+                  <button
+                    type="button"
+                    class="inline-flex h-8 w-full items-center gap-1.5 rounded-lg px-2.5 text-[12px] text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                    title="Sidebar control"
+                    @click.stop="toggleDesktopSidebarModeMenu"
+                  >
+                    <Sidebar class="h-3.5 w-3.5" />
+                    Sidebar
+                  </button>
+
+                  <div
+                    v-if="desktopSidebarModeMenuOpen"
+                    class="absolute bottom-full left-0 z-50 mb-2 w-44 rounded-2xl border border-black/[0.08] bg-white p-2 shadow-[0_12px_30px_rgba(15,23,42,0.14)]"
+                  >
+                    <div class="px-2 pb-1.5 text-[11px] font-medium text-slate-500">Sidebar control</div>
+                    <button
+                      v-for="option in desktopSidebarModeOptions"
+                      :key="option.value"
+                      type="button"
+                      class="flex w-full items-center gap-2 rounded-xl px-2 py-2 text-left text-[12px] text-slate-700 transition-colors hover:bg-black/[0.04]"
+                      @click.stop="setDesktopSidebarMode(option.value)"
+                    >
+                      <span class="inline-flex h-4 w-4 items-center justify-center">
+                        <span
+                          class="h-2 w-2 rounded-full"
+                          :class="desktopSidebarMode === option.value ? 'bg-slate-800' : 'bg-transparent ring-1 ring-slate-300'"
+                        />
+                      </span>
+                      <span class="truncate">{{ option.label }}</span>
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
           </div>
-
-          <div class="shrink-0 p-2">
-              <button
-                class="w-full inline-flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                @click="openSettings('machines')"
-              >
-                <Settings class="h-3.5 w-3.5" />
-                Settings
-              </button>
-          </div>
         </aside>
 
         <div
-          v-if="!isMobileLayout"
+          v-if="!isMobileLayout && !desktopSidebarCompact"
           class="group relative shrink-0 w-3 cursor-col-resize touch-none"
           title="Drag to resize the thread sidebar"
           @pointerdown.prevent="beginSessionSidebarDrag"
@@ -3456,7 +3759,61 @@ watch(
                 </div>
               </div>
 
-              <div class="flex shrink-0 items-center gap-1.5">
+              <div
+                v-if="isMobileLayout"
+                class="relative shrink-0"
+                data-mobile-workspace-menu-root="true"
+              >
+                <button
+                  class="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  title="Open workspace tools"
+                  @click.stop="mobileWorkspaceMenuOpen = !mobileWorkspaceMenuOpen"
+                >
+                  <Menu class="h-4 w-4" />
+                </button>
+
+                <div
+                  v-if="mobileWorkspaceMenuOpen"
+                  class="absolute right-0 top-full z-30 mt-2 w-44 rounded-2xl border border-black/[0.08] bg-white p-2 shadow-[0_14px_36px_rgba(15,23,42,0.16)]"
+                >
+                  <button
+                    class="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-[12px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+                    :class="mobileWorkspaceMenuItemClass('code')"
+                    :disabled="ideStarting"
+                    @click="openWorkspaceTool('code')"
+                  >
+                    <Loader2 v-if="ideStarting" class="h-3.5 w-3.5 animate-spin" />
+                    <Code v-else class="h-3.5 w-3.5" />
+                    Workspace
+                  </button>
+                  <button
+                    class="mt-1 flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-[12px] font-medium transition-colors"
+                    :class="mobileWorkspaceMenuItemClass('terminal')"
+                    @click="openWorkspaceTool('terminal')"
+                  >
+                    <Terminal class="h-3.5 w-3.5" />
+                    Terminal
+                  </button>
+                  <button
+                    class="mt-1 flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-[12px] font-medium transition-colors"
+                    :class="mobileWorkspaceMenuItemClass('files')"
+                    @click="openWorkspaceTool('files')"
+                  >
+                    <FileText class="h-3.5 w-3.5" />
+                    Files
+                  </button>
+                  <button
+                    class="mt-1 flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-[12px] font-medium transition-colors"
+                    :class="mobileWorkspaceMenuItemClass('git')"
+                    @click="openWorkspaceTool('git')"
+                  >
+                    <GitBranch class="h-3.5 w-3.5" />
+                    Git
+                  </button>
+                </div>
+              </div>
+
+              <div v-else class="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
                 <button
                   class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
                   :class="workspaceToolButtonClass('code')"
@@ -3548,10 +3905,11 @@ watch(
           <div v-if="mainPaneMode === 'chat'" class="relative flex-1 min-h-0">
             <div
               ref="chatScrollEl"
-              class="absolute inset-0 overflow-auto px-3 py-6 sm:px-4 sm:py-8 lg:px-6"
+              class="rg-chat-scroll absolute inset-0 overflow-x-hidden overflow-y-auto px-3 py-6 sm:px-4 sm:py-8 lg:px-6"
+              :class="isMobileLayout ? 'rg-chat-scroll-mobile' : ''"
               @scroll="onChatScroll"
             >
-              <div class="mx-auto w-full max-w-[700px]">
+              <div class="rg-chat-scroll-inner mx-auto w-full min-w-0 max-w-[700px]">
               <div v-if="selectedSessionId && sessionLoading" class="py-10">
                 <div class="space-y-3 animate-pulse">
                   <div class="h-8 w-2/3 rounded-xl bg-slate-100" />
@@ -3579,14 +3937,14 @@ watch(
                 <div
                   v-for="m in chatMessages"
                   :key="m.id"
-                  class="flex"
+                  class="flex w-full min-w-0 max-w-full overflow-hidden"
                   :class="[
                     m.role === 'user' ? 'justify-end' : 'justify-start',
                     (m.stepKind === 'background' && m.active) ? '-mt-2' : ''
                   ]"
                 >
                   <!-- Interleaved "step lines" (reasoning sections + tools) -->
-                  <div v-if="m.role === 'step'" class="w-full">
+                  <div v-if="m.role === 'step'" class="min-w-0 w-full">
                     <!-- Per-turn "Details" fold (reasoning + exploration) -->
                     <div
                       v-if="m.stepKind === 'background'"
@@ -3686,12 +4044,12 @@ watch(
 
                                     <div v-if="it.output.stdout" class="mt-2">
                                       <div class="mb-1 text-[10px] uppercase tracking-wider text-slate-500">stdout</div>
-                                      <pre class="m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl border border-black/[0.06] bg-white p-2 text-xs font-mono text-slate-800">{{ it.output.stdout }}</pre>
+                                      <pre class="rg-chat-local-x-scroll m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl border border-black/[0.06] bg-white p-2 text-xs font-mono text-slate-800">{{ it.output.stdout }}</pre>
                                     </div>
 
                                     <div v-if="it.output.stderr" class="mt-2">
                                       <div class="mb-1 text-[10px] uppercase tracking-wider text-slate-500">stderr</div>
-                                      <pre class="m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl border border-black/[0.06] bg-white p-2 text-xs font-mono text-slate-800">{{ it.output.stderr }}</pre>
+                                      <pre class="rg-chat-local-x-scroll m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl border border-black/[0.06] bg-white p-2 text-xs font-mono text-slate-800">{{ it.output.stderr }}</pre>
                                     </div>
 
                                     <div v-if="!it.output.loading && !it.output.stdout && !it.output.stderr" class="mt-2 text-xs text-slate-500">
@@ -3759,7 +4117,7 @@ watch(
                                     </div>
                                   </div>
 
-                                  <div class="max-h-[520px] overflow-auto">
+                                  <div class="rg-chat-local-x-scroll max-h-[520px] overflow-auto">
                                     <table class="w-full border-collapse text-xs font-mono">
                                       <tbody>
                                         <tr
@@ -3903,7 +4261,7 @@ watch(
                             </div>
                           </div>
 
-                          <div class="max-h-[520px] overflow-auto">
+                          <div class="rg-chat-local-x-scroll max-h-[520px] overflow-auto">
                             <table class="w-full border-collapse text-xs font-mono">
                               <tbody>
                                 <tr
@@ -3978,12 +4336,12 @@ watch(
 
                             <div v-if="m.output.stdout" class="mt-2">
                               <div class="mb-1 text-[10px] uppercase tracking-wider text-slate-500">stdout</div>
-                              <pre class="m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl border border-black/[0.06] bg-white p-2 text-xs font-mono text-slate-800">{{ m.output.stdout }}</pre>
+                              <pre class="rg-chat-local-x-scroll m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl border border-black/[0.06] bg-white p-2 text-xs font-mono text-slate-800">{{ m.output.stdout }}</pre>
                             </div>
 
                             <div v-if="m.output.stderr" class="mt-2">
                               <div class="mb-1 text-[10px] uppercase tracking-wider text-slate-500">stderr</div>
-                              <pre class="m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl border border-black/[0.06] bg-white p-2 text-xs font-mono text-slate-800">{{ m.output.stderr }}</pre>
+                              <pre class="rg-chat-local-x-scroll m-0 max-h-64 overflow-auto whitespace-pre-wrap rounded-xl border border-black/[0.06] bg-white p-2 text-xs font-mono text-slate-800">{{ m.output.stderr }}</pre>
                             </div>
 
                             <div v-if="!m.output.loading && !m.output.stdout && !m.output.stderr" class="mt-2 text-xs text-slate-500">
@@ -3996,25 +4354,37 @@ watch(
                   </div>
 
                   <!-- System lines -->
-                  <div v-else-if="m.role === 'system'" class="w-full text-xs text-slate-500">
-                    <div class="mb-1 text-[10px] uppercase tracking-wider text-slate-400">{{ m.stream ?? 'system' }}</div>
-                    <pre class="m-0 whitespace-pre-wrap">{{ m.text }}</pre>
+                  <div v-else-if="m.role === 'system'" class="min-w-0 w-full text-xs">
+                    <div
+                      class="rounded-xl px-3 py-2"
+                      :class="m.tone === 'error'
+                        ? 'bg-rose-50 text-rose-700'
+                        : 'text-slate-500'"
+                    >
+                      <div
+                        class="mb-1 text-[10px] uppercase tracking-wider"
+                        :class="m.tone === 'error' ? 'text-rose-500' : 'text-slate-400'"
+                      >
+                        {{ m.stream ?? 'system' }}
+                      </div>
+                      <pre class="m-0 whitespace-pre-wrap">{{ m.text }}</pre>
+                    </div>
                   </div>
 
                   <!-- User + assistant bubbles -->
                   <div
                     v-else
-                    class="text-sm leading-7 text-slate-700 transition-colors"
+                    class="min-w-0 max-w-full overflow-hidden text-sm leading-7 text-slate-700 transition-colors"
                     :class="m.role === 'user'
-                      ? 'max-w-[640px] rounded-2xl bg-[#efefec] px-4 py-3 text-slate-700 shadow-sm'
-                      : 'w-full max-w-[640px] px-0 py-0 text-slate-700'"
+                      ? 'w-full max-w-full rounded-2xl bg-[#efefec] px-4 py-3 text-slate-700 shadow-sm sm:w-auto sm:max-w-[640px]'
+                      : 'w-full min-w-0 max-w-full px-0 py-0 text-slate-700 sm:max-w-[640px]'"
                   >
-                    <div v-if="m.role === 'assistant'">
-                      <div v-if="String(m.text ?? '').trim()">
+                    <div v-if="m.role === 'assistant'" class="min-w-0 max-w-full overflow-hidden">
+                      <div v-if="String(m.text ?? '').trim()" class="min-w-0 max-w-full overflow-hidden">
                         <MarkdownView :source="m.text" />
                       </div>
                     </div>
-                    <div v-else>
+                    <div v-else class="min-w-0 max-w-full overflow-hidden">
                       <div v-if="Array.isArray(m.attachments) && m.attachments.length" class="mb-2 flex flex-wrap gap-2">
                         <a
                           v-for="a in m.attachments"
@@ -4510,7 +4880,7 @@ watch(
 
                     <ComposerPillSelect
                       v-model="composerModel"
-                      class="max-w-[220px]"
+                      class="min-w-0 max-w-[220px]"
                       title="Choose model"
                       :options="composerModelSelectOptions"
                       :disabled="modelCatalogLoading && !composerModelOptions.length"
@@ -4519,7 +4889,7 @@ watch(
 
                     <ComposerPillSelect
                       v-model="composerReasoningEffort"
-                      class="max-w-[220px]"
+                      class="min-w-0 max-w-[220px]"
                       title="Select reasoning"
                       :options="composerReasoningSelectOptions"
                       size="md"
@@ -4591,6 +4961,9 @@ watch(
                       <div v-if="composerMachineUpgradeErrorText" class="mt-2 text-[11px] text-red-600">
                         {{ composerMachineUpgradeErrorText }}
                       </div>
+                      <div v-else-if="composerMachineUpgradeLocked" class="mt-2 text-[11px] text-amber-700">
+                        {{ composerMachineUpgradeLockedReason }}
+                      </div>
                       <div v-else-if="composerMachineUpgradeAvailable" class="mt-2 text-[11px] text-slate-500">
                         Upgrade this runner from the updated host.
                       </div>
@@ -4608,7 +4981,8 @@ watch(
                         v-if="composerMachineUpgradeAvailable"
                         type="button"
                         class="mt-3 inline-flex items-center gap-2 rounded-full bg-red-600 px-3 py-1.5 text-[11px] font-medium text-white transition-colors hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-40"
-                        :disabled="composerMachineUpgradeWorking || ['starting', 'receiving', 'installing', 'updating', 'restarting'].includes(String(composerMachine?.upgrade?.state ?? ''))"
+                        :disabled="composerMachineUpgradeLocked || composerMachineUpgradeWorking || composerMachineUpgradeBusy"
+                        :title="composerMachineUpgradeLockedReason || null"
                         @click.stop="composerMachine ? upgradeMachine(composerMachine.machineId) : null"
                       >
                         <Loader2 v-if="composerMachineUpgradeWorking" class="h-3.5 w-3.5 animate-spin" />
@@ -4619,7 +4993,7 @@ watch(
 
                   <ComposerPillSelect
                     v-model="composerApprovalPolicy"
-                    class="max-w-[170px]"
+                    class="min-w-0 max-w-[170px]"
                     :title="selectedSession ? 'Session approval policy' : 'Default approval policy'"
                     :options="composerApprovalSelectOptions"
                     size="sm"
@@ -4627,7 +5001,7 @@ watch(
 
                   <ComposerPillSelect
                     v-model="composerSandbox"
-                    class="max-w-[190px]"
+                    class="min-w-0 max-w-[190px]"
                     :title="selectedSession ? 'Session sandbox' : 'Default sandbox'"
                     :options="composerSandboxSelectOptions"
                     size="sm"
@@ -4941,6 +5315,62 @@ watch(
                     </div>
                   </div>
 
+                  <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                    <div class="flex items-start justify-between gap-3">
+                      <div class="min-w-0">
+                        <div class="text-sm font-medium text-slate-900">Host self-update</div>
+                        <div class="mt-1 text-xs text-slate-500">
+                          Fetch the configured branch, rebuild Rootgrid, and restart the host from this machine.
+                        </div>
+                      </div>
+                      <button
+                        class="inline-flex shrink-0 items-center gap-2 rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                        :disabled="!hostSelfUpdateEnabled || hostSelfUpdateWorking"
+                        :title="hostSelfUpdateEnabled ? 'Fetch, rebuild, and restart the host.' : 'Set host.selfUpdate.enabled=true in config.json to enable web-triggered host updates.'"
+                        @click="startHostSelfUpdate"
+                      >
+                        <Loader2 v-if="hostSelfUpdateWorking" class="h-4 w-4 animate-spin" />
+                        Update host
+                      </button>
+                    </div>
+
+                    <div class="mt-3 grid grid-cols-1 gap-2 text-xs text-slate-500 sm:grid-cols-2">
+                      <div class="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                        Remote:
+                        <span class="ml-1 break-all font-mono text-slate-700">{{ hostSelfUpdateInfo?.repo ?? 'origin' }}</span>
+                      </div>
+                      <div class="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                        Branch:
+                        <span class="ml-1 font-mono text-slate-700">{{ hostSelfUpdateInfo?.branch ?? 'main' }}</span>
+                      </div>
+                      <div class="rounded-xl border border-slate-200 bg-white px-3 py-2 sm:col-span-2">
+                        Workdir:
+                        <span class="ml-1 break-all font-mono text-slate-700">{{ hostSelfUpdateInfo?.workdir ?? '—' }}</span>
+                      </div>
+                      <div class="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                        Install:
+                        <span class="ml-1 break-all font-mono text-slate-700">{{ hostSelfUpdateInfo?.installCommand ?? 'npm ci' }}</span>
+                      </div>
+                      <div class="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                        Build:
+                        <span class="ml-1 break-all font-mono text-slate-700">{{ hostSelfUpdateInfo?.buildCommand ?? 'npm run build' }}</span>
+                      </div>
+                    </div>
+
+                    <div v-if="hostSelfUpdateInfo?.restartMode === 'command'" class="mt-2 text-xs text-slate-500">
+                      Restart mode: configured command, then Rootgrid exits.
+                    </div>
+                    <div v-else class="mt-2 text-xs text-slate-500">
+                      Restart mode: Rootgrid exits after a successful update so your service/container can restart it.
+                    </div>
+
+                    <div v-if="hostSelfUpdateError" class="mt-2 text-sm text-red-600">{{ hostSelfUpdateError }}</div>
+                    <div v-else-if="hostSelfUpdateStatus" class="mt-2 text-sm text-emerald-700">{{ hostSelfUpdateStatus }}</div>
+                    <div v-else-if="!hostSelfUpdateEnabled" class="mt-2 text-xs text-amber-700">
+                      Configure <span class="font-mono">host.selfUpdate</span> in <span class="font-mono">~/.rootgrid/config.json</span> to enable this button.
+                    </div>
+                  </div>
+
                   <div v-if="appSettingsError" class="text-sm text-red-600">{{ appSettingsError }}</div>
 
                   <div class="flex items-center justify-end">
@@ -5055,8 +5485,8 @@ watch(
                             v-if="machineIsOnline(m) && ((machineHasVersionMismatch(m) && machineSupportsWebUpgrade(m)) || machineHasUnknownVersion(m))"
                             class="inline-flex items-center gap-2 rounded-md bg-indigo-50 px-2.5 py-1.5 text-xs text-indigo-700 transition-colors hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
                             @click="upgradeMachine(m.machineId)"
-                            :disabled="machineUpgradeWorkingId === m.machineId || ['starting', 'updating', 'restarting'].includes(String(m.upgrade?.state ?? ''))"
-                            :title="machineHasUnknownVersion(m) ? 'Try a remote runner upgrade. If this legacy runner does not support it, update it manually.' : 'Pull, rebuild, and restart this runner using its configured upgrade commands.'"
+                            :disabled="Boolean(machineUpgradeLockReason(m)) || machineUpgradeWorkingId === m.machineId || machineUpgradeBusy(m)"
+                            :title="machineUpgradeButtonTitle(m)"
                           >
                             <Loader2 v-if="machineUpgradeWorkingId === m.machineId" class="h-3.5 w-3.5 animate-spin" />
                             {{ machineHasUnknownVersion(m) ? 'Try upgrade' : 'Upgrade' }}
@@ -5123,6 +5553,9 @@ watch(
                       </div>
                       <div v-if="machineUpgradeStatusText(m)" class="mt-2 text-xs" :class="m.upgrade?.state === 'failed' ? 'text-red-600' : 'text-slate-500'">
                         {{ machineUpgradeStatusText(m) }}
+                      </div>
+                      <div v-if="machineUpgradeLockReason(m)" class="mt-2 text-xs text-amber-700">
+                        {{ machineUpgradeLockReason(m) }}
                       </div>
                     </div>
                   </div>

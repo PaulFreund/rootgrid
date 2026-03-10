@@ -7,8 +7,10 @@
 }
 
 html,
-body {
+body,
+#app {
   height: 100%;
+  max-width: 100%;
 }
 
 body {
@@ -17,6 +19,7 @@ body {
   color: #1f2937;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
     "Segoe UI Emoji";
+  overflow-x: clip;
 }
 
 * {
@@ -46,16 +49,25 @@ body {
 @layer components {
   .rg-prose {
     @apply prose prose-slate max-w-none text-[15px] leading-7;
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: hidden;
     overflow-wrap: anywhere;
     word-break: break-word;
   }
 
   .rg-prose :where(pre):not(:where(.not-prose *)) {
-    @apply bg-transparent p-0;
+    @apply max-w-full bg-transparent p-0;
   }
 
   .rg-prose :where(p):not(:where(.not-prose *)) {
     @apply my-3;
+  }
+
+  .rg-prose :where(table):not(:where(.not-prose *)) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
   }
 
   .rg-prose :where(a, li, blockquote, code, strong, em, span):not(:where(.not-prose *)) {
@@ -64,7 +76,7 @@ body {
   }
 
   .rg-codeblock {
-    @apply my-4 overflow-hidden rounded-2xl border border-black/5 bg-[#f1f1ee];
+    @apply my-4 max-w-full overflow-hidden rounded-2xl border border-black/5 bg-[#f1f1ee];
   }
 
   .rg-codeblock__header {
@@ -80,7 +92,7 @@ body {
   }
 
   .rg-codeblock pre {
-    @apply m-0 overflow-auto p-3 text-xs;
+    @apply m-0 max-w-full overflow-auto p-3 text-xs;
   }
 
   .rg-codeblock code {
@@ -101,6 +113,31 @@ body {
   .rg-pill-button,
   .rg-pill-button {
     @apply relative inline-flex items-center rounded-full border border-transparent text-slate-500;
+  }
+}
+
+@media (max-width: 767px) {
+  .rg-chat-scroll-mobile {
+    overflow-x: clip;
+    overscroll-behavior-x: none;
+    touch-action: pan-y;
+  }
+
+  .rg-chat-scroll-mobile .rg-chat-scroll-inner,
+  .rg-chat-scroll-mobile .rg-prose,
+  .rg-chat-scroll-mobile details,
+  .rg-chat-scroll-mobile summary {
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .rg-chat-scroll-mobile .rg-chat-local-x-scroll,
+  .rg-chat-scroll-mobile .rg-codeblock pre,
+  .rg-chat-scroll-mobile .rg-prose :where(table):not(:where(.not-prose *)) {
+    max-width: 100%;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-x pan-y;
   }
 }
 

@@ -20,6 +20,30 @@ export function clearComposerAttachments(list, deps) {
   items.splice(0, items.length)
 }
 
+export function buildComposerAttachmentRefs(uploadDescriptors, sessionId, {
+  createId = () => globalThis.crypto.randomUUID()
+} = {}) {
+  const sid = String(sessionId ?? '').trim()
+  const out = []
+  for (const upload of (Array.isArray(uploadDescriptors) ? uploadDescriptors : [])) {
+    if (!upload || typeof upload !== 'object') continue
+    const uploadId = String(upload.uploadId ?? '').trim()
+    if (!uploadId) continue
+    const mimeType = String(upload.mimeType ?? 'application/octet-stream').trim() || 'application/octet-stream'
+    out.push({
+      id: createId(),
+      filename: String(upload.filename ?? 'upload').trim() || 'upload',
+      mimeType,
+      sizeBytes: Number(upload.sizeBytes ?? 0) || 0,
+      file: null,
+      previewUrl: isImageMimeType(mimeType) ? (String(upload.url ?? '').trim() || null) : null,
+      uploadId,
+      uploadedForSessionId: sid
+    })
+  }
+  return out
+}
+
 export function buildComposerAttachments(files, {
   createId = () => globalThis.crypto.randomUUID(),
   createPreviewUrl = globalThis.URL?.createObjectURL?.bind(globalThis.URL)
