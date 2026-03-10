@@ -183,6 +183,7 @@ let offlineHandler = null
 
 const layoutShellEl = ref(null)
 const workspaceSplitEl = ref(null)
+const appViewportHeight = ref(null)
 const machines = ref([])
 const sessions = ref([])
 const machineRowsById = reactive(new Map())
@@ -447,6 +448,9 @@ let keydownHandler = null
 let visibilityHandler = null
 let swMessageHandler = null
 let windowResizeHandler = null
+let windowPageShowHandler = null
+let visualViewportHandler = null
+let viewportSyncTimer = null
 let sidebarDragMoveHandler = null
 let sidebarDragUpHandler = null
 let workspaceDragMoveHandler = null
@@ -623,6 +627,44 @@ function persistWorkspaceWidth() {
 function refreshMobileLayout() {
   const viewportWidth = Number(layoutShellEl.value?.clientWidth ?? window.innerWidth ?? 0)
   isMobileLayout.value = isMobileViewportWidth(viewportWidth)
+}
+
+const appShellStyle = computed(() => {
+  const px = Number(appViewportHeight.value ?? 0)
+  if (!Number.isFinite(px) || px <= 0) return null
+  return {
+    height: `${px}px`,
+    minHeight: `${px}px`
+  }
+})
+
+function syncAppViewportHeight() {
+  const visualHeight = Number(window.visualViewport?.height ?? NaN)
+  const innerHeight = Number(window.innerHeight ?? NaN)
+  const docHeight = Number(document.documentElement?.clientHeight ?? NaN)
+  const candidates = [visualHeight, innerHeight, docHeight]
+    .filter((value) => Number.isFinite(value) && value > 0)
+  if (!candidates.length) return null
+  const nextHeight = Math.max(1, Math.round(Math.min(...candidates)))
+  appViewportHeight.value = nextHeight
+  return nextHeight
+}
+
+function queueAppViewportSync() {
+  syncAppViewportHeight()
+  try {
+    window.requestAnimationFrame(() => {
+      syncAppViewportHeight()
+    })
+  } catch {
+  }
+  if (viewportSyncTimer) {
+    try { clearTimeout(viewportSyncTimer) } catch {}
+  }
+  viewportSyncTimer = setTimeout(() => {
+    viewportSyncTimer = null
+    syncAppViewportHeight()
+  }, 240)
 }
 
 function stopSessionSidebarDrag() {
@@ -3068,6 +3110,7 @@ onMounted(async () => {
   newThreadOpen.value = false
   defaultsOpen.value = false
   workspacePaneOpen.value = false
+  queueAppViewportSync()
   refreshMobileLayout()
   desktopSidebarMode.value = readStoredDesktopSidebarMode()
   sessionSidebarWidth.value = readSessionSidebarWidth()
@@ -3098,6 +3141,7 @@ onMounted(async () => {
   try { window.addEventListener('offline', onOffline) } catch {}
   const onResize = () => {
     const chatSnapshot = captureChatScrollSnapshot()
+    queueAppViewportSync()
     refreshMobileLayout()
     applySessionSidebarWidth(sessionSidebarWidth.value)
     applyWorkspaceChatPaneWidth(workspaceChatWidth.value)
@@ -3108,6 +3152,19 @@ onMounted(async () => {
   }
   windowResizeHandler = onResize
   try { window.addEventListener('resize', onResize) } catch {}
+  const onPageShow = () => {
+    queueAppViewportSync()
+  }
+  windowPageShowHandler = onPageShow
+  try { window.addEventListener('pageshow', onPageShow) } catch {}
+  if (window.visualViewport) {
+    const onVisualViewportChange = () => {
+      queueAppViewportSync()
+    }
+    visualViewportHandler = onVisualViewportChange
+    try { window.visualViewport.addEventListener('resize', onVisualViewportChange) } catch {}
+    try { window.visualViewport.addEventListener('scroll', onVisualViewportChange) } catch {}
+  }
 
   const onKeyDown = (ev) => {
     if (ev.key === 'Escape') {
@@ -3157,6 +3214,7 @@ onMounted(async () => {
   try { document.addEventListener('pointerdown', onSessionMenuOutside) } catch {}
 
   await nextTick()
+  queueAppViewportSync()
   updateSessionListMetrics()
   if (typeof ResizeObserver === 'function') {
     try {
@@ -3246,6 +3304,19 @@ onBeforeUnmount(() => {
     try { window.removeEventListener('resize', windowResizeHandler) } catch {}
     windowResizeHandler = null
   }
+  if (windowPageShowHandler) {
+    try { window.removeEventListener('pageshow', windowPageShowHandler) } catch {}
+    windowPageShowHandler = null
+  }
+  if (visualViewportHandler && window.visualViewport) {
+    try { window.visualViewport.removeEventListener('resize', visualViewportHandler) } catch {}
+    try { window.visualViewport.removeEventListener('scroll', visualViewportHandler) } catch {}
+    visualViewportHandler = null
+  }
+  if (viewportSyncTimer) {
+    try { clearTimeout(viewportSyncTimer) } catch {}
+    viewportSyncTimer = null
+  }
 
   if (visibilityHandler) {
     try { document.removeEventListener('visibilitychange', visibilityHandler) } catch {}
@@ -3297,7 +3368,7 @@ watch(
 </script>
 
 <template>
-  <div class="rg-app-shell bg-[#f7f7f4] text-slate-900">
+  <div class="rg-app-shell bg-[#f7f7f4] text-slate-900" :style="appShellStyle">
     <div v-if="!authed" class="h-full flex flex-col">
       <div v-if="showPwaInstallPrompt" class="shrink-0 px-4 pt-4">
         <div class="mx-auto flex max-w-xl items-start justify-between gap-3 rounded-2xl border border-indigo-200 bg-indigo-50/80 px-4 py-3 text-left shadow-sm">
