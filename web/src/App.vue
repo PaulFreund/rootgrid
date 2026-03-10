@@ -3297,7 +3297,7 @@ watch(
 </script>
 
 <template>
-  <div class="h-screen w-screen bg-[#f7f7f4] text-slate-900">
+  <div class="rg-app-shell bg-[#f7f7f4] text-slate-900">
     <div v-if="!authed" class="h-full flex flex-col">
       <div v-if="showPwaInstallPrompt" class="shrink-0 px-4 pt-4">
         <div class="mx-auto flex max-w-xl items-start justify-between gap-3 rounded-2xl border border-indigo-200 bg-indigo-50/80 px-4 py-3 text-left shadow-sm">
@@ -5186,7 +5186,7 @@ watch(
 
                 <div v-if="newThreadError" class="text-sm text-red-600">{{ newThreadError }}</div>
 
-                <div class="mt-auto flex shrink-0 flex-col gap-3 border-t border-black/[0.04] bg-white px-0 py-3 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] sm:flex-row sm:items-center sm:pb-3">
+                <div class="mt-auto flex shrink-0 flex-col gap-3 border-t border-black/[0.04] bg-white px-0 py-3 sm:flex-row sm:items-center">
                   <div class="min-w-0 flex-1 rounded-lg bg-white px-3 py-2 ring-1 ring-slate-200">
                     <div class="text-[11px] uppercase tracking-wider text-slate-500">Selected folder</div>
                     <div class="mt-1 truncate text-sm text-slate-900" :title="newThreadCwd || newThreadBrowsePath">
