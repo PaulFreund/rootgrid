@@ -156,7 +156,9 @@ import {
 } from './lib/workspaceTerminal.js'
 import {
   isMobileViewportWidth,
-  preferredMobilePane
+  preferredMobilePane,
+  SESSION_CHAT_MAX_WIDTH,
+  shouldUseSessionChatHeaderMenu
 } from './lib/mobileLayout.js'
 import {
   resolveMainPaneMode,
@@ -183,6 +185,7 @@ let offlineHandler = null
 
 const layoutShellEl = ref(null)
 const workspaceSplitEl = ref(null)
+const mainPaneEl = ref(null)
 const appViewportHeight = ref(null)
 const machines = ref([])
 const sessions = ref([])
@@ -199,6 +202,7 @@ const sessionSidebarDragging = ref(false)
 const workspaceChatWidth = ref(DEFAULT_WORKSPACE_CHAT_WIDTH)
 const workspaceSplitDragging = ref(false)
 const isMobileLayout = ref(false)
+const mainPaneViewportWidth = ref(0)
 const desktopSidebarMode = ref(DEFAULT_DESKTOP_SIDEBAR_MODE)
 const desktopSidebarFlyoutOpen = ref(false)
 const desktopSidebarModeMenuOpen = ref(false)
@@ -457,6 +461,7 @@ let workspaceDragMoveHandler = null
 let workspaceDragUpHandler = null
 let sessionListResizeObserver = null
 let chatResizeObserver = null
+let mainPaneResizeObserver = null
 let sessionMenuOutsideHandler = null
 
 function getSessionStore(sessionId) {
@@ -625,8 +630,13 @@ function persistWorkspaceWidth() {
 }
 
 function refreshMobileLayout() {
-  const viewportWidth = Number(layoutShellEl.value?.clientWidth ?? window.innerWidth ?? 0)
+  const viewportWidth = Number(window.innerWidth ?? document.documentElement?.clientWidth ?? layoutShellEl.value?.clientWidth ?? 0)
   isMobileLayout.value = isMobileViewportWidth(viewportWidth)
+}
+
+function syncMainPaneViewportWidth() {
+  mainPaneViewportWidth.value = Number(mainPaneEl.value?.clientWidth ?? 0)
+  return mainPaneViewportWidth.value
 }
 
 const appShellStyle = computed(() => {
@@ -1498,7 +1508,8 @@ const {
   lastSseMessageAt,
   everConnected,
   handleEnvelope: (env) => handleEnvelope(env),
-  currentVisibility
+  currentVisibility,
+  shouldReconnect: () => authed.value && networkOnline.value
 })
 
 schedulePostVisibility = schedulePostVisibilityImpl
@@ -1626,6 +1637,9 @@ const workspaceMainStyle = computed(() => {
   if (isMobileLayout.value || !showWorkspacePane.value) return null
   return { width: `${workspaceChatWidth.value}px` }
 })
+const sessionChatShellStyle = computed(() => ({
+  maxWidth: `${SESSION_CHAT_MAX_WIDTH}px`
+}))
 const composerMachineLabel = computed(() => {
   if (selectedSession.value) {
     const host = sessionHostName(selectedSession.value) || 'Local'
@@ -1708,6 +1722,14 @@ const mainPaneMode = computed(() => {
     isMobileLayout: isMobileLayout.value,
     forceEmptyHomeScreen: forceEmptyHomeScreen.value
   })
+})
+const useSessionHeaderWorkspaceMenu = computed(() => {
+  if (isMobileLayout.value) return true
+  if (mainPaneMode.value !== 'chat') return false
+  return shouldUseSessionChatHeaderMenu(mainPaneViewportWidth.value)
+})
+watch(useSessionHeaderWorkspaceMenu, (enabled) => {
+  if (!enabled) mobileWorkspaceMenuOpen.value = false
 })
 const showWorkspacePane = computed(() => {
   if (isMobileLayout.value) return false
@@ -3143,6 +3165,7 @@ onMounted(async () => {
     const chatSnapshot = captureChatScrollSnapshot()
     queueAppViewportSync()
     refreshMobileLayout()
+    syncMainPaneViewportWidth()
     applySessionSidebarWidth(sessionSidebarWidth.value)
     applyWorkspaceChatPaneWidth(workspaceChatWidth.value)
     updateSessionListMetrics()
@@ -3216,6 +3239,7 @@ onMounted(async () => {
   await nextTick()
   queueAppViewportSync()
   updateSessionListMetrics()
+  syncMainPaneViewportWidth()
   if (typeof ResizeObserver === 'function') {
     try {
       sessionListResizeObserver = new ResizeObserver(() => updateSessionListMetrics())
@@ -3229,6 +3253,11 @@ onMounted(async () => {
         restoreChatScrollState(sid).catch(() => {})
       })
       if (chatScrollEl.value) chatResizeObserver.observe(chatScrollEl.value)
+    } catch {
+    }
+    try {
+      mainPaneResizeObserver = new ResizeObserver(() => syncMainPaneViewportWidth())
+      if (mainPaneEl.value) mainPaneResizeObserver.observe(mainPaneEl.value)
     } catch {
     }
   }
@@ -3279,6 +3308,8 @@ onBeforeUnmount(() => {
   sessionListResizeObserver = null
   try { chatResizeObserver?.disconnect?.() } catch {}
   chatResizeObserver = null
+  try { mainPaneResizeObserver?.disconnect?.() } catch {}
+  mainPaneResizeObserver = null
   if (nowTimer) {
     try { clearInterval(nowTimer) } catch {}
     nowTimer = null
@@ -3471,9 +3502,9 @@ watch(
         </div>
       </div>
 
-      <div ref="layoutShellEl" class="flex flex-1 min-h-0 overflow-hidden">
+      <div ref="layoutShellEl" class="flex min-h-0 min-w-0 flex-1 overflow-hidden">
         <div
-          class="flex min-h-0 flex-1"
+          class="flex min-h-0 min-w-0 flex-1"
           :class="isMobileLayout ? 'h-full w-full flex-none shrink-0 overflow-hidden transition-transform duration-300 ease-out' : ''"
           :style="layoutTrackStyle"
         >
@@ -3790,10 +3821,11 @@ watch(
       <!-- Main -->
       <div
         ref="workspaceSplitEl"
-        class="flex min-h-0 bg-white"
+        class="flex min-h-0 min-w-0 bg-white"
         :class="isMobileLayout ? 'min-h-0 h-full w-1/2 min-w-0 shrink-0 basis-1/2 overflow-hidden p-0' : 'flex-1 gap-1.5 p-1.5'"
       >
       <main
+        ref="mainPaneEl"
         class="min-h-0"
         :class="isMobileLayout
           ? 'h-full w-full min-w-0 max-w-full flex-1 overflow-hidden'
@@ -3806,9 +3838,9 @@ watch(
           :class="isMobileLayout ? 'w-full rounded-none shadow-none' : 'rounded-[16px] shadow-[0_1px_2px_rgba(0,0,0,0.03)]'"
         >
           <header class="bg-white px-4 py-2.5">
-            <div v-if="mainPaneMode === 'chat'" class="flex items-start justify-between gap-4">
-              <div class="min-w-0">
-                <div class="flex min-w-0 items-center gap-2">
+            <div v-if="mainPaneMode === 'chat'" class="flex min-w-0 items-start justify-between gap-4">
+              <div class="min-w-0 flex flex-1 items-center gap-2">
+                <div class="flex min-w-0 flex-1 items-center gap-2">
                   <button
                     v-if="isMobileLayout"
                     class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
@@ -3817,9 +3849,9 @@ watch(
                   >
                     <ArrowLeft class="h-4 w-4" />
                   </button>
-                  <div v-if="selectedSession" class="min-w-0 flex items-center gap-2">
+                  <div v-if="selectedSession" class="min-w-0 flex flex-1 items-center gap-2">
                     <button
-                      class="truncate rounded text-[13px] font-semibold text-slate-800 transition-colors hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                      class="min-w-0 flex-1 truncate rounded text-left text-[13px] font-semibold text-slate-800 transition-colors hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
                       title="Rename thread"
                       @click="openRenameSession(selectedSession, { focus: 'title' })"
                     >
@@ -3831,7 +3863,7 @@ watch(
               </div>
 
               <div
-                v-if="isMobileLayout"
+                v-if="useSessionHeaderWorkspaceMenu"
                 class="relative shrink-0"
                 data-mobile-workspace-menu-root="true"
               >
@@ -3884,9 +3916,9 @@ watch(
                 </div>
               </div>
 
-              <div v-else class="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
+              <div v-else class="flex shrink-0 items-center justify-end gap-1.5 whitespace-nowrap">
                 <button
-                  class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  class="inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
                   :class="workspaceToolButtonClass('code')"
                   @click="openWorkspace"
                   title="Open VS Code web (code-server)"
@@ -3897,7 +3929,7 @@ watch(
                   Open
                 </button>
                 <button
-                  class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  class="inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
                   :class="workspaceToolButtonClass('terminal')"
                   @click="openWorkspaceTool('terminal')"
                   title="Open terminal"
@@ -3906,7 +3938,7 @@ watch(
                   <span class="hidden sm:inline">Terminal</span>
                 </button>
                 <button
-                  class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  class="inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
                   :class="workspaceToolButtonClass('files')"
                   @click="openWorkspaceTool('files')"
                   title="Open file viewer"
@@ -3915,7 +3947,7 @@ watch(
                   <span class="hidden sm:inline">Files</span>
                 </button>
                 <button
-                  class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  class="inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
                   :class="workspaceToolButtonClass('git')"
                   @click="openWorkspaceTool('git')"
                   title="Open git viewer"
@@ -3980,7 +4012,7 @@ watch(
               :class="isMobileLayout ? 'rg-chat-scroll-mobile' : ''"
               @scroll="onChatScroll"
             >
-              <div class="rg-chat-scroll-inner mx-auto w-full min-w-0 max-w-[700px]">
+              <div class="rg-chat-scroll-inner mx-auto w-full min-w-0" :style="sessionChatShellStyle">
               <div v-if="selectedSessionId && sessionLoading" class="py-10">
                 <div class="space-y-3 animate-pulse">
                   <div class="h-8 w-2/3 rounded-xl bg-slate-100" />
@@ -4446,9 +4478,10 @@ watch(
                   <div
                     v-else
                     class="min-w-0 max-w-full overflow-hidden text-sm leading-7 text-slate-700 transition-colors"
+                    :style="{ maxWidth: `${SESSION_CHAT_MAX_WIDTH}px` }"
                     :class="m.role === 'user'
-                      ? 'w-full max-w-full rounded-2xl bg-[#efefec] px-4 py-3 text-slate-700 shadow-sm sm:w-auto sm:max-w-[640px]'
-                      : 'w-full min-w-0 max-w-full px-0 py-0 text-slate-700 sm:max-w-[640px]'"
+                      ? 'w-full max-w-full rounded-2xl bg-[#efefec] px-4 py-3 text-slate-700 shadow-sm sm:w-auto'
+                      : 'w-full min-w-0 max-w-full px-0 py-0 text-slate-700'"
                   >
                     <div v-if="m.role === 'assistant'" class="min-w-0 max-w-full overflow-hidden">
                       <div v-if="String(m.text ?? '').trim()" class="min-w-0 max-w-full overflow-hidden">
@@ -4507,7 +4540,7 @@ watch(
 
           <!-- Pinned plan checklist (Codex-style) -->
           <div v-if="mainPaneMode === 'chat' && pinnedPlanHasUnchecked" class="shrink-0 bg-white px-6 pb-3">
-            <div class="mx-auto w-full max-w-[700px]">
+            <div class="mx-auto w-full" :style="sessionChatShellStyle">
               <div class="overflow-hidden rounded-[20px] border border-black/[0.05] bg-[#f5f5f2]">
                 <button
                   class="flex w-full items-center justify-between gap-3 bg-[#f5f5f2] px-4 py-2 text-left text-xs text-slate-700 transition-colors hover:bg-black/[0.025] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/40"
@@ -4586,7 +4619,7 @@ watch(
             @dragover.prevent
             @drop.prevent="onComposerDrop"
           >
-            <div class="mx-auto w-full max-w-[700px]">
+            <div class="mx-auto w-full" :style="sessionChatShellStyle">
               <div
                 v-if="composerDragging"
                 class="pointer-events-none absolute inset-0 flex items-center justify-center border-2 border-dashed border-slate-900/30 bg-slate-900/5 text-sm font-medium text-slate-700"

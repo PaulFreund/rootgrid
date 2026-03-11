@@ -186,3 +186,114 @@ test('createSessionSseActions batches non-snapshot envelopes briefly before hand
     globalThis.EventSource = originalEventSource
   }
 })
+
+test('createSessionSseActions retries a closed SSE stream on the configured cadence', async () => {
+  class FakeEventSource {
+    static CLOSED = 2
+    static instances = []
+
+    constructor(url) {
+      this.url = url
+      this.readyState = 0
+      this.closeCalls = 0
+      FakeEventSource.instances.push(this)
+    }
+
+    close() {
+      this.closeCalls += 1
+      this.readyState = FakeEventSource.CLOSED
+    }
+  }
+
+  const sseStatus = { value: 'disconnected' }
+  const sseDisconnectReason = { value: null }
+  const originalEventSource = globalThis.EventSource
+  globalThis.EventSource = FakeEventSource
+  try {
+    const actions = createSessionSseActions({
+      apiFetch: async () => ({ ok: true }),
+      sseConnectionId: { value: null },
+      lastSseEventId: { value: 0 },
+      hasSnapshot: { value: false },
+      selectedSessionId: { value: null },
+      selectedMachineId: { value: null },
+      stickToBottom: { value: true },
+      scheduleMarkRead: () => {},
+      clearScheduledMarkRead: () => {},
+      onVisible: () => {},
+      sseStatus,
+      sseDisconnectReason,
+      lastSseMessageAt: { value: 0 },
+      everConnected: { value: false },
+      reconnectDelayMs: 5,
+      shouldReconnect: () => true,
+      handleEnvelope: () => {},
+      currentVisibility: () => 'visible'
+    })
+
+    actions.connectSse()
+    const first = FakeEventSource.instances[0]
+    first.readyState = FakeEventSource.CLOSED
+    first.onerror()
+    assert.equal(sseStatus.value, 'error')
+    assert.equal(sseDisconnectReason.value, 'closed')
+
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(FakeEventSource.instances.length, 2)
+    assert.equal(first.closeCalls, 1)
+  } finally {
+    globalThis.EventSource = originalEventSource
+  }
+})
+
+test('createSessionSseActions does not schedule retries when reconnect is disabled', async () => {
+  class FakeEventSource {
+    static CLOSED = 2
+    static instances = []
+
+    constructor(url) {
+      this.url = url
+      this.readyState = 0
+      FakeEventSource.instances.push(this)
+    }
+
+    close() {
+      this.readyState = FakeEventSource.CLOSED
+    }
+  }
+
+  const originalEventSource = globalThis.EventSource
+  globalThis.EventSource = FakeEventSource
+  try {
+    const actions = createSessionSseActions({
+      apiFetch: async () => ({ ok: true }),
+      sseConnectionId: { value: null },
+      lastSseEventId: { value: 0 },
+      hasSnapshot: { value: false },
+      selectedSessionId: { value: null },
+      selectedMachineId: { value: null },
+      stickToBottom: { value: true },
+      scheduleMarkRead: () => {},
+      clearScheduledMarkRead: () => {},
+      onVisible: () => {},
+      sseStatus: { value: 'disconnected' },
+      sseDisconnectReason: { value: null },
+      lastSseMessageAt: { value: 0 },
+      everConnected: { value: false },
+      reconnectDelayMs: 5,
+      shouldReconnect: () => false,
+      handleEnvelope: () => {},
+      currentVisibility: () => 'visible'
+    })
+
+    actions.connectSse()
+    const first = FakeEventSource.instances[0]
+    first.readyState = FakeEventSource.CLOSED
+    first.onerror()
+
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(FakeEventSource.instances.length, 1)
+  } finally {
+    globalThis.EventSource = originalEventSource
+  }
+})

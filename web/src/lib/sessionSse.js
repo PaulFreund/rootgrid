@@ -67,6 +67,7 @@ export function createSessionSseActions({
   persistLastEventId = null,
   flushDelayMs = 16,
   flushBatchSize = 64,
+  reconnectDelayMs = 5_000,
   hasSnapshot = null,
   selectedSessionId,
   selectedMachineId = null,
@@ -79,11 +80,13 @@ export function createSessionSseActions({
   lastSseMessageAt,
   everConnected,
   handleEnvelope,
-  currentVisibility = () => currentVisibilityState()
+  currentVisibility = () => currentVisibilityState(),
+  shouldReconnect = () => true
 }) {
   let es = null
   let visibilityPostTimer = null
   let flushTimer = null
+  let reconnectTimer = null
   /** @type {any[]} */
   let pendingEnvelopes = []
 
@@ -124,6 +127,22 @@ export function createSessionSseActions({
     }, flushDelayMs)
   }
 
+  function clearReconnectTimer() {
+    if (!reconnectTimer) return
+    try { clearTimeout(reconnectTimer) } catch {}
+    reconnectTimer = null
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer) return
+    if (!shouldReconnect()) return
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      if (!shouldReconnect()) return
+      connectSse()
+    }, reconnectDelayMs)
+  }
+
   async function postVisibilityNow() {
     const connectionId = sseConnectionId.value
     if (!connectionId) return
@@ -157,6 +176,7 @@ export function createSessionSseActions({
   }
 
   function closeSse() {
+    clearReconnectTimer()
     flushPendingEnvelopes()
     if (!es) return
     try { es.close() } catch {}
@@ -181,6 +201,7 @@ export function createSessionSseActions({
 
     next.onopen = () => {
       if (es !== next) return
+      clearReconnectTimer()
       sseStatus.value = 'connected'
       sseDisconnectReason.value = null
       everConnected.value = true
@@ -193,6 +214,7 @@ export function createSessionSseActions({
       sseDisconnectReason.value = inferSseDisconnectReason(next, {
         fallback: sseDisconnectReason.value ?? 'error'
       })
+      scheduleReconnect()
     }
 
     next.onmessage = (ev) => {
@@ -220,6 +242,7 @@ export function createSessionSseActions({
       try { clearTimeout(visibilityPostTimer) } catch {}
       visibilityPostTimer = null
     }
+    clearReconnectTimer()
     flushPendingEnvelopes()
     closeSse()
   }

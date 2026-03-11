@@ -113,6 +113,15 @@ body,
     word-break: break-word;
   }
 
+  .rg-prose :where(code):not(:where(pre code, .not-prose *)) {
+    @apply rounded-md bg-black/[0.05] px-1.5 py-0.5 font-mono text-[0.92em] font-medium text-slate-800;
+  }
+
+  .rg-prose :where(code):not(:where(pre code, .not-prose *))::before,
+  .rg-prose :where(code):not(:where(pre code, .not-prose *))::after {
+    content: none;
+  }
+
   .rg-codeblock {
     @apply my-4 max-w-full overflow-hidden rounded-2xl border border-black/5 bg-[#f1f1ee];
   }
