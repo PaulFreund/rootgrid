@@ -38,6 +38,20 @@ export function readStoredPwaInstallDismissed(storageObj = globalThis.localStora
   }
 }
 
+export function browserSupportsPwaInstallPrompt({
+  windowObj = globalThis.window
+} = {}) {
+  try {
+    if ('onbeforeinstallprompt' in (windowObj ?? {})) return true
+  } catch {
+  }
+  try {
+    if (typeof windowObj?.BeforeInstallPromptEvent === 'function') return true
+  } catch {
+  }
+  return false
+}
+
 export function writeStoredPwaInstallDismissed(value, storageObj = globalThis.localStorage) {
   try {
     if (value) storageObj?.setItem?.(PWA_INSTALL_DISMISS_KEY, '1')
@@ -47,15 +61,15 @@ export function writeStoredPwaInstallDismissed(value, storageObj = globalThis.lo
 }
 
 export function shouldShowPwaInstallPrompt({
-  isMobileLayout,
   installed,
-  dismissed
+  dismissed,
+  supported,
+  canPrompt
 }) {
-  return Boolean(isMobileLayout && !installed && !dismissed)
+  return Boolean(supported && canPrompt && !installed && !dismissed)
 }
 
 export function createPwaInstallPromptActions({
-  isMobileLayout,
   windowObj = globalThis.window,
   navigatorObj = globalThis.navigator,
   localStorageObj = globalThis.localStorage
@@ -64,22 +78,32 @@ export function createPwaInstallPromptActions({
   const pwaInstalled = ref(isStandaloneDisplay({ windowObj, navigatorObj }))
   const pwaInstallDismissed = ref(readStoredPwaInstallDismissed(localStorageObj))
   const pwaInstallWorking = ref(false)
+  const pwaInstallInstructionsVisible = ref(false)
 
   let beforeInstallPromptHandler = null
   let appInstalledHandler = null
 
+  const pwaInstallSupported = computed(() => browserSupportsPwaInstallPrompt({ windowObj }))
   const pwaInstallCanPrompt = computed(() => Boolean(deferredPrompt.value))
   const pwaInstallManualOnly = computed(() => isLikelyIosBrowser({ navigatorObj }) && !pwaInstallCanPrompt.value)
+  const pwaInstallActionLabel = computed(() => 'Install')
   const pwaInstallMessage = computed(() => {
-    if (pwaInstallCanPrompt.value) return 'Install Rootgrid for faster access and better mobile notifications.'
+    if (pwaInstallCanPrompt.value) return 'Install Rootgrid for faster access and app-like behavior.'
     if (pwaInstallManualOnly.value) return 'Install Rootgrid from Safari using Share → Add to Home Screen.'
-    return 'Install Rootgrid from your browser menu for a better mobile experience.'
+    return 'Install Rootgrid from your browser menu for faster access.'
+  })
+  const pwaInstallInstructions = computed(() => {
+    if (pwaInstallManualOnly.value) {
+      return 'Open the Share menu in Safari, then choose Add to Home Screen.'
+    }
+    return 'Open your browser menu and choose Install app, Add to Home Screen, or Create shortcut.'
   })
   const showPwaInstallPrompt = computed(() => {
     return shouldShowPwaInstallPrompt({
-      isMobileLayout: isMobileLayout?.value,
       installed: pwaInstalled.value,
-      dismissed: pwaInstallDismissed.value
+      dismissed: pwaInstallDismissed.value,
+      supported: pwaInstallSupported.value,
+      canPrompt: pwaInstallCanPrompt.value
     })
   })
 
@@ -87,14 +111,16 @@ export function createPwaInstallPromptActions({
     const installed = isStandaloneDisplay({ windowObj, navigatorObj })
     pwaInstalled.value = installed
     if (installed) {
-      pwaInstallDismissed.value = false
-      writeStoredPwaInstallDismissed(false, localStorageObj)
+      pwaInstallDismissed.value = true
+      pwaInstallInstructionsVisible.value = false
+      writeStoredPwaInstallDismissed(true, localStorageObj)
     }
     return installed
   }
 
   function dismissPwaInstallPrompt() {
     pwaInstallDismissed.value = true
+    pwaInstallInstructionsVisible.value = false
     writeStoredPwaInstallDismissed(true, localStorageObj)
   }
 
@@ -132,13 +158,19 @@ export function createPwaInstallPromptActions({
 
   async function triggerPwaInstallPrompt() {
     const prompt = deferredPrompt.value
-    if (!prompt?.prompt) return false
+    if (!prompt?.prompt) {
+      pwaInstallInstructionsVisible.value = !pwaInstallInstructionsVisible.value
+      return false
+    }
     pwaInstallWorking.value = true
     try {
       await prompt.prompt()
       const choice = await prompt.userChoice?.catch(() => null)
       deferredPrompt.value = null
       if (choice?.outcome === 'accepted') {
+        pwaInstallDismissed.value = true
+        writeStoredPwaInstallDismissed(true, localStorageObj)
+        pwaInstallInstructionsVisible.value = false
         refreshPwaInstalledState()
         return true
       }
@@ -149,10 +181,14 @@ export function createPwaInstallPromptActions({
   }
 
   return {
+    pwaInstallSupported,
     pwaInstallCanPrompt,
     pwaInstallDismissed,
     pwaInstalled,
     pwaInstallManualOnly,
+    pwaInstallActionLabel,
+    pwaInstallInstructions,
+    pwaInstallInstructionsVisible,
     pwaInstallMessage,
     pwaInstallWorking,
     showPwaInstallPrompt,

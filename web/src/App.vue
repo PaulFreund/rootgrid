@@ -20,7 +20,6 @@ import {
   countMachineWorkingSessions as countMachineWorkingSessionsAt,
   formatAgeShort as formatAgeShortValue,
   formatCompactInt,
-  finalizeCompletedPlan,
   indicatorDotClass,
   machineDisplayName as machineDisplayNameAt,
   machineIsOnline as machineIsOnlineAt,
@@ -36,6 +35,9 @@ import {
   toastBorderClass,
   updateTokenUsageMap
 } from './lib/appDisplay.js'
+import {
+  applySessionPlanState
+} from './lib/sessionPlanState.js'
 import {
   copyTextToClipboard,
   dismissToastById,
@@ -126,6 +128,9 @@ import {
   createPwaInstallPromptActions
 } from './lib/pwaInstallPrompt.js'
 import {
+  createNotificationAccessPromptActions
+} from './lib/notificationAccessPrompt.js'
+import {
   createSessionAdminActions
 } from './lib/sessionAdminActions.js'
 import {
@@ -156,10 +161,13 @@ import {
 } from './lib/workspaceTerminal.js'
 import {
   isMobileViewportWidth,
-  preferredMobilePane,
+  preferredMobilePane
+} from './lib/mobileLayout.js'
+import {
+  buildSessionChatShellStyle,
   SESSION_CHAT_MAX_WIDTH,
   shouldUseSessionChatHeaderMenu
-} from './lib/mobileLayout.js'
+} from './lib/sessionChatLayout.js'
 import {
   resolveMainPaneMode,
   shouldAutoOpenNewThreadScreen
@@ -865,7 +873,6 @@ const {
   requestNotificationPermission,
   refreshPushSubscription,
   enablePush,
-  autoEnablePushOnLoad,
   disablePush,
   openSettings: openSettingsBase
 } = createSystemSettingsActions({
@@ -879,7 +886,12 @@ const {
 })
 
 const {
-  pwaInstallCanPrompt,
+  pwaInstallDismissed,
+  pwaInstalled,
+  pwaInstallSupported,
+  pwaInstallActionLabel,
+  pwaInstallInstructions,
+  pwaInstallInstructionsVisible,
   pwaInstallMessage,
   pwaInstallWorking,
   showPwaInstallPrompt,
@@ -887,9 +899,104 @@ const {
   attachPwaInstallPrompt,
   disposePwaInstallPrompt,
   triggerPwaInstallPrompt
-} = createPwaInstallPromptActions({
-  isMobileLayout
+} = createPwaInstallPromptActions({})
+
+const pwaInstallPromptCompleted = computed(() => (
+  pwaInstalled.value || pwaInstallDismissed.value || !pwaInstallSupported.value
+))
+
+const notificationAccessPushCapable = computed(() => Boolean(
+  authed.value
+  && appSettingsLoaded.value
+  && pushSupported.value
+  && globalThis.window?.isSecureContext
+  && String(appSettings.notifications?.webPush ?? '').trim() !== 'never'
+))
+
+const notificationAccessEnabled = computed(() => {
+  if (notificationAccessPushCapable.value) {
+    return pushStatus.value === 'subscribed'
+  }
+  return notificationPermission.value === 'granted'
 })
+
+const notificationAccessReady = computed(() => (
+  !notificationAccessPushCapable.value || pushStatus.value !== 'unknown'
+))
+
+const {
+  showNotificationAccessPrompt,
+  dismissNotificationAccessPrompt
+} = createNotificationAccessPromptActions({
+  previousStepComplete: pwaInstallPromptCompleted,
+  notificationSupported,
+  notificationPermission,
+  notificationEnabled: notificationAccessEnabled,
+  notificationReady: notificationAccessReady
+})
+
+const notificationAccessMessage = computed(() => {
+  if (notificationAccessPushCapable.value) {
+    return 'Enable notifications for approvals and completion alerts, even when Rootgrid is in the background.'
+  }
+  return 'Enable browser notifications for approvals and completion alerts.'
+})
+
+const onboardingBanner = computed(() => {
+  if (showPwaInstallPrompt.value) {
+    return {
+      kind: 'install',
+      title: 'Install Rootgrid',
+      message: pwaInstallMessage.value,
+      detail: pwaInstallInstructionsVisible.value ? pwaInstallInstructions.value : '',
+      actionLabel: pwaInstallActionLabel.value,
+      actionPendingLabel: 'Opening…',
+      working: pwaInstallWorking.value
+    }
+  }
+  if (showNotificationAccessPrompt.value) {
+    return {
+      kind: 'notifications',
+      title: 'Enable notifications',
+      message: notificationAccessMessage.value,
+      detail: '',
+      actionLabel: 'Enable',
+      actionPendingLabel: 'Enabling…',
+      working: pushWorking.value
+    }
+  }
+  return null
+})
+
+async function triggerNotificationAccessPrompt() {
+  if (notificationAccessPushCapable.value) {
+    const ok = await enablePush()
+    if (ok || notificationAccessEnabled.value || notificationPermission.value === 'denied') {
+      dismissNotificationAccessPrompt()
+    }
+    return ok
+  }
+  const permission = await requestNotificationPermission()
+  if (permission !== 'default') dismissNotificationAccessPrompt()
+  return permission === 'granted'
+}
+
+function dismissOnboardingBanner() {
+  if (!onboardingBanner.value) return
+  if (onboardingBanner.value.kind === 'install') {
+    dismissPwaInstallPrompt()
+    return
+  }
+  dismissNotificationAccessPrompt()
+}
+
+async function triggerOnboardingBannerAction() {
+  if (!onboardingBanner.value) return false
+  if (onboardingBanner.value.kind === 'install') {
+    return await triggerPwaInstallPrompt()
+  }
+  return await triggerNotificationAccessPrompt()
+}
 
 function openSettings(tab = 'machines') {
   const nextTab = tab === 'defaults' ? 'machines' : tab
@@ -1017,17 +1124,10 @@ function clearScheduledMarkRead() {
 }
 
 function applyDerivedSessionEvent(sessionId, event, store) {
+  applySessionPlanState(store, event)
+
   if (event.type === 'diff.updated' && typeof event.payload?.diff === 'string') {
     store.diff = event.payload.diff
-  }
-
-  if (event.type === 'plan.updated') {
-    store.plan = Array.isArray(event.payload?.plan) ? event.payload.plan : null
-    store.planExplanation = event.payload?.explanation ?? null
-  }
-
-  if (event.type === 'turn.completed') {
-    store.plan = finalizeCompletedPlan(store.plan, event.payload?.status ?? null)
   }
 
   if (event.type === 'thread.tokenUsage.updated' || event.type === 'token.count') {
@@ -1581,6 +1681,15 @@ watch(defaultsOpen, (open) => {
   loadArchivedSessions().catch(() => {})
 })
 
+watch(
+  () => notificationAccessPushCapable.value,
+  (capable) => {
+    if (!capable) return
+    refreshPushSubscription().catch(() => {})
+  },
+  { immediate: true }
+)
+
 watch(selectedSessionId, (sid, prevSid) => {
   if (!isMobileLayout.value) return
   if (!String(sid ?? '').trim()) {
@@ -1637,9 +1746,7 @@ const workspaceMainStyle = computed(() => {
   if (isMobileLayout.value || !showWorkspacePane.value) return null
   return { width: `${workspaceChatWidth.value}px` }
 })
-const sessionChatShellStyle = computed(() => ({
-  maxWidth: `${SESSION_CHAT_MAX_WIDTH}px`
-}))
+const sessionChatShellStyle = buildSessionChatShellStyle()
 const composerMachineLabel = computed(() => {
   if (selectedSession.value) {
     const host = sessionHostName(selectedSession.value) || 'Local'
@@ -2300,16 +2407,6 @@ onLoginConnect = () => {
   }
   showInitialNewThreadIfNeeded()
 }
-
-watch(
-  () => [authed.value, appSettingsLoaded.value, String(appSettings.notifications?.webPush ?? '')],
-  ([isAuthed, settingsLoaded, webPushPolicy]) => {
-    if (!isAuthed || !settingsLoaded) return
-    if (String(webPushPolicy ?? '').trim() === 'never') return
-    autoEnablePushOnLoad({ force: true }).catch(() => {})
-  },
-  { immediate: true }
-)
 
 watch(
   () => mainPaneMode.value,
@@ -3400,33 +3497,40 @@ watch(
 
 <template>
   <div class="rg-app-shell bg-[#f7f7f4] text-slate-900" :style="appShellStyle">
-    <div v-if="!authed" class="h-full flex flex-col">
-      <div v-if="showPwaInstallPrompt" class="shrink-0 px-4 pt-4">
-        <div class="mx-auto flex max-w-xl items-start justify-between gap-3 rounded-2xl border border-indigo-200 bg-indigo-50/80 px-4 py-3 text-left shadow-sm">
-          <div class="min-w-0">
-            <div class="text-sm font-medium text-slate-900">Install Rootgrid</div>
-            <div class="mt-0.5 text-xs leading-5 text-slate-600">{{ pwaInstallMessage }}</div>
-          </div>
-          <div class="flex shrink-0 items-center gap-2">
-            <button
-              v-if="pwaInstallCanPrompt"
-              class="inline-flex items-center rounded-full bg-slate-900 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
-              :disabled="pwaInstallWorking"
-              @click="triggerPwaInstallPrompt"
-            >
-              {{ pwaInstallWorking ? 'Opening…' : 'Install' }}
-            </button>
-            <button
-              class="inline-flex items-center justify-center rounded-full p-1.5 text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600"
-              @click="dismissPwaInstallPrompt"
-              aria-label="Dismiss install prompt"
-            >
-              <X class="h-4 w-4" />
-            </button>
+    <div v-if="onboardingBanner" class="shrink-0 px-4 pt-4">
+      <div
+        class="mx-auto flex max-w-3xl items-center justify-between gap-4 rounded-2xl border px-4 py-3 text-left shadow-sm"
+        :class="onboardingBanner.kind === 'install'
+          ? 'border-indigo-200 bg-indigo-50/80'
+          : 'border-emerald-200 bg-emerald-50/80'"
+      >
+        <div class="min-w-0 flex-1">
+          <div class="text-sm font-medium text-slate-900">{{ onboardingBanner.title }}</div>
+          <div class="mt-0.5 text-xs leading-5 text-slate-600">{{ onboardingBanner.message }}</div>
+          <div v-if="onboardingBanner.detail" class="mt-2 text-xs leading-5 text-slate-600">
+            {{ onboardingBanner.detail }}
           </div>
         </div>
+        <div class="flex shrink-0 items-center gap-2 self-center">
+          <button
+            class="inline-flex min-h-8 items-center rounded-full bg-slate-900 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
+            :disabled="onboardingBanner.working"
+            @click="triggerOnboardingBannerAction"
+          >
+            {{ onboardingBanner.working ? onboardingBanner.actionPendingLabel : onboardingBanner.actionLabel }}
+          </button>
+          <button
+            class="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600"
+            @click="dismissOnboardingBanner"
+            :aria-label="`Dismiss ${onboardingBanner.title}`"
+          >
+            <X class="h-4 w-4" />
+          </button>
+        </div>
       </div>
+    </div>
 
+    <div v-if="!authed" class="h-full flex flex-col">
       <div class="flex flex-1 items-center justify-center px-6 pb-6">
         <div class="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
           <div class="text-xl font-semibold tracking-tight text-slate-900">Rootgrid</div>
@@ -3455,35 +3559,6 @@ watch(
     </div>
 
     <div v-else class="h-full flex flex-col bg-white">
-      <div
-        v-if="showPwaInstallPrompt"
-        class="shrink-0 border-b border-black/5 bg-indigo-50/70"
-      >
-        <div class="mx-auto flex max-w-3xl items-start justify-between gap-3 px-4 py-3 sm:px-6">
-          <div class="min-w-0">
-            <div class="text-sm font-medium text-slate-900">Install Rootgrid</div>
-            <div class="mt-0.5 text-xs leading-5 text-slate-600">{{ pwaInstallMessage }}</div>
-          </div>
-          <div class="flex shrink-0 items-center gap-2">
-            <button
-              v-if="pwaInstallCanPrompt"
-              class="inline-flex items-center rounded-full bg-slate-900 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
-              :disabled="pwaInstallWorking"
-              @click="triggerPwaInstallPrompt"
-            >
-              {{ pwaInstallWorking ? 'Opening…' : 'Install' }}
-            </button>
-            <button
-              class="inline-flex items-center justify-center rounded-full p-1.5 text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600"
-              @click="dismissPwaInstallPrompt"
-              aria-label="Dismiss install prompt"
-            >
-              <X class="h-4 w-4" />
-            </button>
-          </div>
-        </div>
-      </div>
-
       <div
         v-if="connectionBanner"
         class="shrink-0 bg-white/80 backdrop-blur supports-[backdrop-filter]:bg-white/60"
