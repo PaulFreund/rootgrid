@@ -171,7 +171,7 @@ export async function startRunnerClient({ url, token, machineId, machineName, de
     ws.on('close', () => {
       cleanup()
       const backoffMs = Math.min(30_000, 250 * Math.pow(2, attempt))
-      setTimeout(connect, backoffMs).unref?.()
+      setTimeout(connect, backoffMs)
     })
 
     ws.on('error', () => {

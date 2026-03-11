@@ -54,6 +54,40 @@ export function getSystemdUserUnitPath({ serviceName }) {
   return join(homedir(), '.config', 'systemd', 'user', `${serviceName}.service`)
 }
 
+export function buildSystemdUserUnit({
+  execStart,
+  description = 'Rootgrid',
+  workingDirectory = null,
+  environment = null
+}) {
+  const envLines = []
+  if (environment && typeof environment === 'object') {
+    for (const [k, v] of Object.entries(environment)) {
+      if (!k) continue
+      if (v === undefined) continue
+      envLines.push(`Environment=${systemdQuote(`${k}=${v}`)}`)
+    }
+  }
+
+  return [
+    '[Unit]',
+    `Description=${description}`,
+    'After=network.target',
+    '',
+    '[Service]',
+    'Type=simple',
+    ...(workingDirectory ? [`WorkingDirectory=${workingDirectory}`] : []),
+    ...envLines,
+    `ExecStart=${formatExecStart(execStart)}`,
+    'Restart=always',
+    'RestartSec=1',
+    '',
+    '[Install]',
+    'WantedBy=default.target',
+    ''
+  ].join('\n')
+}
+
 /**
  * Best-effort systemd --user autostart.
  *
@@ -74,33 +108,12 @@ export async function installSystemdUserService({
 }) {
   const unitPath = getSystemdUserUnitPath({ serviceName })
   await mkdir(join(homedir(), '.config', 'systemd', 'user'), { recursive: true })
-
-  const envLines = []
-  if (environment && typeof environment === 'object') {
-    for (const [k, v] of Object.entries(environment)) {
-      if (!k) continue
-      if (v === undefined) continue
-      envLines.push(`Environment=${systemdQuote(`${k}=${v}`)}`)
-    }
-  }
-
-  const unit = [
-    '[Unit]',
-    `Description=${description}`,
-    'After=network.target',
-    '',
-    '[Service]',
-    'Type=simple',
-    ...(workingDirectory ? [`WorkingDirectory=${workingDirectory}`] : []),
-    ...envLines,
-    `ExecStart=${formatExecStart(execStart)}`,
-    'Restart=on-failure',
-    'RestartSec=1',
-    '',
-    '[Install]',
-    'WantedBy=default.target',
-    ''
-  ].join('\n')
+  const unit = buildSystemdUserUnit({
+    execStart,
+    description,
+    workingDirectory,
+    environment
+  })
 
   await writeFile(unitPath, unit, { mode: 0o644 })
 

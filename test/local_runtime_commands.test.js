@@ -8,6 +8,7 @@ import {
   usesManagedRuntimeForConfig
 } from '../src/setup/localRuntimeCommands.js'
 import { buildDefaultConfig } from '../src/config/defaultConfig.js'
+import { buildSystemdUserUnit } from '../src/setup/systemdUserAutostart.js'
 
 test('chooseUserServiceMethod prefers the configured method only when available', () => {
   assert.equal(chooseUserServiceMethod({
@@ -82,4 +83,16 @@ test('applyAutostartConfig toggles autostart state safely', () => {
   const disabled = applyAutostartConfig(enabled, { enabled: false, method: null })
   assert.equal(disabled.autostart.enabled, false)
   assert.equal(disabled.autostart.method, null)
+})
+
+test('buildSystemdUserUnit restarts the Rootgrid service on any exit', () => {
+  const unit = buildSystemdUserUnit({
+    description: 'Rootgrid (runner)',
+    execStart: ['/usr/bin/node', '/root/.rootgrid/current/src/cli.js'],
+    workingDirectory: '/root/.rootgrid/current'
+  })
+
+  assert.match(unit, /^Type=simple$/m)
+  assert.match(unit, /^Restart=always$/m)
+  assert.doesNotMatch(unit, /^Restart=on-failure$/m)
 })

@@ -222,7 +222,7 @@ export async function startTunnelClient({ url, token, machineId, machineName }) 
     ws.on('close', () => {
       for (const id of Array.from(streams.keys())) cleanupStream(id)
       const backoffMs = Math.min(30_000, 250 * Math.pow(2, attempt))
-      setTimeout(connect, backoffMs).unref?.()
+      setTimeout(connect, backoffMs)
     })
 
     ws.on('error', () => {
