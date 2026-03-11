@@ -2,7 +2,7 @@
 import { ref, watch } from 'vue'
 import { ArrowLeft } from 'lucide-vue-next'
 
-import MonacoFileViewer from './MonacoFileViewer.vue'
+import CodeFileViewer from './CodeFileViewer.vue'
 import WorkspaceFileTreeNode from './WorkspaceFileTreeNode.vue'
 
 const props = defineProps({
@@ -135,7 +135,7 @@ watch(() => props.selectedFilePath, (path) => {
           <div v-else-if="selectedFile?.binary" class="px-4 py-3 text-sm text-slate-500">Binary file preview is not supported.</div>
           <div v-else-if="selectedFile?.text !== undefined && selectedFile?.text !== null" class="flex h-full min-h-0 flex-col">
             <div class="min-h-0 flex-1">
-              <MonacoFileViewer :path="selectedFile.path" :value="selectedFile.text" />
+              <CodeFileViewer :path="selectedFile.path" :value="selectedFile.text" />
             </div>
           </div>
           <div v-else class="flex h-full items-center justify-center px-6 text-center text-sm text-slate-500">
@@ -187,7 +187,7 @@ watch(() => props.selectedFilePath, (path) => {
           <div v-else-if="selectedFile?.text !== undefined && selectedFile?.text !== null" class="flex h-full min-h-0 flex-col">
             <div class="truncate px-4 py-2 text-xs text-slate-500" :title="selectedFile.path">{{ selectedFile.path }}</div>
             <div class="min-h-0 flex-1">
-              <MonacoFileViewer :path="selectedFile.path" :value="selectedFile.text" />
+              <CodeFileViewer :path="selectedFile.path" :value="selectedFile.text" />
             </div>
           </div>
           <div v-else class="flex h-full items-center justify-center px-6 text-center text-sm text-slate-500">
