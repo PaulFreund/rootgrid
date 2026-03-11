@@ -1,7 +1,21 @@
 import { spawn } from 'node:child_process'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { join } from 'node:path'
 import process from 'node:process'
 
-import { getRootgridPackageRoot } from '../lib/rootgridVersion.js'
+import {
+  DEFAULT_GITHUB_RELEASE_ASSET_NAME,
+  buildGitHubReleaseChannelTag,
+  downloadGitHubReleaseBundleToFile,
+  extractGitHubAccessTokenFromRepoSpec,
+  sanitizeGitHubRepoForDisplay
+} from '../lib/githubReleaseChannel.js'
+import {
+  getReleaseTransfersDir,
+  hashFileSha256,
+  installManagedReleaseFromBundle,
+  isCurrentProcessUsingManagedRelease
+} from '../lib/managedRelease.js'
 
 function trimText(value) {
   const text = String(value ?? '').trim()
@@ -24,6 +38,23 @@ function normalizeShellOutput(value) {
   return String(value ?? '')
     .replace(/\r\n/g, '\n')
     .trim()
+}
+
+function normalizeKeepReleases(value, fallback = 3) {
+  const n = Number(value ?? fallback)
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : fallback
+}
+
+function resolveHostSelfUpdateRepoConfig(config) {
+  const repo = trimText(config?.host?.selfUpdate?.repo)
+    ?? trimText(config?.host?.selfUpdate?.repoUrl)
+  const accessToken = trimText(config?.host?.selfUpdate?.accessToken)
+    ?? trimText(config?.host?.selfUpdate?.token)
+    ?? extractGitHubAccessTokenFromRepoSpec(repo)
+  return {
+    repo,
+    accessToken
+  }
 }
 
 function defaultRunCommand(command, args = [], {
@@ -88,16 +119,7 @@ function defaultRunCommand(command, args = [], {
 }
 
 export function sanitizeRepoUrlForDisplay(value) {
-  const raw = trimText(value)
-  if (!raw) return 'origin'
-  try {
-    const url = new URL(raw)
-    url.username = ''
-    url.password = ''
-    return url.toString()
-  } catch {
-    return raw.replace(/\/\/[^/@:\s]+:[^/@\s]+@/g, '//***:***@')
-  }
+  return sanitizeGitHubRepoForDisplay(value)
 }
 
 export function countWorkingHostSessions(store) {
@@ -134,16 +156,14 @@ export function countWorkingHostSessions(store) {
 }
 
 export function buildHostSelfUpdatePublicState(config, {
-  packageRoot = getRootgridPackageRoot(),
   state = null
 } = {}) {
   const source = config?.host?.selfUpdate ?? {}
+  const repoConfig = resolveHostSelfUpdateRepoConfig(config)
   const enabled = source?.enabled === true
-  const repoUrl = trimText(source?.repoUrl)
   const branch = trimText(source?.branch) ?? 'main'
-  const workdir = trimText(source?.workdir) ?? packageRoot
-  const installCommand = trimText(source?.installCommand) ?? 'npm ci'
-  const buildCommand = trimText(source?.buildCommand) ?? 'npm run build'
+  const assetName = trimText(source?.assetName) ?? DEFAULT_GITHUB_RELEASE_ASSET_NAME
+  const keepReleases = normalizeKeepReleases(source?.keepReleases, 3)
   const restartCommand = trimText(source?.restartCommand)
   const working = Boolean(state?.working)
   const awaitingRestart = Boolean(state?.awaitingRestart)
@@ -153,11 +173,12 @@ export function buildHostSelfUpdatePublicState(config, {
 
   return {
     enabled,
-    repo: sanitizeRepoUrlForDisplay(repoUrl),
+    mode: 'github-release',
+    repo: sanitizeRepoUrlForDisplay(repoConfig.repo),
     branch,
-    workdir,
-    installCommand,
-    buildCommand,
+    channelTag: buildGitHubReleaseChannelTag(branch),
+    assetName,
+    keepReleases,
     restartMode: restartCommand ? 'command' : 'exit',
     working,
     awaitingRestart,
@@ -170,10 +191,13 @@ export function buildHostSelfUpdatePublicState(config, {
 export function createHostSelfUpdateManager({
   config,
   store,
-  packageRoot = getRootgridPackageRoot(),
   runCommand = defaultRunCommand,
   exitProcess = (code) => process.exit(code),
-  setTimer = globalThis.setTimeout
+  setTimer = globalThis.setTimeout,
+  isManagedRuntime = isCurrentProcessUsingManagedRelease,
+  downloadReleaseBundle = downloadGitHubReleaseBundleToFile,
+  installReleaseBundle = installManagedReleaseFromBundle,
+  hashFile = hashFileSha256
 } = {}) {
   const state = {
     working: false,
@@ -184,11 +208,7 @@ export function createHostSelfUpdateManager({
     exitScheduled: false
   }
 
-  async function runGit(args, { cwd }) {
-    return await runCommand('git', ['-C', cwd, ...args], { cwd })
-  }
-
-  async function runShell(command, { cwd, detached = false, wait = true }) {
+  async function runShell(command, { cwd = null, detached = false, wait = true } = {}) {
     return await runCommand('/bin/sh', ['-lc', command], {
       cwd,
       detached,
@@ -197,10 +217,7 @@ export function createHostSelfUpdateManager({
   }
 
   function getPublicState() {
-    return buildHostSelfUpdatePublicState(config, {
-      packageRoot,
-      state
-    })
+    return buildHostSelfUpdatePublicState(config, { state })
   }
 
   async function start() {
@@ -217,11 +234,16 @@ export function createHostSelfUpdateManager({
       )
     }
 
-    const workdir = summary.workdir
-    const repoSpec = trimText(config?.host?.selfUpdate?.repoUrl) ?? 'origin'
-    const branch = summary.branch
-    const installCommand = trimText(config?.host?.selfUpdate?.installCommand) ?? 'npm ci'
-    const buildCommand = trimText(config?.host?.selfUpdate?.buildCommand) ?? 'npm run build'
+    const managedRuntime = await isManagedRuntime()
+    if (!managedRuntime) {
+      throw httpError(
+        409,
+        'host self-update requires a managed host install; reinstall with the GitHub install/upgrade command first'
+      )
+    }
+
+    const repoConfig = resolveHostSelfUpdateRepoConfig(config)
+    if (!repoConfig.repo) throw httpError(400, 'host self-update repo is not configured')
 
     state.working = true
     state.awaitingRestart = false
@@ -230,30 +252,37 @@ export function createHostSelfUpdateManager({
     state.lastStartedAtMs = Date.now()
     state.lastCompletedAtMs = null
 
+    const transferDir = await mkdtemp(join(getReleaseTransfersDir(), 'host-update-'))
+    const archivePath = join(transferDir, summary.assetName)
+
     try {
-      await runGit(['rev-parse', '--is-inside-work-tree'], { cwd: workdir })
-      const status = await runGit(['status', '--porcelain', '--untracked-files=no'], { cwd: workdir })
-      if (normalizeShellOutput(status?.stdout)) {
-        throw httpError(409, 'host checkout has local changes; commit or stash them before updating')
+      const bundle = await downloadReleaseBundle({
+        repoSpec: repoConfig.repo,
+        branch: summary.branch,
+        assetName: summary.assetName,
+        accessToken: repoConfig.accessToken,
+        outPath: archivePath
+      })
+
+      if (bundle?.expectedSha256) {
+        const actualSha256 = await hashFile(archivePath)
+        if (actualSha256 !== bundle.expectedSha256) {
+          throw httpError(500, 'downloaded host bundle checksum mismatch')
+        }
       }
 
-      await runGit(['fetch', '--depth', '1', repoSpec, branch], { cwd: workdir })
-
-      try {
-        await runGit(['checkout', branch], { cwd: workdir })
-        await runGit(['merge', '--ff-only', 'FETCH_HEAD'], { cwd: workdir })
-      } catch {
-        await runGit(['checkout', '-B', branch, 'FETCH_HEAD'], { cwd: workdir })
-      }
-
-      if (installCommand) await runShell(installCommand, { cwd: workdir })
-      if (buildCommand) await runShell(buildCommand, { cwd: workdir })
+      const installed = await installReleaseBundle({
+        archivePath,
+        keep: summary.keepReleases
+      })
 
       state.awaitingRestart = true
       state.lastCompletedAtMs = Date.now()
 
       return {
         ok: true,
+        releaseId: trimText(installed?.manifest?.releaseId),
+        version: trimText(installed?.manifest?.version),
         message: summary.restartMode === 'command'
           ? 'Host update succeeded. Rootgrid is restarting.'
           : 'Host update succeeded. Rootgrid is exiting so its service/container can restart it.',
@@ -265,6 +294,8 @@ export function createHostSelfUpdateManager({
       state.working = false
       state.awaitingRestart = false
       throw (Number(err?.statusCode) ? err : httpError(500, state.lastError))
+    } finally {
+      await rm(transferDir, { recursive: true, force: true }).catch(() => {})
     }
   }
 
@@ -273,11 +304,10 @@ export function createHostSelfUpdateManager({
     state.exitScheduled = true
 
     const restartCommand = trimText(config?.host?.selfUpdate?.restartCommand)
-    const workdir = trimText(config?.host?.selfUpdate?.workdir) ?? packageRoot
 
     if (restartCommand) {
       runShell(restartCommand, {
-        cwd: workdir,
+        cwd: process.cwd(),
         detached: true,
         wait: false
       }).catch(() => {})

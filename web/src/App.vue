@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Archive, ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FileText, FolderClosed, GitBranch, Loader2, Menu, MoreHorizontal, Pencil, Plus, Settings, Sidebar, Square, Terminal, Trash2, X } from 'lucide-vue-next'
+import { Archive, ArrowDown, ArrowLeft, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, Circle, Code, Copy, FileText, FolderClosed, GitBranch, Keyboard, Loader2, Menu, MoreHorizontal, Pencil, Plus, RotateCw, Settings, Sidebar, Square, Terminal, Trash2, X } from 'lucide-vue-next'
 
 import MarkdownView from './components/MarkdownView.vue'
 import ComposerPillSelect from './components/ComposerPillSelect.vue'
@@ -137,19 +137,27 @@ import {
   createSessionStoreState,
   sessionHostName as sessionHostNameForRow,
   sessionIndicator,
-  sessionInitial,
+  sessionListAccentClass,
+  sessionListAccentTone,
+  sessionListTextClass,
   sessionListTitle,
   sessionProject,
   sessionTooltip as sessionTooltipForRow
 } from './lib/sessionUi.js'
 import {
+  refreshSessionQueuedPrompts
+} from './lib/sessionQueuedPrompts.js'
+import {
   DEFAULT_DESKTOP_SIDEBAR_MODE,
   COMPACT_SESSION_SIDEBAR_WIDTH,
   clampSessionSidebarWidth,
+  DEFAULT_SESSION_SIDEBAR_SIDE,
   DEFAULT_SESSION_SIDEBAR_WIDTH,
   persistDesktopSidebarMode,
+  persistSessionSidebarSide,
   persistSessionSidebarWidth,
   readStoredDesktopSidebarMode,
+  readStoredSessionSidebarSide,
   readStoredSessionSidebarWidth
 } from './lib/sidebarResize.js'
 import {
@@ -168,6 +176,10 @@ import {
   SESSION_CHAT_MAX_WIDTH,
   shouldUseSessionChatHeaderMenu
 } from './lib/sessionChatLayout.js'
+import {
+  COMPOSER_TEXTAREA_MIN_HEIGHT,
+  resolveComposerTextareaMaxHeight
+} from './lib/composerInputLayout.js'
 import {
   resolveMainPaneMode,
   shouldAutoOpenNewThreadScreen
@@ -207,6 +219,7 @@ const sessionListScrollTop = ref(0)
 const sessionListViewportHeight = ref(720)
 const sessionSidebarWidth = ref(DEFAULT_SESSION_SIDEBAR_WIDTH)
 const sessionSidebarDragging = ref(false)
+const sessionSidebarSide = ref(DEFAULT_SESSION_SIDEBAR_SIDE)
 const workspaceChatWidth = ref(DEFAULT_WORKSPACE_CHAT_WIDTH)
 const workspaceSplitDragging = ref(false)
 const isMobileLayout = ref(false)
@@ -226,6 +239,23 @@ const desktopSidebarModeOptions = Object.freeze([
   { value: 'collapsed', label: 'Collapsed' },
   { value: 'hover', label: 'Expand on hover' }
 ])
+const COMPACT_SIDEBAR_SESSION_SLOT_HEIGHT = 56
+const COMPACT_SIDEBAR_GROUP_SLOT_HEIGHT = 28
+const compactSidebarSessionSlotStyle = Object.freeze({
+  minHeight: `${COMPACT_SIDEBAR_SESSION_SLOT_HEIGHT}px`
+})
+const compactSidebarGroupSlotStyle = Object.freeze({
+  height: `${COMPACT_SIDEBAR_GROUP_SLOT_HEIGHT}px`
+})
+const compactSidebarHeaderButtonSlotStyle = Object.freeze({
+  minHeight: '34px'
+})
+const compactSidebarFooterPrimarySlotStyle = Object.freeze({
+  minHeight: '34px'
+})
+const compactSidebarFooterSecondarySlotStyle = Object.freeze({
+  minHeight: '32px'
+})
 
 const visibleSessions = computed(() => sessions.value.filter((s) => !s?.archivedMs))
 
@@ -256,6 +286,7 @@ const composerContextPopoverHover = ref(false)
 const composerMachinePopoverOpen = ref(false)
 const composerMachinePopoverHover = ref(false)
 const mobileWorkspaceMenuOpen = ref(false)
+const mobileWorkspaceTerminalKeyOverlayOpen = ref(false)
 
 function isImageType(mimeType) {
   return isImageMimeType(mimeType)
@@ -380,6 +411,7 @@ let nowTimer = null
 
 const messageDraft = ref('')
 const attachments = ref([]) // [{ id, filename, mimeType, sizeBytes, file, previewUrl }]
+const composerTextareaEl = ref(null)
 const fileInputEl = ref(null)
 const sendError = ref('')
 const ideError = ref('')
@@ -639,7 +671,17 @@ function persistWorkspaceWidth() {
 
 function refreshMobileLayout() {
   const viewportWidth = Number(window.innerWidth ?? document.documentElement?.clientWidth ?? layoutShellEl.value?.clientWidth ?? 0)
-  isMobileLayout.value = isMobileViewportWidth(viewportWidth)
+  const coarsePointer = Boolean(
+    window.matchMedia?.('(pointer: coarse)')?.matches
+    || window.matchMedia?.('(any-pointer: coarse)')?.matches
+  )
+  const screenWidth = Number(window.screen?.width ?? 0)
+  const screenHeight = Number(window.screen?.height ?? 0)
+  isMobileLayout.value = isMobileViewportWidth(viewportWidth, {
+    coarsePointer,
+    screenWidth,
+    screenHeight
+  })
 }
 
 function syncMainPaneViewportWidth() {
@@ -685,6 +727,20 @@ function queueAppViewportSync() {
   }, 240)
 }
 
+function syncComposerTextareaHeight() {
+  const el = composerTextareaEl.value
+  if (!el) return
+  const maxHeight = resolveComposerTextareaMaxHeight(appViewportHeight.value)
+  el.style.height = 'auto'
+  const scrollHeight = Number(el.scrollHeight ?? 0)
+  const nextHeight = Math.max(
+    COMPOSER_TEXTAREA_MIN_HEIGHT,
+    Math.min(scrollHeight, maxHeight)
+  )
+  el.style.height = `${nextHeight}px`
+  el.style.overflowY = scrollHeight > maxHeight ? 'auto' : 'hidden'
+}
+
 function stopSessionSidebarDrag() {
   sessionSidebarDragging.value = false
   if (sidebarDragMoveHandler) {
@@ -718,7 +774,8 @@ function stopWorkspacePaneDrag() {
 function updateSessionSidebarWidthFromClientX(clientX) {
   const rect = layoutShellEl.value?.getBoundingClientRect?.()
   const left = Number(rect?.left ?? 0)
-  const width = clientX - left
+  const right = Number(rect?.right ?? (left + Number(rect?.width ?? 0)))
+  const width = sessionSidebarOnRight.value ? (right - clientX) : (clientX - left)
   applySessionSidebarWidth(width)
 }
 
@@ -819,6 +876,11 @@ function setDesktopSidebarMode(mode) {
   desktopSidebarMode.value = persistDesktopSidebarMode(mode)
   desktopSidebarModeMenuOpen.value = false
   desktopSidebarFlyoutOpen.value = false
+}
+
+function toggleSessionSidebarSide() {
+  sessionSidebarSide.value = persistSessionSidebarSide(sessionSidebarSide.value === 'right' ? 'left' : 'right')
+  nextTick(() => updateSessionListMetrics())
 }
 
 const {
@@ -1353,6 +1415,21 @@ async function loadSession(sessionId) {
   })
 }
 
+async function refreshSelectedSessionQueuedPrompts() {
+  const sid = String(selectedSessionId.value ?? '').trim()
+  if (!sid || !sessionStores.has(sid)) return false
+  return await refreshSessionQueuedPrompts({
+    sessionId: sid,
+    apiFetch,
+    getSessionStore,
+    upsertSessionRow,
+    shouldApply: (targetSessionId) => (
+      String(selectedSessionId.value ?? '').trim() === targetSessionId
+      && sessionStores.has(targetSessionId)
+    )
+  })
+}
+
 async function loadMoreBefore(sessionId, { pages = 1, limit = 200 } = {}) {
   await loadMoreSessionHistoryBeforeHelper({
     apiFetch,
@@ -1505,6 +1582,9 @@ function handleTerminalEnvelope(env) {
 handleEnvelope = (env) => {
   if (handleTerminalEnvelope(env)) return
   baseHandleEnvelope(env)
+  if (env?.type === 'registry.snapshot') {
+    refreshSelectedSessionQueuedPrompts().catch(() => {})
+  }
 }
 
 const selectedSession = computed(() => {
@@ -1512,24 +1592,6 @@ const selectedSession = computed(() => {
   if (!sid) return null
   return sessionRowsById.get(sid) ?? null
 })
-const compactSidebarPreviewSessions = computed(() => {
-  const out = []
-  const seen = new Set()
-  const push = (session) => {
-    const sid = String(session?.sessionId ?? '').trim()
-    if (!sid || seen.has(sid)) return
-    seen.add(sid)
-    out.push(session)
-  }
-
-  push(selectedSession.value)
-  for (const session of visibleSessions.value) {
-    push(session)
-    if (out.length >= 8) break
-  }
-  return out
-})
-const compactSidebarOverflowCount = computed(() => Math.max(0, visibleSessions.value.length - compactSidebarPreviewSessions.value.length))
 const selectedComposerApproval = computed(() => {
   return findApprovalForSession(approvalQueue.value, selectedSessionId.value)
 })
@@ -1727,21 +1789,66 @@ const visibleSessionWindow = computed(() => computeVirtualWindowVariable(session
   overscanPx: 280,
   getItemHeight: (entry) => entry?.kind === 'group' ? 28 : 56
 }))
+const sessionSidebarOnRight = computed(() => sessionSidebarSide.value === 'right')
 const layoutTrackStyle = computed(() => {
   if (!isMobileLayout.value) return null
+  const showingSidebarPane = mobilePane.value === 'list'
+  const translatePercent = sessionSidebarOnRight.value
+    ? (showingSidebarPane ? -50 : 0)
+    : (showingSidebarPane ? 0 : -50)
   return {
     width: '200%',
-    transform: mobilePane.value === 'list' ? 'translateX(0%)' : 'translateX(-50%)'
+    transform: `translateX(${translatePercent}%)`
   }
 })
+const sidebarPaneOrderClass = computed(() => {
+  if (!sessionSidebarOnRight.value) return ''
+  return isMobileLayout.value ? 'order-2' : 'order-3'
+})
+const mainSplitOrderClass = computed(() => (
+  sessionSidebarOnRight.value ? 'order-1' : ''
+))
+const sidebarResizeHandleOrderClass = computed(() => (
+  sessionSidebarOnRight.value ? 'order-2' : ''
+))
 const sessionSidebarStyle = computed(() => {
   if (isMobileLayout.value) return null
   return { width: `${desktopSidebarCompact.value ? COMPACT_SESSION_SIDEBAR_WIDTH : sessionSidebarWidth.value}px` }
 })
 const sessionSidebarPanelStyle = computed(() => {
   if (!desktopSidebarCompact.value) return null
-  return { width: `${sessionSidebarWidth.value}px` }
+  const panelWidth = desktopSidebarExpandOnHover.value ? DEFAULT_SESSION_SIDEBAR_WIDTH : sessionSidebarWidth.value
+  return { width: `${panelWidth}px` }
 })
+const sessionSidebarCompactBorderClass = computed(() => (
+  sessionSidebarOnRight.value ? 'border-l border-black/[0.05]' : 'border-r border-black/[0.05]'
+))
+const sessionSidebarFlyoutClass = computed(() => {
+  if (!desktopSidebarCompact.value) return 'relative w-full'
+  if (sessionSidebarOnRight.value) {
+    return desktopSidebarFlyoutVisible.value
+      ? 'absolute inset-y-0 right-0 z-30 overflow-hidden rounded-l-[18px] border-l border-black/[0.05] opacity-100 shadow-[0_14px_32px_rgba(15,23,42,0.16)] pointer-events-auto translate-x-0 transition-all duration-150 ease-out'
+      : 'absolute inset-y-0 right-0 z-30 overflow-hidden rounded-l-[18px] border-l border-black/[0.05] opacity-0 shadow-[0_14px_32px_rgba(15,23,42,0.16)] pointer-events-none translate-x-2 transition-all duration-150 ease-out'
+  }
+  return desktopSidebarFlyoutVisible.value
+    ? 'absolute inset-y-0 left-0 z-30 overflow-hidden rounded-r-[18px] border-r border-black/[0.05] opacity-100 shadow-[0_14px_32px_rgba(15,23,42,0.16)] pointer-events-auto translate-x-0 transition-all duration-150 ease-out'
+    : 'absolute inset-y-0 left-0 z-30 overflow-hidden rounded-r-[18px] border-r border-black/[0.05] opacity-0 shadow-[0_14px_32px_rgba(15,23,42,0.16)] pointer-events-none -translate-x-2 transition-all duration-150 ease-out'
+})
+const compactSidebarModeMenuClass = computed(() => (
+  sessionSidebarOnRight.value
+    ? 'absolute bottom-0 right-full z-40 mr-2 w-44 rounded-2xl border border-black/[0.08] bg-white p-2 shadow-[0_12px_30px_rgba(15,23,42,0.14)]'
+    : 'absolute bottom-0 left-full z-40 ml-2 w-44 rounded-2xl border border-black/[0.08] bg-white p-2 shadow-[0_12px_30px_rgba(15,23,42,0.14)]'
+))
+const panelSidebarModeMenuClass = computed(() => (
+  sessionSidebarOnRight.value
+    ? 'absolute bottom-full right-0 z-50 mb-2 w-44 rounded-2xl border border-black/[0.08] bg-white p-2 shadow-[0_12px_30px_rgba(15,23,42,0.14)]'
+    : 'absolute bottom-full left-0 z-50 mb-2 w-44 rounded-2xl border border-black/[0.08] bg-white p-2 shadow-[0_12px_30px_rgba(15,23,42,0.14)]'
+))
+const sessionRowMenuClass = computed(() => (
+  sessionSidebarOnRight.value
+    ? 'absolute left-0 top-7 z-20 w-44 rounded-xl border border-black/[0.06] bg-white p-1 shadow-lg shadow-black/10'
+    : 'absolute right-0 top-7 z-20 w-44 rounded-xl border border-black/[0.06] bg-white p-1 shadow-lg shadow-black/10'
+))
 const workspaceMainStyle = computed(() => {
   if (isMobileLayout.value || !showWorkspacePane.value) return null
   return { width: `${workspaceChatWidth.value}px` }
@@ -1762,6 +1869,15 @@ const composerMachine = computed(() => {
     return mid ? (machineRowsById.get(mid) ?? null) : null
   }
   return defaultsSelectedMachine.value ?? null
+})
+const currentWorkspaceHostLabel = computed(() => {
+  const machineId = String(currentWorkspaceContext.value.machineId ?? '').trim()
+  if (!machineId) return 'Local'
+  return machineDisplayName(machineRowsById.get(machineId) ?? { machineId })
+})
+const currentWorkspaceHeaderLabel = computed(() => {
+  const cwd = String(currentWorkspaceContext.value.cwd ?? '').trim()
+  return cwd ? `${currentWorkspaceHostLabel.value} / ${cwd}` : currentWorkspaceHostLabel.value
 })
 const composerMachineOnline = computed(() => {
   if (selectedSession.value) {
@@ -1830,6 +1946,13 @@ const mainPaneMode = computed(() => {
     forceEmptyHomeScreen: forceEmptyHomeScreen.value
   })
 })
+const mobileWorkspacePaneActive = computed(() => (
+  isMobileLayout.value && mobilePane.value === 'workspace'
+))
+const mobileWorkspaceLandscapeHeader = computed(() => (
+  mobileWorkspacePaneActive.value
+  && Number(mainPaneViewportWidth.value ?? 0) > Number(appViewportHeight.value ?? 0)
+))
 const useSessionHeaderWorkspaceMenu = computed(() => {
   if (isMobileLayout.value) return true
   if (mainPaneMode.value !== 'chat') return false
@@ -1837,6 +1960,16 @@ const useSessionHeaderWorkspaceMenu = computed(() => {
 })
 watch(useSessionHeaderWorkspaceMenu, (enabled) => {
   if (!enabled) mobileWorkspaceMenuOpen.value = false
+})
+watch(
+  () => [mobileWorkspacePaneActive.value, workspacePaneTab.value],
+  ([workspaceActive, tab]) => {
+    if (workspaceActive && tab === 'terminal') return
+    mobileWorkspaceTerminalKeyOverlayOpen.value = false
+  }
+)
+watch(() => workspaceTerminalSession.value?.terminalId, () => {
+  mobileWorkspaceTerminalKeyOverlayOpen.value = false
 })
 const showWorkspacePane = computed(() => {
   if (isMobileLayout.value) return false
@@ -1852,6 +1985,12 @@ const desktopSidebarExpandOnHover = computed(() => (
 ))
 const desktopSidebarFlyoutVisible = computed(() => (
   desktopSidebarCompact.value && desktopSidebarExpandOnHover.value && desktopSidebarFlyoutOpen.value
+))
+const compactSidebarModeMenuVisible = computed(() => (
+  desktopSidebarModeMenuOpen.value && !desktopSidebarFlyoutVisible.value
+))
+const panelSidebarModeMenuVisible = computed(() => (
+  desktopSidebarModeMenuOpen.value && (!desktopSidebarCompact.value || desktopSidebarFlyoutVisible.value)
 ))
 watch(desktopSidebarMode, () => {
   desktopSidebarModeMenuOpen.value = false
@@ -1879,11 +2018,30 @@ const composerContextRingStrokeStyle = computed(() => {
     strokeDashoffset: `${circumference * (1 - (clamped / 100))}`
   }
 })
-const workspacePaneTitle = computed(() => {
-  if (workspacePaneTab.value === 'terminal') return 'Terminal'
-  if (workspacePaneTab.value === 'files') return 'Files'
-  if (workspacePaneTab.value === 'git') return 'Git'
-  return 'Workspace'
+const mobileWorkspaceHeaderAction = computed(() => {
+  if (!mobileWorkspacePaneActive.value) return null
+  if (workspacePaneTab.value === 'files') {
+    return {
+      kind: 'refresh-files',
+      title: workspaceFilesLoading.value ? 'Refreshing files…' : 'Refresh files',
+      disabled: workspaceFilesLoading.value
+    }
+  }
+  if (workspacePaneTab.value === 'git') {
+    return {
+      kind: 'refresh-git',
+      title: workspaceGitLoading.value ? 'Refreshing git status…' : 'Refresh git status',
+      disabled: workspaceGitLoading.value
+    }
+  }
+  if (workspacePaneTab.value === 'terminal' && workspaceTerminalSession.value?.terminalId) {
+    return {
+      kind: 'terminal-keys',
+      title: mobileWorkspaceTerminalKeyOverlayOpen.value ? 'Hide terminal keys' : 'Show terminal keys',
+      disabled: false
+    }
+  }
+  return null
 })
 const workspaceTerminalOpening = computed(() => (
   workspacePaneTab.value === 'terminal'
@@ -1891,6 +2049,22 @@ const workspaceTerminalOpening = computed(() => (
   && !workspaceTerminalError.value
   && (workspaceTerminalStarting.value || !workspaceTerminalSession.value?.terminalId)
 ))
+
+function runMobileWorkspaceHeaderAction() {
+  const action = mobileWorkspaceHeaderAction.value
+  if (!action || action.disabled) return
+  if (action.kind === 'refresh-files') {
+    loadWorkspaceFiles().catch(() => {})
+    return
+  }
+  if (action.kind === 'refresh-git') {
+    refreshWorkspaceGit().catch(() => {})
+    return
+  }
+  if (action.kind === 'terminal-keys') {
+    mobileWorkspaceTerminalKeyOverlayOpen.value = !mobileWorkspaceTerminalKeyOverlayOpen.value
+  }
+}
 
 function handleComposerMachineMouseEnter() {
   if (!composerMachineVersionMismatch.value && !composerMachineUnknownVersion.value) return
@@ -2682,6 +2856,7 @@ const {
 
 function activateWorkspacePane(tab) {
   mobileWorkspaceMenuOpen.value = false
+  mobileWorkspaceTerminalKeyOverlayOpen.value = false
   workspacePaneOpen.value = true
   workspacePaneTab.value = tab
   if (isMobileLayout.value) mobilePane.value = 'workspace'
@@ -2690,6 +2865,7 @@ function activateWorkspacePane(tab) {
 function restoreMobileSessionPane() {
   if (!isMobileLayout.value) return
   mobileWorkspaceMenuOpen.value = false
+  mobileWorkspaceTerminalKeyOverlayOpen.value = false
   workspacePaneOpen.value = false
   mobilePane.value = preferredMobilePane(selectedSessionId.value)
 }
@@ -3232,6 +3408,7 @@ onMounted(async () => {
   queueAppViewportSync()
   refreshMobileLayout()
   desktopSidebarMode.value = readStoredDesktopSidebarMode()
+  sessionSidebarSide.value = readStoredSessionSidebarSide()
   sessionSidebarWidth.value = readSessionSidebarWidth()
   workspaceChatWidth.value = readWorkspaceChatPaneWidth()
 
@@ -3337,6 +3514,7 @@ onMounted(async () => {
   queueAppViewportSync()
   updateSessionListMetrics()
   syncMainPaneViewportWidth()
+  syncComposerTextareaHeight()
   if (typeof ResizeObserver === 'function') {
     try {
       sessionListResizeObserver = new ResizeObserver(() => updateSessionListMetrics())
@@ -3472,6 +3650,14 @@ watch(
 )
 
 watch(
+  () => [messageDraft.value, appViewportHeight.value, mainPaneViewportWidth.value],
+  async () => {
+    await nextTick()
+    syncComposerTextareaHeight()
+  }
+)
+
+watch(
   () => [currentWorkspaceContext.value.machineId, currentWorkspaceContext.value.cwd],
   ([machineId, cwd], [prevMachineId, prevCwd]) => {
     if (machineId === prevMachineId && cwd === prevCwd) return
@@ -3586,9 +3772,12 @@ watch(
         <!-- Sidebar -->
         <aside
           class="relative bg-[#efefec]"
-          :class="isMobileLayout
-            ? 'min-h-0 h-full w-1/2 min-w-0 shrink-0 basis-1/2 overflow-hidden'
-            : (desktopSidebarCompact ? 'min-h-0 shrink-0 overflow-visible' : 'min-h-0 shrink-0 overflow-hidden')"
+          :class="[
+            isMobileLayout
+              ? 'min-h-0 h-full w-1/2 min-w-0 shrink-0 basis-1/2 overflow-hidden'
+              : (desktopSidebarCompact ? 'min-h-0 shrink-0 overflow-visible' : 'min-h-0 shrink-0 overflow-hidden'),
+            sidebarPaneOrderClass
+          ]"
           :style="sessionSidebarStyle"
           @mouseenter="openDesktopSidebarFlyout"
           @mouseleave="closeDesktopSidebarFlyout"
@@ -3597,100 +3786,142 @@ watch(
         >
           <div
             v-if="desktopSidebarCompact"
-            class="flex h-full w-full flex-col items-center gap-2 border-r border-black/[0.05] bg-[#efefec] px-1.5 py-3"
+            class="flex h-full w-full flex-col bg-[#efefec]"
+            :class="sessionSidebarCompactBorderClass"
           >
-            <button
-              class="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-white text-slate-700 ring-1 ring-black/[0.06] transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-              @click="openNewThreadDialog"
-              title="New thread"
-            >
-              <Plus class="h-4 w-4" />
-            </button>
-
-            <div class="flex-1 overflow-hidden pt-1">
-              <div class="flex h-full flex-col items-center gap-2 overflow-y-auto pb-1">
+            <div class="shrink-0 px-3 pb-2 pt-3">
+              <div class="flex justify-center" :style="compactSidebarHeaderButtonSlotStyle">
                 <button
-                  v-for="session in compactSidebarPreviewSessions"
-                  :key="session.sessionId"
-                  class="relative inline-flex h-9 w-9 items-center justify-center rounded-xl text-[11px] font-semibold uppercase transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                  :class="selectedSessionId === session.sessionId
-                    ? 'bg-white text-slate-800 shadow-sm ring-1 ring-black/[0.08]'
-                    : 'text-slate-500 hover:bg-white/75'"
-                  :title="sessionTooltip(session)"
-                  @click="openSession(session.sessionId)"
+                  class="inline-flex h-8 w-8 items-center justify-center rounded-xl bg-white text-slate-700 ring-1 ring-black/[0.06] transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  @click="openNewThreadDialog"
+                  title="New thread"
                 >
-                  <span>{{ sessionInitial(session) }}</span>
-                  <span
-                    class="absolute bottom-1 right-1 h-1.5 w-1.5 rounded-full ring-2 ring-[#efefec]"
-                    :class="indicatorDotClass(sessionIndicator(session))"
-                  />
+                  <Plus class="h-4 w-4" />
                 </button>
+              </div>
+            </div>
 
+            <div class="shrink-0 px-2 pb-2 pt-3">
+              <div class="flex h-7 items-center justify-center px-2">
+                <div class="h-px w-5 rounded-full bg-black/[0.08]" aria-hidden="true" />
+              </div>
+            </div>
+
+            <div class="flex-1 overflow-hidden px-2 pb-2">
+              <div v-if="!hasSnapshot" class="space-y-2 px-2 py-2">
                 <div
-                  v-if="compactSidebarOverflowCount"
-                  class="pt-0.5 text-[10px] font-medium text-slate-400"
-                  :title="`${compactSidebarOverflowCount} more threads`"
+                  v-for="i in 7"
+                  :key="i"
+                  class="mx-auto h-9 w-9 animate-pulse rounded-xl bg-slate-100"
+                />
+              </div>
+
+              <div v-else-if="!visibleSessions.length" class="px-1 py-4 text-center text-[10px] text-slate-400">
+                No threads
+              </div>
+
+              <div v-else class="h-full overflow-hidden">
+                <div v-if="visibleSessionWindow.offsetTop > 0" :style="{ height: `${visibleSessionWindow.offsetTop}px` }" />
+
+                <template v-for="entry in visibleSessionWindow.items" :key="entry.key">
+                  <div
+                    v-if="entry.kind === 'group'"
+                    :style="compactSidebarGroupSlotStyle"
+                    aria-hidden="true"
+                  />
+
+                  <div
+                    v-else
+                    class="flex w-full items-center justify-center"
+                    :style="compactSidebarSessionSlotStyle"
+                  >
+                    <button
+                      class="relative inline-flex h-9 w-9 items-center justify-center rounded-xl transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                      :class="selectedSessionId === entry.session.sessionId
+                        ? 'bg-white shadow-sm ring-1 ring-black/[0.08]'
+                        : 'hover:bg-white/75'"
+                      :title="sessionTooltip(entry.session)"
+                      @click="openSession(entry.session.sessionId)"
+                    >
+                      <span
+                        class="h-3 w-3 rounded-full"
+                        :class="indicatorDotClass(sessionIndicator(entry.session))"
+                      />
+                    </button>
+                  </div>
+                </template>
+
+                <div v-if="visibleSessionWindow.offsetBottom > 0" :style="{ height: `${visibleSessionWindow.offsetBottom}px` }" />
+                <div
+                  v-if="sessionListLoading || sessionListHasMore"
+                  class="flex items-center justify-center py-2 text-[10px] text-slate-400"
                 >
-                  +{{ compactSidebarOverflowCount }}
+                  <span :title="sessionListLoading ? 'Loading more threads…' : 'Scroll for older threads'">
+                    {{ sessionListLoading ? '…' : '↓' }}
+                  </span>
                 </div>
               </div>
             </div>
 
-            <button
-              class="inline-flex h-9 w-9 items-center justify-center rounded-xl text-slate-500 transition-colors hover:bg-white/75 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-              @click="openSettings('machines')"
-              title="Settings"
-            >
-              <Settings class="h-4 w-4" />
-            </button>
+            <div class="relative z-20 shrink-0 p-2">
+              <div class="flex flex-col items-center space-y-1.5">
+                <div class="flex justify-center" :style="compactSidebarFooterPrimarySlotStyle">
+                  <button
+                    class="inline-flex h-8 w-8 items-center justify-center rounded-xl text-slate-500 transition-colors hover:bg-white/75 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                    @click="openSettings('machines')"
+                    title="Settings"
+                  >
+                    <Settings class="h-4 w-4" />
+                  </button>
+                </div>
 
-            <div class="relative" data-sidebar-mode-root="true">
-              <button
-                type="button"
-                class="inline-flex h-9 w-9 items-center justify-center rounded-xl text-slate-500 transition-colors hover:bg-white/75 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                title="Sidebar control"
-                @click.stop="toggleDesktopSidebarModeMenu"
-              >
-                <Sidebar class="h-4 w-4" />
-              </button>
+                <div class="relative flex justify-center" :style="compactSidebarFooterSecondarySlotStyle" data-sidebar-mode-root="true">
+                  <button
+                    type="button"
+                    class="inline-flex h-8 w-8 items-center justify-center rounded-xl text-slate-500 transition-colors hover:bg-white/75 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                    title="Sidebar control"
+                    @click.stop="toggleDesktopSidebarModeMenu"
+                  >
+                    <Sidebar class="h-4 w-4" />
+                  </button>
 
-              <div
-                v-if="desktopSidebarModeMenuOpen"
-                class="absolute bottom-0 left-full z-40 ml-2 w-44 rounded-2xl border border-black/[0.08] bg-white p-2 shadow-[0_12px_30px_rgba(15,23,42,0.14)]"
-              >
-                <div class="px-2 pb-1.5 text-[11px] font-medium text-slate-500">Sidebar control</div>
-                <button
-                  v-for="option in desktopSidebarModeOptions"
-                  :key="option.value"
-                  type="button"
-                  class="flex w-full items-center gap-2 rounded-xl px-2 py-2 text-left text-[12px] text-slate-700 transition-colors hover:bg-black/[0.04]"
-                  @click.stop="setDesktopSidebarMode(option.value)"
-                >
-                  <span class="inline-flex h-4 w-4 items-center justify-center">
-                    <span
-                      class="h-2 w-2 rounded-full"
-                      :class="desktopSidebarMode === option.value ? 'bg-slate-800' : 'bg-transparent ring-1 ring-slate-300'"
-                    />
-                  </span>
-                  <span class="truncate">{{ option.label }}</span>
-                </button>
+                  <div
+                    v-if="compactSidebarModeMenuVisible"
+                    :class="compactSidebarModeMenuClass"
+                  >
+                    <div class="px-2 pb-1.5 text-[11px] font-medium text-slate-500" :class="sessionSidebarOnRight ? 'text-right' : ''">Sidebar control</div>
+                    <button
+                      v-for="option in desktopSidebarModeOptions"
+                      :key="option.value"
+                      type="button"
+                      class="flex w-full items-center gap-2 rounded-xl px-2 py-2 text-[12px] text-slate-700 transition-colors hover:bg-black/[0.04]"
+                      :class="sessionSidebarOnRight ? 'flex-row-reverse text-right' : 'text-left'"
+                      @click.stop="setDesktopSidebarMode(option.value)"
+                    >
+                      <span class="inline-flex h-4 w-4 items-center justify-center">
+                        <span
+                          class="h-2 w-2 rounded-full"
+                          :class="desktopSidebarMode === option.value ? 'bg-slate-800' : 'bg-transparent ring-1 ring-slate-300'"
+                        />
+                      </span>
+                      <span class="truncate">{{ option.label }}</span>
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
 
           <div
             class="flex h-full flex-col bg-[#efefec]"
-            :class="desktopSidebarCompact
-              ? (desktopSidebarFlyoutVisible
-                ? 'absolute inset-y-0 left-0 z-30 overflow-hidden rounded-r-[18px] border-r border-black/[0.05] opacity-100 shadow-[0_14px_32px_rgba(15,23,42,0.16)] pointer-events-auto translate-x-0 transition-all duration-150 ease-out'
-                : 'absolute inset-y-0 left-0 z-30 overflow-hidden rounded-r-[18px] border-r border-black/[0.05] opacity-0 shadow-[0_14px_32px_rgba(15,23,42,0.16)] pointer-events-none -translate-x-2 transition-all duration-150 ease-out')
-              : 'relative w-full'"
+            :class="sessionSidebarFlyoutClass"
             :style="sessionSidebarPanelStyle"
           >
             <div class="shrink-0 px-3 pb-2 pt-3">
               <div class="space-y-0.5">
                 <button
-                  class="w-full inline-flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-slate-700 transition-colors hover:bg-black/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  class="w-full inline-flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-[13px] text-slate-700 transition-colors hover:bg-black/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  :class="sessionSidebarOnRight ? 'justify-end flex-row-reverse text-right' : 'text-left'"
                   @click="openNewThreadDialog"
                 >
                   <Plus class="h-3.5 w-3.5 text-slate-400" />
@@ -3700,7 +3931,7 @@ watch(
             </div>
 
             <div class="shrink-0 px-2 pb-2 pt-3">
-              <div class="flex items-center justify-between gap-2 px-2">
+              <div class="flex items-center justify-between gap-2 px-2" :class="sessionSidebarOnRight ? 'flex-row-reverse' : ''">
                 <div class="flex h-7 items-center text-[11px] text-slate-400">Threads</div>
                 <button
                   class="inline-flex h-7 items-center justify-center gap-1 rounded-md px-2 text-[11px] text-slate-400 transition-colors hover:bg-black/[0.04] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
@@ -3742,6 +3973,7 @@ watch(
                     >
                       <div
                         class="inline-flex min-w-0 max-w-full items-center rounded-full border border-black/[0.08] px-2 py-0.5 text-[10px] font-medium text-slate-500"
+                        :class="sessionSidebarOnRight ? 'ml-auto' : ''"
                         :title="`${entry.host} / ${entry.project}`"
                       >
                         <span class="truncate">{{ entry.host }} / {{ entry.project }}</span>
@@ -3750,31 +3982,53 @@ watch(
 
                     <button
                       v-else
-                      class="group w-full rounded-lg px-2.5 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-slate-400/30"
-                      :class="selectedSessionId === entry.session.sessionId ? 'bg-[#ecece8]' : 'hover:bg-black/[0.035]'"
+                      class="group w-full rounded-lg px-2.5 py-1.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-slate-400/30"
+                      :class="[
+                        sessionSidebarOnRight ? 'text-right' : 'text-left',
+                        sessionListAccentClass(entry.session, {
+                          selected: selectedSessionId === entry.session.sessionId
+                        })
+                      ]"
                       :title="sessionTooltip(entry.session)"
                       @click="openSession(entry.session.sessionId)"
                     >
-                      <div class="flex items-start gap-2.5">
+                      <div class="flex items-start gap-2.5" :class="sessionSidebarOnRight ? 'flex-row-reverse' : ''">
                         <span
                           class="mt-[0.38rem] h-2 w-2 shrink-0 rounded-full"
-                          :class="indicatorDotClass(sessionIndicator(entry.session))"
+                          :class="sessionListAccentTone(entry.session) === 'default'
+                            ? indicatorDotClass(sessionIndicator(entry.session))
+                            : 'bg-white'"
                         />
 
                         <div class="min-w-0 flex-1">
-                          <div class="flex items-center justify-between gap-2">
-                            <div class="truncate text-[13px] font-medium text-slate-700">{{ sessionListTitle(entry.session) }}</div>
-                            <div class="flex shrink-0 items-center gap-1">
+                          <div class="flex items-center justify-between gap-2" :class="sessionSidebarOnRight ? 'flex-row-reverse' : ''">
+                            <div
+                              class="truncate text-[13px] font-medium"
+                              :class="sessionListTextClass(entry.session)"
+                            >
+                              {{ sessionListTitle(entry.session) }}
+                            </div>
+                            <div class="flex shrink-0 items-center gap-1" :class="sessionSidebarOnRight ? 'flex-row-reverse' : ''">
                               <div
                                 v-if="sessionListGroupingMode === 'project'"
-                                class="text-[11px] text-slate-400"
+                                class="text-[11px]"
+                                :class="sessionListTextClass(entry.session, { muted: true })"
                               >
                                 {{ formatAgeShort(entry.session.updatedMs) }}
                               </div>
                               <div class="relative shrink-0" data-session-menu-root="true">
                                 <button
-                                  class="inline-flex h-6 w-6 items-center justify-center rounded-md text-slate-300 transition-colors hover:bg-black/[0.05] hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
-                                  :class="sessionMenuId === entry.session.sessionId ? 'bg-black/[0.05] text-slate-600 opacity-100' : (isMobileLayout ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100')"
+                                  class="inline-flex h-6 w-6 items-center justify-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                                  :class="[
+                                    sessionListAccentTone(entry.session) === 'default'
+                                      ? 'text-slate-300 hover:bg-black/[0.05] hover:text-slate-600'
+                                      : 'text-white/75 hover:bg-white/15 hover:text-white',
+                                    sessionMenuId === entry.session.sessionId
+                                      ? (sessionListAccentTone(entry.session) === 'default'
+                                        ? 'bg-black/[0.05] text-slate-600 opacity-100'
+                                        : 'bg-white/15 text-white opacity-100')
+                                      : (isMobileLayout ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100')
+                                  ]"
                                   title="Thread actions"
                                   @click.stop="toggleSessionMenu(entry.session.sessionId)"
                                 >
@@ -3783,22 +4037,25 @@ watch(
 
                                 <div
                                   v-if="sessionMenuId === entry.session.sessionId"
-                                  class="absolute right-0 top-7 z-20 w-44 rounded-xl border border-black/[0.06] bg-white p-1 shadow-lg shadow-black/10"
+                                  :class="sessionRowMenuClass"
                                 >
                                   <button
-                                    class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
+                                    class="w-full rounded-lg px-3 py-2 text-sm text-slate-700 transition-colors hover:bg-slate-100"
+                                    :class="sessionSidebarOnRight ? 'text-right' : 'text-left'"
                                     @click.stop="openSessionMenuEdit(entry.session)"
                                   >
                                     Edit
                                   </button>
                                   <button
-                                    class="w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
+                                    class="w-full rounded-lg px-3 py-2 text-sm text-slate-700 transition-colors hover:bg-slate-100"
+                                    :class="sessionSidebarOnRight ? 'text-right' : 'text-left'"
                                     @click.stop="archiveFromSessionMenu(entry.session.sessionId)"
                                   >
                                     Archive
                                   </button>
                                   <button
-                                    class="w-full rounded-lg px-3 py-2 text-left text-sm text-red-600 transition-colors hover:bg-red-50"
+                                    class="w-full rounded-lg px-3 py-2 text-sm text-red-600 transition-colors hover:bg-red-50"
+                                    :class="sessionSidebarOnRight ? 'text-right' : 'text-left'"
                                     @click.stop="openSessionMenuDelete(entry.session.sessionId)"
                                   >
                                     Delete
@@ -3810,10 +4067,12 @@ watch(
 
                           <div
                             v-if="sessionListGroupingMode !== 'project'"
-                            class="mt-1 flex min-w-0 items-center justify-between gap-2 text-[11px] text-slate-400"
+                            class="mt-1 flex min-w-0 items-center justify-between gap-2 text-[11px]"
+                            :class="[sessionListTextClass(entry.session, { muted: true }), sessionSidebarOnRight ? 'flex-row-reverse' : '']"
                           >
                             <span
-                              class="inline-flex min-w-0 max-w-[170px] shrink-0 items-center rounded-full border border-black/[0.08] px-2 py-0.5 text-[10px] font-medium text-slate-500"
+                              class="inline-flex min-w-0 max-w-[170px] shrink-0 items-center rounded-full border px-2 py-0.5 text-[10px] font-medium"
+                              :class="sessionListTextClass(entry.session, { chip: true })"
                               :title="`${sessionHostName(entry.session)} / ${sessionProject(entry.session)}`"
                             >
                               <span class="truncate">{{ sessionHostName(entry.session) }} / {{ sessionProject(entry.session) }}</span>
@@ -3836,7 +4095,8 @@ watch(
             <div class="relative z-20 shrink-0 p-2">
               <div class="space-y-1.5">
                 <button
-                  class="min-w-0 inline-flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  class="min-w-0 inline-flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-[13px] text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  :class="sessionSidebarOnRight ? 'justify-end flex-row-reverse text-right' : 'text-left'"
                   @click="openSettings('machines')"
                 >
                   <Settings class="h-3.5 w-3.5" />
@@ -3847,6 +4107,7 @@ watch(
                   <button
                     type="button"
                     class="inline-flex h-8 w-full items-center gap-1.5 rounded-lg px-2.5 text-[12px] text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                    :class="sessionSidebarOnRight ? 'justify-end flex-row-reverse text-right' : ''"
                     title="Sidebar control"
                     @click.stop="toggleDesktopSidebarModeMenu"
                   >
@@ -3855,15 +4116,16 @@ watch(
                   </button>
 
                   <div
-                    v-if="desktopSidebarModeMenuOpen"
-                    class="absolute bottom-full left-0 z-50 mb-2 w-44 rounded-2xl border border-black/[0.08] bg-white p-2 shadow-[0_12px_30px_rgba(15,23,42,0.14)]"
+                    v-if="panelSidebarModeMenuVisible"
+                    :class="panelSidebarModeMenuClass"
                   >
-                    <div class="px-2 pb-1.5 text-[11px] font-medium text-slate-500">Sidebar control</div>
+                    <div class="px-2 pb-1.5 text-[11px] font-medium text-slate-500" :class="sessionSidebarOnRight ? 'text-right' : ''">Sidebar control</div>
                     <button
                       v-for="option in desktopSidebarModeOptions"
                       :key="option.value"
                       type="button"
-                      class="flex w-full items-center gap-2 rounded-xl px-2 py-2 text-left text-[12px] text-slate-700 transition-colors hover:bg-black/[0.04]"
+                      class="flex w-full items-center gap-2 rounded-xl px-2 py-2 text-[12px] text-slate-700 transition-colors hover:bg-black/[0.04]"
+                      :class="sessionSidebarOnRight ? 'flex-row-reverse text-right' : 'text-left'"
                       @click.stop="setDesktopSidebarMode(option.value)"
                     >
                       <span class="inline-flex h-4 w-4 items-center justify-center">
@@ -3884,6 +4146,7 @@ watch(
         <div
           v-if="!isMobileLayout && !desktopSidebarCompact"
           class="group relative shrink-0 w-3 cursor-col-resize touch-none"
+          :class="sidebarResizeHandleOrderClass"
           title="Drag to resize the thread sidebar"
           @pointerdown.prevent="beginSessionSidebarDrag"
         >
@@ -3897,7 +4160,10 @@ watch(
       <div
         ref="workspaceSplitEl"
         class="flex min-h-0 min-w-0 bg-white"
-        :class="isMobileLayout ? 'min-h-0 h-full w-1/2 min-w-0 shrink-0 basis-1/2 overflow-hidden p-0' : 'flex-1 gap-1.5 p-1.5'"
+        :class="[
+          isMobileLayout ? 'min-h-0 h-full w-1/2 min-w-0 shrink-0 basis-1/2 overflow-hidden p-0' : 'flex-1 gap-1.5 p-1.5',
+          mainSplitOrderClass
+        ]"
       >
       <main
         ref="mainPaneEl"
@@ -5006,11 +5272,17 @@ watch(
 
                 <div class="px-3 py-3">
                 <textarea
+                  ref="composerTextareaEl"
                   v-model="messageDraft"
                   rows="2"
                   class="w-full resize-none bg-transparent px-1.5 text-[14px] leading-6 text-slate-800 outline-none placeholder:text-slate-400"
+                  :style="{
+                    minHeight: `${COMPOSER_TEXTAREA_MIN_HEIGHT}px`,
+                    maxHeight: `${resolveComposerTextareaMaxHeight(appViewportHeight)}px`
+                  }"
                   placeholder="Ask for follow-up changes…"
                   @keydown.enter.exact.prevent="submit"
+                  @input="syncComposerTextareaHeight"
                   @paste="onComposerPaste"
                 />
 
@@ -5402,6 +5674,27 @@ watch(
                     <div class="mt-2 text-xs text-slate-500">Rootgrid prunes its own sessions/events beyond this window.</div>
                   </div>
 
+                  <div class="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                    <div class="min-w-0">
+                      <div class="text-[11px] uppercase tracking-wider text-slate-500">Interface</div>
+                      <div class="mt-1 text-xs text-slate-700">Invert the session layout</div>
+                      <div class="mt-1 text-xs text-slate-500">Moves the thread list to the right and right-aligns sidebar items on this device.</div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      :aria-checked="sessionSidebarOnRight ? 'true' : 'false'"
+                      class="relative inline-flex h-7 w-12 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
+                      :class="sessionSidebarOnRight ? 'bg-slate-900' : 'bg-slate-300'"
+                      @click="toggleSessionSidebarSide"
+                    >
+                      <span
+                        class="absolute left-0 top-1 h-5 w-5 rounded-full bg-white shadow-sm transition-transform"
+                        :class="sessionSidebarOnRight ? 'translate-x-6' : 'translate-x-1'"
+                      />
+                    </button>
+                  </div>
+
                   <div>
                     <div class="text-xs uppercase tracking-wider text-slate-500">SSE notifications</div>
                     <select
@@ -5499,13 +5792,13 @@ watch(
                       <div class="min-w-0">
                         <div class="text-sm font-medium text-slate-900">Host self-update</div>
                         <div class="mt-1 text-xs text-slate-500">
-                          Fetch the configured branch, rebuild Rootgrid, and restart the host from this machine.
+                          Download the latest GitHub-built host bundle for the configured branch and restart this host.
                         </div>
                       </div>
                       <button
                         class="inline-flex shrink-0 items-center gap-2 rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30"
                         :disabled="!hostSelfUpdateEnabled || hostSelfUpdateWorking"
-                        :title="hostSelfUpdateEnabled ? 'Fetch, rebuild, and restart the host.' : 'Set host.selfUpdate.enabled=true in config.json to enable web-triggered host updates.'"
+                        :title="hostSelfUpdateEnabled ? 'Download the configured GitHub release bundle and restart the host.' : 'Set host.selfUpdate.enabled=true in config.json to enable web-triggered host updates.'"
                         @click="startHostSelfUpdate"
                       >
                         <Loader2 v-if="hostSelfUpdateWorking" class="h-4 w-4 animate-spin" />
@@ -5515,24 +5808,24 @@ watch(
 
                     <div class="mt-3 grid grid-cols-1 gap-2 text-xs text-slate-500 sm:grid-cols-2">
                       <div class="rounded-xl border border-slate-200 bg-white px-3 py-2">
-                        Remote:
-                        <span class="ml-1 break-all font-mono text-slate-700">{{ hostSelfUpdateInfo?.repo ?? 'origin' }}</span>
+                        Repository:
+                        <span class="ml-1 break-all font-mono text-slate-700">{{ hostSelfUpdateInfo?.repo ?? '—' }}</span>
                       </div>
                       <div class="rounded-xl border border-slate-200 bg-white px-3 py-2">
                         Branch:
                         <span class="ml-1 font-mono text-slate-700">{{ hostSelfUpdateInfo?.branch ?? 'main' }}</span>
                       </div>
-                      <div class="rounded-xl border border-slate-200 bg-white px-3 py-2 sm:col-span-2">
-                        Workdir:
-                        <span class="ml-1 break-all font-mono text-slate-700">{{ hostSelfUpdateInfo?.workdir ?? '—' }}</span>
+                      <div class="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                        Channel tag:
+                        <span class="ml-1 break-all font-mono text-slate-700">{{ hostSelfUpdateInfo?.channelTag ?? 'branch-main' }}</span>
                       </div>
                       <div class="rounded-xl border border-slate-200 bg-white px-3 py-2">
-                        Install:
-                        <span class="ml-1 break-all font-mono text-slate-700">{{ hostSelfUpdateInfo?.installCommand ?? 'npm ci' }}</span>
+                        Asset:
+                        <span class="ml-1 break-all font-mono text-slate-700">{{ hostSelfUpdateInfo?.assetName ?? 'rootgrid-managed-release.tgz' }}</span>
                       </div>
                       <div class="rounded-xl border border-slate-200 bg-white px-3 py-2">
-                        Build:
-                        <span class="ml-1 break-all font-mono text-slate-700">{{ hostSelfUpdateInfo?.buildCommand ?? 'npm run build' }}</span>
+                        Keep releases:
+                        <span class="ml-1 font-mono text-slate-700">{{ hostSelfUpdateInfo?.keepReleases ?? 3 }}</span>
                       </div>
                     </div>
 
@@ -5785,48 +6078,98 @@ watch(
         </section>
         <section
           v-else
-          class="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-none bg-white shadow-[0_1px_2px_rgba(0,0,0,0.03)]"
+          class="flex h-full min-h-0 min-w-0 overflow-hidden rounded-none bg-white shadow-[0_1px_2px_rgba(0,0,0,0.03)]"
+          :class="mobileWorkspaceLandscapeHeader ? 'flex-row' : 'flex-col'"
         >
-          <div class="flex items-center justify-between gap-3 px-4 py-2.5">
-            <div class="flex items-center gap-2">
+          <div
+            :class="mobileWorkspaceLandscapeHeader
+              ? 'flex w-[48px] shrink-0 flex-col items-center gap-2 border-r border-black/[0.05] px-1.5 py-2'
+              : 'flex items-center justify-between gap-2 px-3 py-2'"
+          >
+            <template v-if="mobileWorkspaceLandscapeHeader">
               <button
-                class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                class="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
                 title="Back to chat"
                 @click="restoreMobileSessionPane"
               >
-                <ArrowLeft class="h-4 w-4" />
+                <ArrowLeft class="h-3.5 w-3.5" />
               </button>
-              <div>
-                <div class="text-[13px] font-semibold text-slate-800">{{ workspacePaneTitle }}</div>
-                <div class="truncate text-[11px] text-slate-500" :title="currentWorkspaceContext.cwd">{{ currentWorkspaceContext.cwd }}</div>
+
+              <div class="flex min-h-0 flex-1 items-center justify-center overflow-hidden">
+                <div
+                  class="max-h-full overflow-hidden text-[10px] font-medium text-slate-700"
+                  :title="currentWorkspaceHeaderLabel"
+                  style="writing-mode: vertical-rl; text-orientation: mixed; transform: rotate(180deg);"
+                >
+                  <span>{{ currentWorkspaceHostLabel }}</span>
+                  <span class="text-slate-500"> / {{ currentWorkspaceContext.cwd }}</span>
+                </div>
               </div>
-            </div>
+
+              <button
+                v-if="mobileWorkspaceHeaderAction"
+                class="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-black/[0.06] bg-white text-slate-600 transition-colors hover:bg-black/[0.03] hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30 disabled:cursor-not-allowed disabled:opacity-45"
+                type="button"
+                :title="mobileWorkspaceHeaderAction.title"
+                :disabled="mobileWorkspaceHeaderAction.disabled"
+                @click="runMobileWorkspaceHeaderAction"
+              >
+                <Loader2
+                  v-if="mobileWorkspaceHeaderAction.kind === 'refresh-files' && workspaceFilesLoading"
+                  class="h-3.5 w-3.5 animate-spin"
+                />
+                <Loader2
+                  v-else-if="mobileWorkspaceHeaderAction.kind === 'refresh-git' && workspaceGitLoading"
+                  class="h-3.5 w-3.5 animate-spin"
+                />
+                <Keyboard
+                  v-else-if="mobileWorkspaceHeaderAction.kind === 'terminal-keys'"
+                  class="h-3.5 w-3.5"
+                />
+                <RotateCw v-else class="h-3.5 w-3.5" />
+              </button>
+            </template>
+
+            <template v-else>
+              <div class="flex min-w-0 items-center gap-2">
+                <button
+                  class="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-black/[0.04] hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30"
+                  title="Back to chat"
+                  @click="restoreMobileSessionPane"
+                >
+                  <ArrowLeft class="h-3.5 w-3.5" />
+                </button>
+                <div class="min-w-0">
+                  <div class="truncate text-[12px] font-semibold text-slate-800">{{ currentWorkspaceHostLabel }}</div>
+                  <div class="truncate text-[10px] text-slate-500" :title="currentWorkspaceContext.cwd">{{ currentWorkspaceContext.cwd }}</div>
+                </div>
+              </div>
+
+              <button
+                v-if="mobileWorkspaceHeaderAction"
+                class="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-black/[0.06] bg-white text-slate-600 transition-colors hover:bg-black/[0.03] hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/30 disabled:cursor-not-allowed disabled:opacity-45"
+                type="button"
+                :title="mobileWorkspaceHeaderAction.title"
+                :disabled="mobileWorkspaceHeaderAction.disabled"
+                @click="runMobileWorkspaceHeaderAction"
+              >
+                <Loader2
+                  v-if="mobileWorkspaceHeaderAction.kind === 'refresh-files' && workspaceFilesLoading"
+                  class="h-3.5 w-3.5 animate-spin"
+                />
+                <Loader2
+                  v-else-if="mobileWorkspaceHeaderAction.kind === 'refresh-git' && workspaceGitLoading"
+                  class="h-3.5 w-3.5 animate-spin"
+                />
+                <Keyboard
+                  v-else-if="mobileWorkspaceHeaderAction.kind === 'terminal-keys'"
+                  class="h-3.5 w-3.5"
+                />
+                <RotateCw v-else class="h-3.5 w-3.5" />
+              </button>
+            </template>
           </div>
-          <div class="border-t border-black/[0.04] px-4 py-2">
-            <div class="flex flex-wrap gap-2">
-              <button
-                class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
-                :class="workspacePaneTab === 'code' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
-                @click="openWorkspaceTool('code')"
-              >Code</button>
-              <button
-                class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
-                :class="workspacePaneTab === 'terminal' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
-                @click="openWorkspaceTool('terminal')"
-              >Terminal</button>
-              <button
-                class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
-                :class="workspacePaneTab === 'files' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
-                @click="openWorkspaceTool('files')"
-              >Files</button>
-              <button
-                class="rounded-full px-2.5 py-1 text-[11px] transition-colors"
-                :class="workspacePaneTab === 'git' ? 'bg-black/[0.06] text-slate-800' : 'text-slate-500 hover:bg-black/[0.04]'"
-                @click="openWorkspaceTool('git')"
-              >Git</button>
-            </div>
-          </div>
-          <div class="min-h-0 flex-1">
+          <div class="min-h-0 flex-1 min-w-0">
             <div v-if="workspacePaneTab === 'code'" class="relative h-full bg-[#f7f7f4]">
               <div
                 v-if="ideFrameLoading"
@@ -5851,15 +6194,19 @@ watch(
                 :session="workspaceTerminalSession"
                 :error="workspaceTerminalError"
                 :opening="workspaceTerminalOpening"
+                :mobile="isMobileLayout"
+                :mobile-key-overlay-open="mobileWorkspaceTerminalKeyOverlayOpen"
                 @ready="onWorkspaceTerminalReady"
                 @input="sendWorkspaceTerminalInput"
                 @resize="queueWorkspaceTerminalResize"
                 @open="reopenWorkspaceTerminal"
+                @update:mobile-key-overlay-open="mobileWorkspaceTerminalKeyOverlayOpen = $event"
               />
             </div>
 
             <div v-else-if="workspacePaneTab === 'files'" class="min-h-0 h-full">
               <WorkspaceFilesPane
+                :mobile="isMobileLayout"
                 :root-path="workspaceFilesPath || currentWorkspaceContext.cwd"
                 :root-entries="workspaceRootEntries"
                 :directory-entries="workspaceDirectoryEntries"
@@ -5879,6 +6226,7 @@ watch(
 
             <WorkspaceGitPane
               v-else
+              :mobile="isMobileLayout"
               :cwd="currentWorkspaceContext.cwd"
               :status="workspaceGitStatus"
               :loading="workspaceGitLoading"
@@ -5946,15 +6294,19 @@ watch(
             :session="workspaceTerminalSession"
             :error="workspaceTerminalError"
             :opening="workspaceTerminalOpening"
+            :mobile="isMobileLayout"
+            :mobile-key-overlay-open="mobileWorkspaceTerminalKeyOverlayOpen"
             @ready="onWorkspaceTerminalReady"
             @input="sendWorkspaceTerminalInput"
             @resize="queueWorkspaceTerminalResize"
             @open="reopenWorkspaceTerminal"
+            @update:mobile-key-overlay-open="mobileWorkspaceTerminalKeyOverlayOpen = $event"
           />
         </div>
 
         <div v-else-if="workspacePaneTab === 'files'" class="min-h-0 flex-1">
           <WorkspaceFilesPane
+            :mobile="isMobileLayout"
             :root-path="workspaceFilesPath || currentWorkspaceContext.cwd"
             :root-entries="workspaceRootEntries"
             :directory-entries="workspaceDirectoryEntries"
@@ -5974,6 +6326,7 @@ watch(
 
         <WorkspaceGitPane
           v-else
+          :mobile="isMobileLayout"
           :cwd="currentWorkspaceContext.cwd"
           :status="workspaceGitStatus"
           :loading="workspaceGitLoading"

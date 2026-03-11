@@ -4,6 +4,9 @@ import {
   replaceApprovalQueue
 } from './approvalQueue.js'
 import {
+  applySessionQueuedPrompts
+} from './sessionQueuedPrompts.js'
+import {
   canCoalesceSessionEvent,
   coalesceSessionEvent
 } from './sessionHistory.js'
@@ -165,8 +168,7 @@ export function createSessionEnvelopeHandler({
     if (env.type === 'session.queuedPrompts.updated') {
       const store = sessionStores.get(sessionId) ?? (selectedSessionId.value === sessionId ? getSessionStore(sessionId) : null)
       if (!store) return
-      store.queuedPrompts = Array.isArray(env.payload?.queuedPrompts) ? env.payload.queuedPrompts : []
-      store.queueSending = false
+      applySessionQueuedPrompts(store, env.payload?.queuedPrompts)
       store.messageViewVersion = Number(store.messageViewVersion ?? 0) + 1
       return
     }

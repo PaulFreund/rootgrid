@@ -5,6 +5,27 @@ import jsonWorker from 'monaco-editor/esm/vs/language/json/json.worker?worker'
 import cssWorker from 'monaco-editor/esm/vs/language/css/css.worker?worker'
 import htmlWorker from 'monaco-editor/esm/vs/language/html/html.worker?worker'
 import tsWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker'
+import 'monaco-editor/esm/vs/language/json/monaco.contribution'
+import 'monaco-editor/esm/vs/language/css/monaco.contribution'
+import 'monaco-editor/esm/vs/language/html/monaco.contribution'
+import 'monaco-editor/esm/vs/language/typescript/monaco.contribution'
+import 'monaco-editor/esm/vs/basic-languages/markdown/markdown.contribution'
+import 'monaco-editor/esm/vs/basic-languages/yaml/yaml.contribution'
+import 'monaco-editor/esm/vs/basic-languages/shell/shell.contribution'
+import 'monaco-editor/esm/vs/basic-languages/python/python.contribution'
+import 'monaco-editor/esm/vs/basic-languages/sql/sql.contribution'
+import 'monaco-editor/esm/vs/basic-languages/xml/xml.contribution'
+import 'monaco-editor/esm/vs/basic-languages/ini/ini.contribution'
+import 'monaco-editor/esm/vs/basic-languages/dockerfile/dockerfile.contribution'
+import 'monaco-editor/esm/vs/basic-languages/powershell/powershell.contribution'
+import 'monaco-editor/esm/vs/basic-languages/go/go.contribution'
+import 'monaco-editor/esm/vs/basic-languages/rust/rust.contribution'
+import 'monaco-editor/esm/vs/basic-languages/cpp/cpp.contribution'
+import 'monaco-editor/esm/vs/basic-languages/java/java.contribution'
+import 'monaco-editor/esm/vs/basic-languages/php/php.contribution'
+import 'monaco-editor/esm/vs/basic-languages/ruby/ruby.contribution'
+import 'monaco-editor/esm/vs/basic-languages/swift/swift.contribution'
+import { inferFileLanguage } from '../lib/fileLanguage.js'
 
 const props = defineProps({
   path: {
@@ -23,23 +44,6 @@ let monacoApi = null
 let editor = null
 let model = null
 let mounted = false
-
-function inferLanguageFromPath(path) {
-  const name = String(path ?? '').trim().toLowerCase()
-  if (!name) return 'plaintext'
-  if (name.endsWith('.js') || name.endsWith('.cjs') || name.endsWith('.mjs')) return 'javascript'
-  if (name.endsWith('.ts') || name.endsWith('.tsx')) return 'typescript'
-  if (name.endsWith('.vue')) return 'html'
-  if (name.endsWith('.json')) return 'json'
-  if (name.endsWith('.md')) return 'markdown'
-  if (name.endsWith('.css')) return 'css'
-  if (name.endsWith('.scss')) return 'scss'
-  if (name.endsWith('.html') || name.endsWith('.htm')) return 'html'
-  if (name.endsWith('.yml') || name.endsWith('.yaml')) return 'yaml'
-  if (name.endsWith('.sh') || name.endsWith('.bash') || name.endsWith('.zsh')) return 'shell'
-  if (name.endsWith('.py')) return 'python'
-  return 'plaintext'
-}
 
 function ensureMonacoEnvironment() {
   const globalObj = globalThis
@@ -81,7 +85,7 @@ async function ensureEditor() {
   if (!mounted || !rootEl.value || editor) return
   model = monaco.editor.createModel(
     String(props.value ?? ''),
-    inferLanguageFromPath(props.path),
+    inferFileLanguage(props.path),
     monaco.Uri.parse(`file://${encodeURI(String(props.path ?? 'untitled.txt'))}`)
   )
   editor = monaco.editor.create(rootEl.value, {

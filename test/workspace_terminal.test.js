@@ -2,10 +2,12 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  applyWorkspaceTerminalInputModifiers,
   appendWorkspaceTerminalOutput,
   buildWorkspaceTerminalExitNotice,
   createWorkspaceTerminalSession,
   normalizeTerminalGeometry,
+  resolveMobileTerminalActionInput,
   workspaceTerminalSessionMatchesContext
 } from '../web/src/lib/workspaceTerminal.js'
 
@@ -63,4 +65,15 @@ test('workspaceTerminalSessionMatchesContext requires matching machine and cwd',
   assert.equal(workspaceTerminalSessionMatchesContext(session, { machineId: 'machine-1', cwd: '/tmp/workspace' }), true)
   assert.equal(workspaceTerminalSessionMatchesContext(session, { machineId: 'machine-2', cwd: '/tmp/workspace' }), false)
   assert.equal(workspaceTerminalSessionMatchesContext(session, { machineId: 'machine-1', cwd: '/tmp/other' }), false)
+})
+
+test('workspace terminal helpers build mobile modifier and special-key input sequences', () => {
+  assert.equal(applyWorkspaceTerminalInputModifiers('c', { ctrl: true }), '\x03')
+  assert.equal(applyWorkspaceTerminalInputModifiers('z', { ctrl: true, alt: true }), '\x1b\x1a')
+  assert.equal(applyWorkspaceTerminalInputModifiers('[', { ctrl: true }), '\x1b')
+  assert.equal(resolveMobileTerminalActionInput('esc'), '\x1b')
+  assert.equal(resolveMobileTerminalActionInput('tab'), '\t')
+  assert.equal(resolveMobileTerminalActionInput('up'), '\x1b[A')
+  assert.equal(resolveMobileTerminalActionInput('pgdn'), '\x1b[6~')
+  assert.equal(resolveMobileTerminalActionInput('ctrl+c'), '\x03')
 })

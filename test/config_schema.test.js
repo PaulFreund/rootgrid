@@ -11,4 +11,6 @@ test('runner web upgrade config is enabled by default with managed release reten
   assert.equal(parsed.runner.upgrade.keepReleases, 3)
   assert.equal(parsed.host.selfUpdate.enabled, false)
   assert.equal(parsed.host.selfUpdate.branch, 'main')
+  assert.equal(parsed.host.selfUpdate.assetName, 'rootgrid-managed-release.tgz')
+  assert.equal(parsed.host.selfUpdate.keepReleases, 3)
 })

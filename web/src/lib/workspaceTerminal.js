@@ -27,6 +27,66 @@ export function buildWorkspaceTerminalExitNotice({ exitCode = null, signal = nul
   return `\r\n[process exited${safeExitCode !== null ? ` with code ${safeExitCode}` : ''}${safeSignal !== null ? ` signal ${safeSignal}` : ''}]\r\n`
 }
 
+export function applyWorkspaceTerminalInputModifiers(text, { ctrl = false, alt = false } = {}) {
+  const raw = String(text ?? '')
+  if (!raw) return ''
+
+  let next = raw
+  if (ctrl) {
+    const first = raw.slice(0, 1)
+    const lower = first.toLowerCase()
+    let ctrlChar = first
+    if (lower >= 'a' && lower <= 'z') {
+      ctrlChar = String.fromCharCode(lower.charCodeAt(0) - 96)
+    } else if (first === ' ') {
+      ctrlChar = '\x00'
+    } else if (first === '@') {
+      ctrlChar = '\x00'
+    } else if (first === '[') {
+      ctrlChar = '\x1b'
+    } else if (first === '\\') {
+      ctrlChar = '\x1c'
+    } else if (first === ']') {
+      ctrlChar = '\x1d'
+    } else if (first === '^') {
+      ctrlChar = '\x1e'
+    } else if (first === '_') {
+      ctrlChar = '\x1f'
+    } else if (first === '?') {
+      ctrlChar = '\x7f'
+    }
+    next = `${ctrlChar}${raw.slice(1)}`
+  }
+
+  if (alt) next = `\x1b${next}`
+  return next
+}
+
+const MOBILE_TERMINAL_ACTION_INPUTS = Object.freeze({
+  esc: '\x1b',
+  tab: '\t',
+  up: '\x1b[A',
+  down: '\x1b[B',
+  right: '\x1b[C',
+  left: '\x1b[D',
+  home: '\x1b[H',
+  end: '\x1b[F',
+  pgup: '\x1b[5~',
+  pgdn: '\x1b[6~'
+})
+
+export function resolveMobileTerminalActionInput(actionId) {
+  const action = String(actionId ?? '').trim().toLowerCase()
+  if (!action) return ''
+  if (Object.prototype.hasOwnProperty.call(MOBILE_TERMINAL_ACTION_INPUTS, action)) {
+    return MOBILE_TERMINAL_ACTION_INPUTS[action]
+  }
+  if (action.startsWith('ctrl+')) {
+    return applyWorkspaceTerminalInputModifiers(action.slice(5), { ctrl: true })
+  }
+  return ''
+}
+
 export function createWorkspaceTerminalSession({
   terminalId = '',
   machineId = '',

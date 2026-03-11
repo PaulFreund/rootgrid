@@ -40,7 +40,7 @@ That managed runtime is used for:
 - runner-only installs
 - remote web-triggered runner upgrades
 
-Host-mode installs instead run directly from the current package checkout/install so local host updates can use the normal package path (`git pull`/npm upgrade + restart).
+Host installs that use the GitHub install/upgrade flow, or enable `host.selfUpdate`, also run from that managed runtime so they can switch `~/.rootgrid/current` to a newly downloaded bundle on upgrade.
 
 If `systemd --user` is available, ask:
 - “Do you want Rootgrid to autostart on login?”
@@ -126,6 +126,21 @@ The script then:
 
 If the generated install URL points at `localhost`/`127.0.0.1`, set `host.publicUrl` so the target machine gets a reachable host address.
 
+## Installing or upgrading a host from GitHub
+
+If this repo lives on GitHub and you want the host itself to use GitHub-built bundles, use the bootstrap script in the repo:
+
+```bash
+curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/OWNER/REPO/contents/scripts/install-host-from-github.sh?ref=main" | ROOTGRID_GITHUB_TOKEN="$GITHUB_TOKEN" ROOTGRID_GITHUB_REPO="OWNER/REPO" ROOTGRID_GITHUB_BRANCH="main" bash
+```
+
+That script:
+1. downloads the latest release-channel bundle for the configured branch from GitHub Releases
+2. installs it under `~/.rootgrid/current`
+3. runs `rootgrid setup` on first install if `~/.rootgrid/config.json` does not exist
+4. enables `host.selfUpdate` in config for that GitHub repo/branch
+5. refreshes the user service so later web-triggered self-updates can switch to the next managed release
+
 ---
 
 ## Proposed config shape (v0)
@@ -157,11 +172,11 @@ This is a **proposed** starting point; adjust as implementation realities land. 
     "trustProxy": false,
     "selfUpdate": {
       "enabled": false,
-      "repoUrl": null,
+      "repo": null,
       "branch": "main",
-      "workdir": null,
-      "installCommand": "npm ci",
-      "buildCommand": "npm run build",
+      "accessToken": null,
+      "assetName": "rootgrid-managed-release.tgz",
+      "keepReleases": 3,
       "restartCommand": null
     },
     "auth": {
@@ -197,7 +212,7 @@ Notes:
 - In host mode:
   - `host.auth.clientToken` protects **browser/web UI** access.
   - `host.auth.runnerToken` protects **runner registration**.
-  - `host.selfUpdate` optionally enables the **Settings → System → Host self-update** button for git-based host installs. `repoUrl` may already include credentials when needed; the UI only shows a sanitized remote.
+  - `host.selfUpdate` optionally enables the **Settings → System → Host self-update** button for GitHub-built branch bundles. The recommended install path is the GitHub bootstrap command above so the host already runs from `~/.rootgrid/current`.
 - In upstream mode, `upstream.url` and `upstream.runnerToken` are required.
 - v0 recommendation: `host.enabled=true` and `upstream.enabled=true` should be treated as **mutually exclusive** (either you host the UI here, or you connect to an upstream host).
 

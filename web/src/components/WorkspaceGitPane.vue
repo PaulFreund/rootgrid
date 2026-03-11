@@ -5,6 +5,10 @@ import { Check, GitBranch, Loader2, Minus, Plus } from 'lucide-vue-next'
 import { classifyWorkspaceGitEntries } from '../lib/workspaceGit.js'
 
 const props = defineProps({
+  mobile: {
+    type: Boolean,
+    default: false
+  },
   cwd: {
     type: String,
     default: ''
@@ -89,7 +93,10 @@ function openFile(path) {
 
 <template>
   <div class="flex h-full min-h-0 flex-col">
-    <div class="border-b border-black/[0.04] px-4 py-3">
+    <div
+      v-if="!mobile"
+      class="border-b border-black/[0.04] px-4 py-3"
+    >
       <div class="flex items-center justify-between gap-2">
         <div class="text-xs text-slate-500" :title="status?.rootPath || cwd">
           {{ status?.rootPath || cwd }}
@@ -104,6 +111,7 @@ function openFile(path) {
       </div>
       <div v-if="error" class="mt-2 text-xs text-red-600">{{ error }}</div>
     </div>
+    <div v-else-if="error" class="px-4 py-3 text-xs text-red-600">{{ error }}</div>
 
     <div class="min-h-0 flex-1 overflow-auto px-4 py-3">
       <div v-if="loading" class="text-sm text-slate-500">Loading git status…</div>

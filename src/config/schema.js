@@ -22,19 +22,32 @@ const RunnerSchema = z.object({
 
 const HostSelfUpdateSchema = z.object({
   enabled: z.boolean().default(false),
-  repoUrl: z.string().min(1).nullable().default(null),
+  repo: z.string().min(1).nullable().optional(),
+  repoUrl: z.string().min(1).nullable().optional(),
   branch: z.string().min(1).default('main'),
-  workdir: z.string().min(1).nullable().default(null),
-  installCommand: z.string().min(1).default('npm ci'),
-  buildCommand: z.string().min(1).default('npm run build'),
-  restartCommand: z.string().min(1).nullable().default(null)
-}).default({
+  accessToken: z.string().min(1).nullable().optional(),
+  token: z.string().min(1).nullable().optional(),
+  assetName: z.string().min(1).default('rootgrid-managed-release.tgz'),
+  keepReleases: z.number().int().min(1).max(50).default(3),
+  restartCommand: z.string().min(1).nullable().default(null),
+  workdir: z.string().min(1).nullable().optional(),
+  installCommand: z.string().min(1).optional(),
+  buildCommand: z.string().min(1).optional()
+}).transform((value) => ({
+  enabled: value.enabled === true,
+  repo: value.repo ?? value.repoUrl ?? null,
+  branch: value.branch,
+  accessToken: value.accessToken ?? value.token ?? null,
+  assetName: value.assetName,
+  keepReleases: value.keepReleases,
+  restartCommand: value.restartCommand ?? null
+})).default({
   enabled: false,
-  repoUrl: null,
+  repo: null,
   branch: 'main',
-  workdir: null,
-  installCommand: 'npm ci',
-  buildCommand: 'npm run build',
+  accessToken: null,
+  assetName: 'rootgrid-managed-release.tgz',
+  keepReleases: 3,
   restartCommand: null
 })
 

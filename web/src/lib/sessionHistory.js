@@ -1,4 +1,5 @@
 import { nextTick, reactive } from 'vue'
+import { applySessionQueuedPrompts } from './sessionQueuedPrompts.js'
 
 export function appendCapped(prev, delta, cap = 200_000) {
   const p = String(prev ?? '')
@@ -525,7 +526,7 @@ export async function loadSessionHistory({
     resetSessionStoreState(store)
 
     if (Array.isArray(data?.events)) {
-      store.queuedPrompts = Array.isArray(data?.queuedPrompts) ? data.queuedPrompts : []
+      applySessionQueuedPrompts(store, data?.queuedPrompts)
       applySessionEventsPage({
         events: data.events,
         reasoningTurnIds: data?.reasoningTurnIds,
@@ -540,7 +541,7 @@ export async function loadSessionHistory({
       if (!pageRes.ok) return
       const page = await pageRes.json().catch(() => null)
       if (nonce !== loadSessionNonce.value) return
-      store.queuedPrompts = Array.isArray(data?.queuedPrompts) ? data.queuedPrompts : []
+      applySessionQueuedPrompts(store, data?.queuedPrompts)
       applySessionEventsPage({
         events: page?.events,
         reasoningTurnIds: page?.reasoningTurnIds,

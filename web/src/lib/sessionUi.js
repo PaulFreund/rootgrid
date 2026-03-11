@@ -96,3 +96,29 @@ export function sessionIndicator(session) {
   if (unread) return 'blue'
   return 'green'
 }
+
+export function sessionListAccentTone(session) {
+  const pending = Number(session?.pendingApprovals ?? 0)
+  const status = String(session?.status ?? '').toLowerCase()
+  if (pending > 0 || status === 'failed') return 'red'
+  const unread = Number(session?.lastSeq ?? 0) > Number(session?.lastReadSeq ?? 0)
+  if (unread) return 'blue'
+  return 'default'
+}
+
+export function sessionListAccentClass(session, { selected = false } = {}) {
+  const tone = sessionListAccentTone(session)
+  if (tone === 'red') return selected ? 'bg-red-500 text-white' : 'bg-red-500 text-white hover:bg-red-500'
+  if (tone === 'blue') return selected ? 'bg-sky-500 text-white' : 'bg-sky-500 text-white hover:bg-sky-500'
+  return selected ? 'bg-[#ecece8]' : 'hover:bg-black/[0.035]'
+}
+
+export function sessionListTextClass(session, { muted = false, chip = false } = {}) {
+  const tone = sessionListAccentTone(session)
+  if (tone === 'default') {
+    if (chip) return 'border-black/[0.08] text-slate-500'
+    return muted ? 'text-slate-400' : 'text-slate-700'
+  }
+  if (chip) return 'border-white/25 text-white/90'
+  return muted ? 'text-white/80' : 'text-white'
+}

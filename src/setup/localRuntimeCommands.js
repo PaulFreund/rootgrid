@@ -34,7 +34,7 @@ export function chooseUserServiceMethod({
 }
 
 export function usesManagedRuntimeForConfig(config) {
-  return !Boolean(config?.host?.enabled)
+  return !Boolean(config?.host?.enabled) || config?.host?.selfUpdate?.enabled === true
 }
 
 export async function resolveInstallUserServiceMethod(preferredMethod = null) {

@@ -3,12 +3,16 @@ import assert from 'node:assert/strict'
 
 import {
   DEFAULT_DESKTOP_SIDEBAR_MODE,
+  DEFAULT_SESSION_SIDEBAR_SIDE,
   clampSessionSidebarWidth,
   DEFAULT_SESSION_SIDEBAR_WIDTH,
   normalizeDesktopSidebarMode,
+  normalizeSessionSidebarSide,
   persistDesktopSidebarMode,
+  persistSessionSidebarSide,
   persistSessionSidebarWidth,
   readStoredDesktopSidebarMode,
+  readStoredSessionSidebarSide,
   readStoredSessionSidebarWidth
 } from '../web/src/lib/sidebarResize.js'
 
@@ -59,4 +63,25 @@ test('desktop sidebar mode is normalized and persisted safely', () => {
   assert.equal(values.get('rootgrid.desktopSidebarMode'), 'hover')
   values.set('rootgrid.desktopSidebarMode', 'collapsed')
   assert.equal(readStoredDesktopSidebarMode(storage), 'collapsed')
+})
+
+test('session sidebar side is normalized and persisted safely', () => {
+  const values = new Map()
+  const storage = {
+    getItem(key) {
+      return values.get(key) ?? null
+    },
+    setItem(key, value) {
+      values.set(key, value)
+    }
+  }
+
+  assert.equal(normalizeSessionSidebarSide('right'), 'right')
+  assert.equal(normalizeSessionSidebarSide('LEFT'), 'left')
+  assert.equal(normalizeSessionSidebarSide('bad'), DEFAULT_SESSION_SIDEBAR_SIDE)
+  assert.equal(readStoredSessionSidebarSide(storage), DEFAULT_SESSION_SIDEBAR_SIDE)
+  assert.equal(persistSessionSidebarSide('right', storage), 'right')
+  assert.equal(values.get('rootgrid.sessionSidebarSide'), 'right')
+  values.set('rootgrid.sessionSidebarSide', 'left')
+  assert.equal(readStoredSessionSidebarSide(storage), 'left')
 })

@@ -231,6 +231,53 @@ export async function extractManagedReleaseBundle({ archivePath, targetDir }) {
   return await readReleaseManifest(targetDir)
 }
 
+export async function installManagedReleaseFromBundle({
+  archivePath,
+  keep = 3,
+  rootgridDir = getRootgridDir()
+} = {}) {
+  if (!archivePath) throw new Error('archivePath is required')
+
+  const releasesDir = getReleasesDir()
+  const tempDir = join(releasesDir, `.pending-${crypto.randomUUID()}`)
+  await mkdir(releasesDir, { recursive: true, mode: 0o700 })
+
+  let releaseDir = tempDir
+  let switchedCurrent = false
+  try {
+    const manifest = await extractManagedReleaseBundle({
+      archivePath,
+      targetDir: tempDir
+    })
+    const releaseId = trimText(manifest?.releaseId)
+    if (!releaseId) throw new Error('release manifest missing releaseId')
+
+    releaseDir = join(releasesDir, releaseId)
+    if (resolve(releaseDir) !== resolve(tempDir)) {
+      await rm(releaseDir, { recursive: true, force: true }).catch(() => {})
+      await rename(tempDir, releaseDir)
+    }
+
+    await switchCurrentRelease(releaseDir, { rootgridDir })
+    switchedCurrent = true
+    await pruneOldManagedReleases({
+      keep,
+      rootgridDir,
+      excludeReleaseIds: [releaseId]
+    })
+    return {
+      releaseDir,
+      manifest
+    }
+  } catch (err) {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => {})
+    if (!switchedCurrent && releaseDir !== tempDir) {
+      await rm(releaseDir, { recursive: true, force: true }).catch(() => {})
+    }
+    throw err
+  }
+}
+
 export async function pruneOldManagedReleases({
   keep = 3,
   rootgridDir = getRootgridDir(),

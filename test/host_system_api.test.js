@@ -299,11 +299,11 @@ test('host system settings payload includes sanitized host self-update details',
         trustProxy: false,
         selfUpdate: {
           enabled: true,
-          repoUrl: 'https://token@example.com/org/rootgrid.git',
+          repo: 'https://github.com/org/rootgrid.git',
           branch: 'stable',
-          workdir: '/srv/rootgrid',
-          installCommand: 'npm ci',
-          buildCommand: 'npm run build',
+          accessToken: 'github-token',
+          assetName: 'rootgrid-managed-release.tgz',
+          keepReleases: 4,
           restartCommand: null
         }
       },
@@ -317,11 +317,12 @@ test('host system settings payload includes sanitized host self-update details',
       getPublicState() {
         return {
           enabled: true,
-          repo: 'https://example.com/org/rootgrid.git',
+          mode: 'github-release',
+          repo: 'org/rootgrid',
           branch: 'stable',
-          workdir: '/srv/rootgrid',
-          installCommand: 'npm ci',
-          buildCommand: 'npm run build',
+          channelTag: 'branch-stable',
+          assetName: 'rootgrid-managed-release.tgz',
+          keepReleases: 4,
           restartMode: 'exit',
           working: false,
           awaitingRestart: false,
@@ -340,8 +341,9 @@ test('host system settings payload includes sanitized host self-update details',
   const handled = await api.handle({ method: 'GET', headers: {} }, new FakeResponse(), new URL('http://127.0.0.1/api/settings'), [])
   assert.equal(handled, true)
   assert.equal(payload?.host?.selfUpdate?.enabled, true)
-  assert.equal(payload?.host?.selfUpdate?.repo, 'https://example.com/org/rootgrid.git')
+  assert.equal(payload?.host?.selfUpdate?.repo, 'org/rootgrid')
   assert.equal(payload?.host?.selfUpdate?.branch, 'stable')
+  assert.equal(payload?.host?.selfUpdate?.assetName, 'rootgrid-managed-release.tgz')
 })
 
 test('host system starts host self-update and schedules restart after responding', async () => {

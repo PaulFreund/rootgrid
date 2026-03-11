@@ -26,4 +26,5 @@ test('config.example.json includes all config fields and validates against the s
   assert.ok(Object.hasOwn(parsed.host, 'selfUpdate'))
   assert.ok(Object.hasOwn(parsed.host, 'auth'))
   assert.ok(Object.hasOwn(parsed.host.selfUpdate, 'branch'))
+  assert.ok(Object.hasOwn(parsed.host.selfUpdate, 'assetName'))
 })

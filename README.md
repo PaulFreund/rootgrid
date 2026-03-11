@@ -33,6 +33,14 @@ node src/cli.js setup
 node src/cli.js
 ```
 
+Managed host install/upgrade from a private GitHub repo can also be done in one line. Set `GITHUB_TOKEN` first, then run:
+
+```bash
+curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/OWNER/REPO/contents/scripts/install-host-from-github.sh?ref=main" | ROOTGRID_GITHUB_TOKEN="$GITHUB_TOKEN" ROOTGRID_GITHUB_REPO="OWNER/REPO" ROOTGRID_GITHUB_BRANCH="main" bash
+```
+
+That command downloads the latest GitHub-built host bundle for the chosen branch, installs it into `~/.rootgrid/current`, runs `rootgrid setup` on first install, and refreshes the user service on later upgrades.
+
 For local development:
 
 ```bash
@@ -66,25 +74,28 @@ Setup also installs a managed runtime under:
 - `~/.rootgrid/releases/<release-id>/`
 - `~/.rootgrid/current -> ~/.rootgrid/releases/<release-id>/`
 
-That managed runtime is used for **runner-only installs** and remote runner upgrades. Host-mode installs run directly from the current package checkout/install so a normal `git pull` + restart picks up the new UI/code.
+That managed runtime is used for:
+- runner-only installs
+- remote runner upgrades
+- host installs that use the GitHub install/upgrade flow or `host.selfUpdate`
 
-If your host runs from a git checkout or a container-managed worktree, you can also configure a web-triggered host self-update in `~/.rootgrid/config.json`:
+To enable web-triggered host self-update from GitHub-built branch bundles, configure `~/.rootgrid/config.json` like this:
 
 ```json
 "host": {
   "selfUpdate": {
     "enabled": true,
-    "repoUrl": "https://example.com/org/rootgrid.git",
+    "repo": "OWNER/REPO",
     "branch": "main",
-    "workdir": "/srv/rootgrid",
-    "installCommand": "npm ci",
-    "buildCommand": "npm run build",
+    "accessToken": "github_pat_...",
+    "assetName": "rootgrid-managed-release.tgz",
+    "keepReleases": 3,
     "restartCommand": null
   }
 }
 ```
 
-Then use **Settings → System → Host self-update**. `repoUrl` may already include credentials/PAT if needed; the UI only shows a sanitized remote.
+Then use **Settings → System → Host self-update**. Rootgrid downloads the latest release-channel bundle for the configured branch, installs it under `~/.rootgrid/current`, and exits so your service/container can restart it. For private repos, use a GitHub token with read access to that repository’s releases.
 
 To add a new remote runner without `git` or `npm`, open **Settings → Machines** on the host and use the generated one-liner:
 
@@ -126,6 +137,7 @@ See: `docs/reverse-proxy.md`.
 - **Codex not found**: install the Codex CLI (`codex`) and re-run `rootgrid`
 - **Need raw Codex traffic for debugging**: set `debug.codexRawCapture.enabled=true` in `~/.rootgrid/config.json`; captures land in `~/.rootgrid/debug/codex/` by default
 - **Want web-triggered runner upgrades on version mismatch**: it is enabled by default for managed installs; the host now ships a prebuilt release bundle to the runner and the runner restarts via its user service
+- **Want GitHub-built host self-updates**: enable `host.selfUpdate`, point it at `OWNER/REPO`, and make sure this host itself is installed from the managed GitHub bundle flow (or reinstall it once with the one-line command above)
 - **SSE stuck behind proxy**: disable proxy buffering for `/api/events`
 - **VS Code button fails**: install `code-server` on the runner; ensure the runner tunnel (`/v1/tunnel`) is connected
 

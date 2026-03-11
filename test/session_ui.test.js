@@ -7,6 +7,9 @@ import {
   sessionHostName,
   sessionIndicator,
   sessionInitial,
+  sessionListAccentClass,
+  sessionListAccentTone,
+  sessionListTextClass,
   sessionListTitle,
   sessionProject,
   sessionTooltip,
@@ -50,6 +53,54 @@ test('session UI helpers derive labels and indicator state', () => {
   assert.equal(sessionHostName(session, machineNames), 'Desk')
   assert.equal(sessionTooltip(session, machineNames), 'project — project · Desk · running')
   assert.equal(sessionIndicator(session), 'blue')
+  assert.equal(sessionListAccentTone(session), 'blue')
+  assert.equal(sessionListAccentClass(session), 'bg-sky-500 text-white hover:bg-sky-500')
+  assert.equal(sessionListTextClass(session), 'text-white')
+  assert.equal(sessionListTextClass(session, { muted: true }), 'text-white/80')
+})
+
+test('sessionListAccentClass prioritizes failed and approval states over unread', () => {
+  assert.equal(sessionListAccentTone({
+    status: 'failed',
+    pendingApprovals: 0,
+    lastSeq: 10,
+    lastReadSeq: 1
+  }), 'red')
+
+  assert.equal(sessionListAccentClass({
+    status: 'failed',
+    pendingApprovals: 0,
+    lastSeq: 10,
+    lastReadSeq: 1
+  }), 'bg-red-500 text-white hover:bg-red-500')
+
+  assert.equal(sessionListAccentClass({
+    status: 'running',
+    pendingApprovals: 2,
+    lastSeq: 10,
+    lastReadSeq: 1
+  }), 'bg-red-500 text-white hover:bg-red-500')
+
+  assert.equal(sessionListAccentClass({
+    status: 'running',
+    pendingApprovals: 0,
+    lastSeq: 10,
+    lastReadSeq: 1
+  }, { selected: true }), 'bg-sky-500 text-white')
+
+  assert.equal(sessionListAccentClass({
+    status: 'running',
+    pendingApprovals: 0,
+    lastSeq: 1,
+    lastReadSeq: 1
+  }), 'hover:bg-black/[0.035]')
+
+  assert.equal(sessionListTextClass({
+    status: 'running',
+    pendingApprovals: 0,
+    lastSeq: 1,
+    lastReadSeq: 1
+  }, { chip: true }), 'border-black/[0.08] text-slate-500')
 })
 
 test('upsertById updates matching items in place by key', () => {

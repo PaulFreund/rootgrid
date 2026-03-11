@@ -1,0 +1,122 @@
+name: Release Channel Bundle
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release-channel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web bundle
+        run: npm run build
+
+      - name: Prepare managed release bundle
+        id: bundle
+        run: node scripts/build-release-channel.mjs
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootgrid-managed-release
+          path: |
+            .release-channel/rootgrid-managed-release.tgz
+            .release-channel/rootgrid-managed-release.tgz.sha256
+          if-no-files-found: error
+
+      - name: Publish branch release channel
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ steps.bundle.outputs.release_tag }}
+          RELEASE_NAME: ${{ steps.bundle.outputs.release_name }}
+          ASSET_PATH: ${{ steps.bundle.outputs.asset_path }}
+          ASSET_SHA_PATH: ${{ steps.bundle.outputs.asset_sha_path }}
+        with:
+          script: |
+            const fs = require('node:fs')
+            const path = require('node:path')
+
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const branch = context.ref.replace(/^refs\/heads\//, '')
+            const tag = process.env.RELEASE_TAG
+            const releaseName = process.env.RELEASE_NAME
+            const assetPaths = [
+              process.env.ASSET_PATH,
+              process.env.ASSET_SHA_PATH
+            ].filter(Boolean)
+
+            let release
+            try {
+              release = (await github.rest.repos.getReleaseByTag({
+                owner,
+                repo,
+                tag
+              })).data
+            } catch (err) {
+              if (err.status !== 404) throw err
+              release = (await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                name: releaseName,
+                target_commitish: branch,
+                prerelease: true,
+                generate_release_notes: false,
+                make_latest: 'false'
+              })).data
+            }
+
+            release = (await github.rest.repos.updateRelease({
+              owner,
+              repo,
+              release_id: release.id,
+              tag_name: tag,
+              name: releaseName,
+              target_commitish: branch,
+              prerelease: true,
+              make_latest: 'false'
+            })).data
+
+            const uploadUrl = release.upload_url.replace(/\{.*$/, '')
+            const existing = new Map((release.assets || []).map((asset) => [asset.name, asset]))
+            for (const assetPath of assetPaths) {
+              const assetName = path.basename(assetPath)
+              if (existing.has(assetName)) {
+                await github.rest.repos.deleteReleaseAsset({
+                  owner,
+                  repo,
+                  asset_id: existing.get(assetName).id
+                })
+              }
+            }
+
+            for (const assetPath of assetPaths) {
+              const assetName = path.basename(assetPath)
+              const data = fs.readFileSync(assetPath)
+              await github.request({
+                method: 'POST',
+                url: uploadUrl,
+                headers: {
+                  'content-type': 'application/octet-stream',
+                  'content-length': data.length
+                },
+                name: assetName,
+                data
+              })
+            }

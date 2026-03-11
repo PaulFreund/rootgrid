@@ -61,11 +61,25 @@ test('buildUserServiceInstallOptions targets the managed current release', () =>
   assert.equal(hostOptions.description, 'Rootgrid (Codex web UI + runner)')
   assert.deepEqual(hostOptions.execStart, ['/usr/bin/node', '/src/rootgrid/src/cli.js'])
   assert.equal(hostOptions.workingDirectory, '/src/rootgrid')
+
+  hostConfig.host.selfUpdate.enabled = true
+  const managedHostOptions = buildUserServiceInstallOptions(hostConfig, {
+    execPath: '/usr/bin/node',
+    env: { PATH: '/usr/bin' },
+    packageRoot: '/src/rootgrid',
+    currentReleasePath: '/home/test/.rootgrid/current'
+  })
+
+  assert.deepEqual(managedHostOptions.execStart, ['/usr/bin/node', '/home/test/.rootgrid/current/src/cli.js'])
+  assert.equal(managedHostOptions.workingDirectory, '/home/test/.rootgrid/current')
 })
 
-test('usesManagedRuntimeForConfig is runner-only', () => {
+test('usesManagedRuntimeForConfig enables managed runtime for runner-only and self-updating hosts', () => {
   const hostConfig = buildDefaultConfig()
   assert.equal(usesManagedRuntimeForConfig(hostConfig), false)
+
+  hostConfig.host.selfUpdate.enabled = true
+  assert.equal(usesManagedRuntimeForConfig(hostConfig), true)
 
   const runnerOnlyConfig = buildDefaultConfig()
   runnerOnlyConfig.host.enabled = false

@@ -1,8 +1,9 @@
 <script setup>
-import { computed } from 'vue'
-import { Loader2, RotateCw } from 'lucide-vue-next'
+import { computed, watch } from 'vue'
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Loader2, RotateCw, X } from 'lucide-vue-next'
 
 import XtermTerminal from './XtermTerminal.vue'
+import { resolveMobileTerminalActionInput } from '../lib/workspaceTerminal.js'
 
 const props = defineProps({
   session: {
@@ -16,10 +17,18 @@ const props = defineProps({
   opening: {
     type: Boolean,
     default: false
+  },
+  mobile: {
+    type: Boolean,
+    default: false
+  },
+  mobileKeyOverlayOpen: {
+    type: Boolean,
+    default: false
   }
 })
 
-const emit = defineEmits(['ready', 'input', 'resize', 'open'])
+const emit = defineEmits(['ready', 'input', 'resize', 'open', 'update:mobileKeyOverlayOpen'])
 
 const statusLabel = computed(() => {
   if (props.error) return String(props.error)
@@ -46,6 +55,54 @@ const shellLabel = computed(() => {
   if (!shell) return ''
   return shell.split('/').filter(Boolean).pop() || shell
 })
+
+const mobileTerminalKeyRows = Object.freeze([
+  [
+    { id: 'esc', label: 'Esc' },
+    { id: 'tab', label: 'Tab' },
+    { id: 'home', label: 'Home' },
+    { id: 'end', label: 'End' }
+  ],
+  [
+    { id: 'up', label: 'Up', icon: ArrowUp },
+    { id: 'left', label: 'Left', icon: ArrowLeft },
+    { id: 'down', label: 'Down', icon: ArrowDown },
+    { id: 'right', label: 'Right', icon: ArrowRight }
+  ],
+  [
+    { id: 'pgup', label: 'PgUp' },
+    { id: 'pgdn', label: 'PgDn' },
+    { id: 'ctrl+c', label: 'Ctrl+C' },
+    { id: 'ctrl+d', label: 'Ctrl+D' }
+  ],
+  [
+    { id: 'ctrl+l', label: 'Ctrl+L' },
+    { id: 'ctrl+z', label: 'Ctrl+Z' }
+  ]
+])
+
+const showMobileTerminalKeys = computed(() => (
+  props.mobile && Boolean(props.session?.terminalId)
+))
+
+function sendMobileTerminalAction(actionId) {
+  const text = resolveMobileTerminalActionInput(actionId)
+  if (!text || !props.session?.connected) return
+  emit('input', text)
+}
+
+watch(() => props.mobile, (mobile) => {
+  if (!mobile) emit('update:mobileKeyOverlayOpen', false)
+})
+
+watch(() => props.session?.terminalId, () => {
+  emit('update:mobileKeyOverlayOpen', false)
+})
+
+watch(showMobileTerminalKeys, (visible) => {
+  if (visible) return
+  emit('update:mobileKeyOverlayOpen', false)
+})
 </script>
 
 <template>
@@ -68,6 +125,48 @@ const shellLabel = computed(() => {
       >
         <Loader2 class="h-4 w-4 animate-spin" />
         <span>Opening terminal…</span>
+      </div>
+    </div>
+
+    <div
+      v-if="showMobileTerminalKeys && mobileKeyOverlayOpen"
+      class="absolute right-3 top-3 z-20"
+    >
+      <div
+        class="w-[232px] rounded-2xl border border-white/10 bg-black/75 p-3 shadow-[0_18px_44px_rgba(0,0,0,0.45)] backdrop-blur"
+      >
+        <div class="mb-2 flex items-center justify-between gap-2">
+          <div class="text-[11px] font-medium uppercase tracking-[0.18em] text-slate-400">Terminal keys</div>
+          <button
+            class="inline-flex h-7 w-7 items-center justify-center rounded-full text-slate-300 transition-colors hover:bg-white/10 hover:text-white"
+            type="button"
+            title="Close keys"
+            @click="$emit('update:mobileKeyOverlayOpen', false)"
+          >
+            <X class="h-3.5 w-3.5" />
+          </button>
+        </div>
+
+        <div class="space-y-2">
+          <div
+            v-for="(row, rowIdx) in mobileTerminalKeyRows"
+            :key="`mobile-terminal-keys-${rowIdx}`"
+            class="grid gap-2"
+            :class="row.length >= 4 ? 'grid-cols-4' : 'grid-cols-2'"
+          >
+            <button
+              v-for="item in row"
+              :key="item.id"
+              class="inline-flex h-10 min-w-0 items-center justify-center gap-1 rounded-xl border border-white/10 bg-white/8 px-2 text-[11px] font-medium text-slate-100 transition-colors hover:bg-white/14 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20 disabled:cursor-not-allowed disabled:opacity-40"
+              type="button"
+              :disabled="!session?.connected"
+              @click="sendMobileTerminalAction(item.id)"
+            >
+              <component :is="item.icon" v-if="item.icon" class="h-3.5 w-3.5" />
+              <span class="truncate">{{ item.label }}</span>
+            </button>
+          </div>
+        </div>
       </div>
     </div>
 

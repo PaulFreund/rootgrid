@@ -40,11 +40,11 @@ export function buildDefaultConfig() {
       trustProxy: false,
       selfUpdate: {
         enabled: false,
-        repoUrl: null,
+        repo: null,
         branch: 'main',
-        workdir: null,
-        installCommand: 'npm ci',
-        buildCommand: 'npm run build',
+        accessToken: null,
+        assetName: 'rootgrid-managed-release.tgz',
+        keepReleases: 3,
         restartCommand: null
       },
       auth: {
