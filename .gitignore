@@ -1,0 +1,12 @@
+node_modules
+web/dist
+web/.vite
+.codex-auth/
+.env
+.env.*
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks

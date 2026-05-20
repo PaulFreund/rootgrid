@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "retentionDays": 30,
+  "notifications": {
+    "sseToasts": "if-not-visible",
+    "webPush": "if-not-visible",
+    "sound": false
+  },
+  "debug": {
+    "codexRawCapture": {
+      "enabled": false,
+      "dir": null
+    }
+  },
+  "autostart": {
+    "enabled": false,
+    "method": null
+  },
+  "runner": {
+    "enabled": true,
+    "machineId": "11111111-2222-4333-8444-555555555555",
+    "machineName": "wsl-devbox",
+    "upgrade": {
+      "enabled": true,
+      "keepReleases": 3
+    }
+  },
+  "host": {
+    "enabled": true,
+    "listen": {
+      "host": "127.0.0.1",
+      "port": 7337
+    },
+    "publicUrl": null,
+    "trustProxy": false,
+    "selfUpdate": {
+      "enabled": true,
+      "repo": null,
+      "branch": "main",
+      "accessToken": null,
+      "assetName": "rootgrid-managed-release.tgz",
+      "keepReleases": 3,
+      "restartCommand": null
+    },
+    "auth": {
+      "clientToken": "replace-with-a-long-random-client-token",
+      "runnerToken": "replace-with-a-long-random-runner-token"
+    }
+  },
+  "upstream": {
+    "enabled": false,
+    "url": null,
+    "runnerToken": null
+  }
+}

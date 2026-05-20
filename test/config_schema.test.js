@@ -1,0 +1,17 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+
+import { buildDefaultConfig } from '../src/config/defaultConfig.js'
+import { RootgridConfigSchema } from '../src/config/schema.js'
+
+test('runner web upgrade config is enabled by default with managed release retention', () => {
+  const config = buildDefaultConfig()
+  const parsed = RootgridConfigSchema.parse(config)
+  assert.equal(parsed.runner.upgrade.enabled, true)
+  assert.equal(parsed.runner.upgrade.keepReleases, 3)
+  assert.equal(parsed.host.selfUpdate.enabled, true)
+  assert.equal(parsed.host.selfUpdate.branch, 'main')
+  assert.equal(parsed.host.selfUpdate.assetName, 'rootgrid-managed-release.tgz')
+  assert.equal(parsed.host.selfUpdate.keepReleases, 3)
+  assert.equal(parsed.notifications.sound, false)
+})

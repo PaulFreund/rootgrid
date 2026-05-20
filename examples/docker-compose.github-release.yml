@@ -1,0 +1,49 @@
+services:
+  rootgrid:
+    image: node:22-bookworm-slim
+    container_name: rootgrid
+    init: true
+    restart: unless-stopped
+    environment:
+      ROOTGRID_HOME_DIR: /root/.rootgrid-data
+      ROOTGRID_RUNTIME_DIR: /root/.rootgrid
+      ROOTGRID_GITHUB_REPO: ${ROOTGRID_GITHUB_REPO:-PaulFreund/rootgrid}
+      ROOTGRID_GITHUB_BRANCH: ${ROOTGRID_GITHUB_BRANCH:-main}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Set to 1 if you also want "container restart pulls latest release".
+      ROOTGRID_BOOTSTRAP_FORCE: ${ROOTGRID_BOOTSTRAP_FORCE:-0}
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+
+        if ! command -v curl >/dev/null 2>&1; then
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates tar
+          rm -rf /var/lib/apt/lists/*
+        fi
+
+        auth=()
+        if [ -n "${GITHUB_TOKEN:-}" ]; then
+          auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+        fi
+
+        curl -fsSL "${auth[@]}" \
+          -H "Accept: application/vnd.github.raw" \
+          "https://api.github.com/repos/${ROOTGRID_GITHUB_REPO}/contents/scripts/start-host-from-github-release.sh?ref=${ROOTGRID_GITHUB_BRANCH}" \
+          | bash
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "const fs=require('fs');const net=require('net');let port=7337;try{const cfg=JSON.parse(fs.readFileSync('/root/.rootgrid-data/config.json','utf8'));port=Number(cfg?.host?.listen?.port||port)}catch{}const s=net.createConnection({host:'127.0.0.1',port,timeout:3000},()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1));s.on('timeout',()=>{s.destroy();process.exit(1)});"
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    volumes:
+      - ./volumes/rootgrid:/root/.rootgrid
+      - ./volumes/rootgrid-data:/root/.rootgrid-data

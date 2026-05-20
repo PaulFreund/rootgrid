@@ -1,0 +1,307 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+
+import { createSessionEnvelopeHandler } from '../web/src/lib/sessionEnvelopeHandler.js'
+import {
+  removeSessionRowInList,
+  replaceMachineRows,
+  replaceSessionRows,
+  upsertMachineRowInList,
+  upsertSessionRowInList
+} from '../web/src/lib/appSessionState.js'
+
+test('session envelope handler keeps registry maps in sync for snapshot/update/delete events', () => {
+  const machines = { value: [] }
+  const sessions = { value: [] }
+  const machineRowsById = new Map()
+  const sessionRowsById = new Map()
+  const approvalQueue = { value: [] }
+  const approvalIds = new Set()
+  const hasSnapshot = { value: false }
+  const selectedSessionId = { value: 's-1' }
+  const sseConnectionId = { value: null }
+  const sessionStores = new Map([
+    ['s-1', { lastRealtimeSeqSeen: 2, loadingBefore: false, pendingAfter: [], currentTurnId: null, turnHasReasoningLive: new Set(), messageViewVersion: 0 }]
+  ])
+  const backfills = []
+  const snapshotPageInfo = []
+  let postVisibilityCalls = 0
+  const deletedSelections = []
+  const toasts = { value: [] }
+  const playedToastSounds = []
+  const tokenUpdates = []
+  const addedEvents = []
+  const restoredPrompts = []
+  const sessionErrors = []
+
+  const handleEnvelope = createSessionEnvelopeHandler({
+    currentVisibility: () => 'visible',
+    notificationPermission: { value: 'default' },
+    showBrowserToast: () => false,
+    playToastSound: (toast) => playedToastSounds.push(toast.id),
+    toasts,
+    scheduleDismissToast: () => {},
+    sseConnectionId,
+    replaceMachineRows: (rows) => replaceMachineRows(machines.value, machineRowsById, rows),
+    replaceSessionRows: (rows) => replaceSessionRows(sessions.value, sessionRowsById, rows),
+    applySessionPageInfo: (payload) => snapshotPageInfo.push(payload),
+    sessionRowsById,
+    approvalQueue,
+    approvalIds,
+    hasSnapshot,
+    schedulePostVisibility: () => { postVisibilityCalls += 1 },
+    selectedSessionId,
+    sessionStores,
+    backfillSessionAfter: (sessionId, { afterSeq }) => {
+      backfills.push({ sessionId, afterSeq })
+      return Promise.resolve()
+    },
+    onSelectedSessionDeleted: (session) => deletedSelections.push(session),
+    upsertMachineRow: (row) => upsertMachineRowInList(machines.value, row, machineRowsById),
+    removeMachineLocal: () => {},
+    removeSessionRow: (sessionId) => removeSessionRowInList(sessions.value, sessionId, sessionRowsById),
+    upsertSessionRow: (row) => upsertSessionRowInList(sessions.value, row, sessionRowsById),
+    getSessionStore: (sessionId) => sessionStores.get(sessionId),
+    stickToBottom: { value: false },
+    scheduleMarkRead: () => {},
+    bumpSessionToTop: () => {},
+    updateTokenUsage: (sessionId, payload) => tokenUpdates.push({ sessionId, payload }),
+    appendToolOutput: () => {},
+    onQueuedPromptRestoreRequested: (payload) => restoredPrompts.push(payload),
+    onSessionError: (payload) => sessionErrors.push(payload),
+    addSessionEvent: (sessionId, event) => {
+      addedEvents.push({ sessionId, event })
+    }
+  })
+
+  handleEnvelope({
+    type: 'registry.snapshot',
+    payload: {
+      connectionId: 'conn-1',
+      machines: [{ machineId: 'm-1', machineName: 'runner-a' }],
+      sessions: [{ sessionId: 's-1', machineId: 'm-1', lastSeq: 5, titleSource: 'auto' }],
+      sessionsHasMore: true,
+      sessionsNextBeforeUpdatedMs: 4,
+      sessionsNextBeforeSessionId: 's-1',
+      approvals: []
+    }
+  })
+
+  assert.equal(hasSnapshot.value, true)
+  assert.equal(sseConnectionId.value, 'conn-1')
+  assert.equal(machineRowsById.get('m-1')?.machineName, 'runner-a')
+  assert.equal(sessionRowsById.get('s-1')?.lastSeq, 5)
+  assert.equal(snapshotPageInfo.length, 1)
+  assert.equal(postVisibilityCalls, 1)
+  assert.deepEqual(backfills, [{ sessionId: 's-1', afterSeq: 2 }])
+
+  handleEnvelope({
+    type: 'registry.machine.upsert',
+    payload: { machineId: 'm-1', machineName: 'runner-b' }
+  })
+  assert.equal(machineRowsById.get('m-1')?.machineName, 'runner-b')
+
+  handleEnvelope({
+    type: 'session.status',
+    scope: { sessionId: 's-1' },
+    payload: {
+      status: 'running',
+      codexThreadId: 'thread-1',
+      threadName: 'Repository overview',
+      threadPreview: 'Summarize the repo'
+    }
+  })
+  assert.equal(sessionRowsById.get('s-1')?.title, 'Repository overview')
+  assert.equal(sessionRowsById.get('s-1')?.preview, 'Summarize the repo')
+  assert.equal(sessionRowsById.get('s-1')?.turnState, 'running')
+
+  handleEnvelope({
+    type: 'session.input',
+    scope: { sessionId: 's-1' },
+    payload: { text: 'follow up' }
+  })
+  assert.equal(sessionRowsById.get('s-1')?.turnState, 'running')
+  assert.equal(sessionRowsById.get('s-1')?.preview, 'follow up')
+
+  handleEnvelope({
+    type: 'approval.request',
+    scope: { sessionId: 's-1' },
+    payload: { approvalId: 'a-1' }
+  })
+  handleEnvelope({
+    type: 'approval.request',
+    scope: { sessionId: 's-1' },
+    payload: { approvalId: 'a-1' }
+  })
+  assert.equal(approvalQueue.value.length, 1)
+  assert.equal(approvalIds.has('a-1'), true)
+
+  handleEnvelope({
+    type: 'approval.resolved',
+    scope: { sessionId: 's-1' },
+    payload: { approvalId: 'a-1' }
+  })
+  assert.equal(approvalQueue.value.length, 0)
+  assert.equal(approvalIds.has('a-1'), false)
+
+  handleEnvelope({
+    type: 'token.count',
+    scope: { sessionId: 's-1' },
+    payload: { total: 123 }
+  })
+  handleEnvelope({
+    type: 'account.rateLimits.updated',
+    scope: { sessionId: 's-1' },
+    payload: { rateLimits: { primary: { used_percent: 4 } } }
+  })
+  assert.deepEqual(tokenUpdates, [
+    { sessionId: 's-1', payload: { total: 123 } },
+    { sessionId: 's-1', payload: { rateLimits: { primary: { used_percent: 4 } } } }
+  ])
+
+  sessionStores.get('s-1').loadingBefore = true
+  sessionStores.get('s-1').pendingAfter = []
+
+  handleEnvelope({
+    id: 'out-1',
+    ts: 10,
+    type: 'session.output',
+    scope: { sessionId: 's-1' },
+    payload: { stream: 'normalized', text: 'hel' }
+  })
+  handleEnvelope({
+    id: 'out-2',
+    ts: 11,
+    type: 'session.output',
+    scope: { sessionId: 's-1' },
+    payload: { stream: 'normalized', text: 'lo' }
+  })
+  assert.equal(sessionStores.get('s-1').pendingAfter.length, 1)
+  assert.equal(sessionStores.get('s-1').pendingAfter[0].payload.text, 'hello')
+
+  sessionStores.get('s-1').loadingBefore = false
+  handleEnvelope({
+    id: 'turn-1',
+    ts: 11.5,
+    type: 'turn.started',
+    scope: { sessionId: 's-1' },
+    payload: { turnId: 'turn-live' }
+  })
+  handleEnvelope({
+    id: 'reason-1',
+    ts: 12,
+    type: 'session.output',
+    scope: { sessionId: 's-1' },
+    payload: { stream: 'reasoning', text: 'inspect files' }
+  })
+  assert.equal(sessionStores.get('s-1').turnHasReasoningLive.has('turn-live'), true)
+
+  handleEnvelope({
+    id: 'session-error-1',
+    type: 'session.error',
+    scope: { sessionId: 's-1', machineId: 'm-1' },
+    payload: {
+      message: 'Codex refresh token was already used. Log out and sign in again on this runner.',
+      details: 'refresh_token_reused'
+    }
+  })
+  assert.equal(sessionErrors.length, 1)
+  assert.equal(sessionErrors[0]?.machineId, 'm-1')
+  assert.equal(sessionErrors[0]?.sessionId, 's-1')
+
+  handleEnvelope({
+    type: 'session.queuedPrompts.updated',
+    scope: { sessionId: 's-1' },
+    payload: {
+      sessionId: 's-1',
+      queuedPrompts: [{ id: 'qp-1', promptId: 'qp-1', text: 'later', attachments: [] }]
+    }
+  })
+  assert.equal(sessionStores.get('s-1').queuedPrompts?.length ?? 0, 1)
+  assert.equal(sessionStores.get('s-1').queueSending, false)
+
+  handleEnvelope({
+    type: 'session.queuedPrompt.restoreRequested',
+    scope: { sessionId: 's-1' },
+    payload: {
+      sessionId: 's-1',
+      prompt: {
+        id: 'qp-restore-1',
+        promptId: 'qp-restore-1',
+        text: 'retry me',
+        attachments: [{ uploadId: 'upload-1', filename: 'note.txt', mimeType: 'text/plain' }]
+      },
+      error: 'runner not connected'
+    }
+  })
+  assert.equal(sessionStores.get('s-1').restoredPrompt?.text, 'retry me')
+  assert.equal(sessionStores.get('s-1').restoredPromptError, 'runner not connected')
+  assert.equal(sessionStores.get('s-1').queueSending, false)
+  assert.deepEqual(restoredPrompts, [{
+    sessionId: 's-1',
+    prompt: {
+      id: 'qp-restore-1',
+      promptId: 'qp-restore-1',
+      text: 'retry me',
+      attachments: [{ uploadId: 'upload-1', filename: 'note.txt', mimeType: 'text/plain' }]
+    },
+    error: 'runner not connected'
+  }])
+
+  handleEnvelope({
+    type: 'turn.completed',
+    scope: { sessionId: 's-1' },
+    payload: { preview: 'Final repository summary' }
+  })
+  assert.equal(sessionRowsById.get('s-1')?.title, 'Final repository summary')
+  assert.equal(sessionRowsById.get('s-1')?.turnState, 'idle')
+
+  sessionRowsById.get('s-1').titleSource = 'user'
+  sessionRowsById.get('s-1').title = 'Pinned title'
+  handleEnvelope({
+    type: 'turn.completed',
+    scope: { sessionId: 's-1' },
+    payload: { preview: 'Should not overwrite pinned title' }
+  })
+  assert.equal(sessionRowsById.get('s-1')?.title, 'Pinned title')
+
+  handleEnvelope({
+    type: 'registry.session.delete',
+    payload: { sessionId: 's-1' }
+  })
+  assert.equal(sessionRowsById.has('s-1'), false)
+  assert.equal(selectedSessionId.value, null)
+  assert.equal(deletedSelections.length, 1)
+  assert.equal(deletedSelections[0]?.sessionId, 's-1')
+
+  handleEnvelope({
+    type: 'registry.hello',
+    payload: { connectionId: 'conn-2', resumed: true }
+  })
+  assert.equal(sseConnectionId.value, 'conn-2')
+  assert.equal(postVisibilityCalls, 2)
+
+  handleEnvelope({
+    id: 'toast-1',
+    type: 'toast',
+    payload: { title: 'One', message: 'Only once' }
+  })
+  handleEnvelope({
+    id: 'toast-1',
+    type: 'toast',
+    payload: { title: 'One', message: 'Only once' }
+  })
+  handleEnvelope({
+    id: 'toast-2',
+    type: 'toast',
+    payload: { title: 'One', message: 'Only once', notificationKey: 'turn:s-1:t-1' }
+  })
+  handleEnvelope({
+    id: 'toast-3',
+    type: 'toast',
+    payload: { title: 'One', message: 'Only once', notificationKey: 'turn:s-1:t-1' }
+  })
+  assert.equal(toasts.value.length, 2)
+  assert.deepEqual(playedToastSounds, ['toast-1', 'toast-2'])
+  assert.ok(addedEvents.some(({ event }) => event.type === 'session.output' && event.payload?.stream === 'reasoning'))
+})

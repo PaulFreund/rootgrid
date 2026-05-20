@@ -1,0 +1,276 @@
+# `rootgrid setup` (interactive wizard)
+
+`rootgrid setup` is the only required “CLI interaction” in v0. After setup, all day-to-day usage is via the **web UI**.
+
+It must write configuration to:
+- `~/.rootgrid/config.json`
+
+After the host starts, the web UI stores its runtime-editable settings in the host SQLite DB instead of rewriting `config.json`. Today that covers:
+- `retentionDays`
+- `notifications.sseToasts`
+- `notifications.webPush`
+- `notifications.sound`
+
+For local source development, `npm run dev` intentionally uses a separate Rootgrid home at `~/.rootgrid-dev/` by default (override with `ROOTGRID_HOME_DIR=/path npm run dev`) so development does not mutate your normal `~/.rootgrid` install. On first run it auto-seeds that dev config from `~/.rootgrid/config.json` when available, while disabling autostart and shifting the machine identity/host port for safety.
+
+`ROOTGRID_INSTALL_DIR` remains supported as a backward-compatible alias for `ROOTGRID_RUNTIME_DIR`.
+
+---
+
+## Wizard flow (v0)
+
+### 1) Check prerequisites
+
+Minimum checks:
+- `node` version (since Rootgrid runs on Node)
+- managed `codex` availability in the Rootgrid runtime
+
+Optional checks (recommended):
+- `git` availability (if the UI will show diffs/status)
+- managed `code-server` availability (only needed for VS Code web viewer)
+- `script` availability (used by the web terminal on Linux/macOS; typically already installed)
+- filesystem permissions for `~/.rootgrid`
+
+### 2) Offer to install missing prerequisites
+
+If prerequisites are missing, offer to install managed runner-local copies under the Rootgrid runtime:
+- Codex (required for v0, installed via npm into `~/.rootgrid/tools/codex/...`; on Linux this also attempts to install/update the system `bubblewrap` package used by Codex sandboxing)
+- `code-server` (optional; installed into `~/.rootgrid/tools/code-server/...`)
+
+### 3) Managed runtime + autostart
+
+During setup, Rootgrid stages a managed runtime under:
+
+- `~/.rootgrid/releases/<release-id>/`
+- `~/.rootgrid/current -> ~/.rootgrid/releases/<release-id>/`
+
+That managed runtime is used for:
+- runner-only installs
+- remote web-triggered runner upgrades
+
+Host installs that use the GitHub install/upgrade flow, or enable `host.selfUpdate`, also run from that managed runtime so they can switch `~/.rootgrid/current` to a newly downloaded bundle on upgrade.
+
+If `systemd --user` is available, ask:
+- “Do you want Rootgrid to autostart on login?”
+
+If yes:
+- create a user service (e.g. `~/.config/systemd/user/rootgrid.service`)
+- enable + start it
+- on Linux, Rootgrid also checks whether `loginctl` lingering is enabled for that user and offers to run `sudo loginctl enable-linger <user>` so the service keeps running after logout
+
+On macOS, use a user `launchd` agent instead (for example `~/Library/LaunchAgents/dev.rootgrid.rootgrid.plist`).
+
+### 4) Runner setup (agent execution on this machine)
+
+Ask:
+- “Do you want this machine to run Codex sessions (runner mode)?”
+
+If yes:
+- ask for machine name (default: hostname)
+
+### 5) Host vs upstream
+
+Ask one of:
+
+**A) Host mode (serve web UI + API here)**
+- listen host (default `127.0.0.1`)
+- listen port (default `7337`)
+- generate (or set) a **client → host** access token (used by the browser/web UI)
+- generate (or set) a **runner → host** access token (used by runners registering to this host)
+- (optional) ask if Rootgrid will run **behind a reverse proxy**
+  - if yes, set `host.trustProxy=true` and (optionally) ask for `host.publicUrl`
+
+**B) Upstream mode (connect this runner to another Rootgrid host)**
+- upstream URL (host websocket base, e.g. `wss://…`)
+- upstream **runner token**
+
+### 6) Write `~/.rootgrid/config.json`
+
+Persist all choices from the wizard (including autostart choice and machine name).
+
+### 7) Print next steps
+
+Examples:
+- if host mode: print the local URL to open in a browser
+- if upstream mode: confirm the machine registered successfully (or how to troubleshoot)
+
+---
+
+## After setup: updating or repairing the local install
+
+`rootgrid setup` is intentionally first-run only. If `~/.rootgrid/config.json` already exists, use these commands instead:
+
+- `rootgrid update-local`
+  - installs the current package into `~/.rootgrid/current`
+  - if autostart is enabled, refreshes/restarts the user service
+- `rootgrid install-service`
+  - reinstalls the user service against `~/.rootgrid/current`
+  - updates `autostart.enabled=true` and the detected method in config
+  - on Linux/systemd, warns if user lingering is still disabled
+- `rootgrid remove-service`
+  - stops/removes the user service
+  - updates `autostart.enabled=false` and clears the method in config
+
+## Installing a remote runner without git/npm
+
+From the host web UI, open **Settings → Machines** and generate the install command. It looks like:
+
+```bash
+curl -fsSL 'https://YOUR-HOST/api/install/runner.sh?installToken=...' | bash
+```
+
+The target machine only needs:
+- `curl`
+- `node`
+- `tar`
+- `git`
+
+The host serves:
+- a short-lived bootstrap shell script
+- a prebuilt runner bundle
+
+The script then:
+1. downloads the bundle from the host
+2. writes a runner-only `~/.rootgrid/config.json`
+3. offers to install managed Codex and `code-server` copies into the runner runtime; on Linux, Codex install also attempts to install/update `bubblewrap`
+4. installs the user service (`systemd --user` on Linux/WSL, `launchd` on macOS)
+5. starts the runner
+
+If the generated install URL points at `localhost`/`127.0.0.1`, set `host.publicUrl` so the target machine gets a reachable host address.
+
+## Installing or upgrading a host from GitHub
+
+If this repo lives on GitHub and you want the host itself to use GitHub-built bundles, use the bootstrap script in the repo:
+
+```bash
+curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/OWNER/REPO/contents/scripts/install-host-from-github.sh?ref=main" | ROOTGRID_GITHUB_TOKEN="$GITHUB_TOKEN" ROOTGRID_GITHUB_REPO="OWNER/REPO" ROOTGRID_GITHUB_BRANCH="main" bash
+```
+
+That script:
+1. downloads the latest release-channel bundle for the configured branch from GitHub Releases
+2. installs it under `~/.rootgrid/current`
+3. runs `rootgrid setup` on first install if `~/.rootgrid/config.json` does not exist
+4. configures `host.selfUpdate.repo`/`branch` for that GitHub repo and keeps host self-update ready to use
+5. refreshes the user service so later web-triggered self-updates can switch to the next managed release
+
+For container deployments, use the GitHub release bootstrap script instead of cloning the repo into the container. It downloads the managed release bundle into `~/.rootgrid/current` and then starts Rootgrid from there:
+
+```bash
+curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/OWNER/REPO/contents/scripts/start-host-from-github-release.sh?ref=main" | ROOTGRID_GITHUB_TOKEN="$GITHUB_TOKEN" ROOTGRID_GITHUB_REPO="OWNER/REPO" ROOTGRID_GITHUB_BRANCH="main" bash
+```
+
+That script expects `~/.rootgrid/config.json` to already exist. In containers, you can keep the GitHub repo/token in environment variables instead of writing them into config:
+- `ROOTGRID_GITHUB_REPO`
+- `ROOTGRID_GITHUB_BRANCH`
+- `GITHUB_TOKEN` or `ROOTGRID_GITHUB_TOKEN`
+
+A checked-in Compose example using separate runtime and data volumes lives at [`examples/docker-compose.github-release.yml`](../examples/docker-compose.github-release.yml).
+
+---
+
+## Proposed config shape (v0)
+
+This is a **proposed** starting point; adjust as implementation realities land. A full repo example also lives at [`config.example.json`](../config.example.json).
+
+```json
+{
+  "version": 1,
+  "retentionDays": 30,
+  "notifications": { "sseToasts": "if-not-visible", "webPush": "if-not-visible", "sound": false },
+  "debug": {
+    "codexRawCapture": { "enabled": false, "dir": null }
+  },
+  "autostart": { "enabled": false, "method": null },
+  "runner": {
+    "enabled": true,
+    "machineId": "replace-with-uuid",
+    "machineName": "my-hostname",
+    "upgrade": {
+      "enabled": true,
+      "keepReleases": 3
+    }
+  },
+  "host": {
+    "enabled": true,
+    "listen": { "host": "127.0.0.1", "port": 7337 },
+    "publicUrl": null,
+    "trustProxy": false,
+    "selfUpdate": {
+      "enabled": true,
+      "repo": null,
+      "branch": "main",
+      "accessToken": null,
+      "assetName": "rootgrid-managed-release.tgz",
+      "keepReleases": 3,
+      "restartCommand": null
+    },
+    "auth": {
+      "clientToken": "replace-with-random",
+      "runnerToken": "replace-with-random"
+    }
+  },
+  "upstream": {
+    "enabled": false,
+    "url": null,
+    "runnerToken": null
+  }
+}
+```
+
+Notes:
+- `runner.machineId` should be a stable UUID generated once (so renaming the machine doesn’t create a “new machine”).
+- `runner.upgrade.enabled` defaults to `true`.
+- `runner.upgrade.keepReleases` controls how many old managed releases Rootgrid keeps under `~/.rootgrid/releases/` after a successful remote upgrade.
+- Remote runner upgrades ship a **prebuilt release bundle** from the host to the runner; the runner does **not** need `git`, `npm`, or a local build toolchain for upgrades.
+- `autostart.method` can be `systemd-user` (Linux/WSL) or `launchd-user` (macOS).
+- `retentionDays` defaults to `30` and applies to **all** persisted data (sessions, logs, artifacts) unless explicitly exempted later.
+- `notifications.sseToasts` controls toast/desktop notifications delivered over SSE:
+  - `"if-not-visible"` (default): send only to hidden tabs
+  - `"always"`: send to all connected tabs
+  - `"never"`: disable
+- `notifications.webPush` controls Web Push delivery (VAPID):
+  - `"if-not-visible"` (default): send when the relevant session is not currently open in a visible Rootgrid tab
+  - `"always"`: always send push (even while the UI is visible)
+  - `"never"`: disable push sends (subscription can remain registered)
+- `notifications.sound` controls whether the web UI plays the bundled notification sound for incoming toast events.
+- `debug.codexRawCapture.enabled` turns on raw `codex app-server` capture for every new runner session.
+- `debug.codexRawCapture.dir` optionally overrides the output directory; when `null`, Rootgrid writes to `~/.rootgrid/debug/codex/`.
+- In host mode:
+  - `host.auth.clientToken` protects **browser/web UI** access.
+  - `host.auth.runnerToken` protects **runner registration**.
+  - `host.selfUpdate` is enabled in config by default, but the **Settings → System → Host self-update** button only becomes actionable once `host.selfUpdate.repo` is set for GitHub-built branch bundles. The recommended install path is the GitHub bootstrap command above so the host already runs from `~/.rootgrid/current`.
+- In upstream mode, `upstream.url` and `upstream.runnerToken` are required.
+- v0 recommendation: `host.enabled=true` and `upstream.enabled=true` should be treated as **mutually exclusive** (either you host the UI here, or you connect to an upstream host).
+
+---
+
+## “Did we forget anything important?”
+
+Common setup prompts that become painful later if you skip them:
+
+1) **Token generation + rotation**
+   - generate strong random tokens by default
+   - keep **separate tokens** for:
+     - browser/web UI → host (`host.auth.clientToken`)
+     - runner → host (`host.auth.runnerToken`)
+   - show them once (or provide rotation commands later)
+
+2) **CORS / allowed origins**
+   - if the UI is ever hosted on a different origin (or if you build a “hosted UI”), you’ll need an origin allowlist
+
+3) **Data directory override**
+   - allow `~/.rootgrid` to be overridden (env var or config) for dev/testing and constrained environments
+
+4) **TLS termination story**
+   - in host mode, you may rely on a reverse proxy (Caddy/nginx) for HTTPS
+   - in upstream mode, `wss://` should be the expectation
+   - reverse proxy must:
+     - support WebSocket upgrades (`/v1/runner/ws`, `/v1/tunnel`, and `/vscode/*`)
+     - disable response buffering for SSE (`/api/events`)
+
+5) **macOS autostart**
+   - ensure the LaunchAgent points at `~/.rootgrid/current/src/cli.js` so remote upgrades pick up the new managed release after restart
+
+6) **Retention / disk usage**
+   - `retentionDays` (default `30`) should prune old sessions/logs/artifacts automatically
+   - uploads/attachments are stored under `~/.rootgrid/uploads/` and are also pruned (host-side) by retention
