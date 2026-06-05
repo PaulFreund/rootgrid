@@ -151,9 +151,22 @@ ensure_optional_tool() {
   if [ "$install_choice" = "1" ] || [ "$install_choice" = "true" ] || [ "$install_choice" = "yes" ]; then
     :
   elif [ "$install_choice" = "0" ] || [ "$install_choice" = "false" ] || [ "$install_choice" = "no" ]; then
+    if [ -n "$continue_question" ]; then
+      echo
+      echo "[!] $name will not be installed."
+      return 0
+    fi
     return 1
   else
     if ! prompt_yes_no "$install_question" 1; then
+      if [ -n "$continue_question" ]; then
+        echo
+        echo "[!] $name will not be installed."
+        if ! prompt_yes_no "$continue_question" 0; then
+          exit 1
+        fi
+        return 0
+      fi
       return 1
     fi
   fi
@@ -182,6 +195,7 @@ ensure_optional_tool() {
     if ! prompt_yes_no "$continue_question" 0; then
       exit 1
     fi
+    return 0
   fi
   return 1
 }
@@ -225,7 +239,7 @@ ensure_optional_tool \
   "code-server" \
   "\"$ROOTGRID_CODE_SERVER_BIN\" --version" \
   "Install managed code-server now into Rootgrid runtime?" \
-  "mkdir -p \"$ROOTGRID_CODE_SERVER_HOME\" \"$ROOTGRID_CODE_SERVER_HOME/.local/bin\" && HOME=\"$ROOTGRID_CODE_SERVER_HOME\" XDG_CONFIG_HOME=\"$ROOTGRID_CODE_SERVER_HOME/.config\" XDG_CACHE_HOME=\"$ROOTGRID_CODE_SERVER_HOME/.cache\" XDG_DATA_HOME=\"$ROOTGRID_CODE_SERVER_HOME/.local/share\" PATH=\"$ROOTGRID_CODE_SERVER_HOME/.local/bin:$PATH\" sh -lc 'curl -fsSL https://code-server.dev/install.sh | sh'" \
+  "mkdir -p \"$ROOTGRID_CODE_SERVER_HOME\" \"$ROOTGRID_CODE_SERVER_HOME/.local/bin\" && HOME=\"$ROOTGRID_CODE_SERVER_HOME\" XDG_CONFIG_HOME=\"$ROOTGRID_CODE_SERVER_HOME/.config\" XDG_CACHE_HOME=\"$ROOTGRID_CODE_SERVER_HOME/.cache\" XDG_DATA_HOME=\"$ROOTGRID_CODE_SERVER_HOME/.local/share\" PATH=\"$ROOTGRID_CODE_SERVER_HOME/.local/bin:$PATH\" sh -lc 'curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone'" \
   "https://coder.com/docs/code-server/latest/install" \
   "Continue runner install without managed code-server? (VS Code web viewer will be unavailable)"
 

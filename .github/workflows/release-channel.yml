@@ -36,6 +36,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: rootgrid-managed-release
+          retention-days: 1
           path: |
             .release-channel/rootgrid-managed-release.tgz
             .release-channel/rootgrid-managed-release.tgz.sha256

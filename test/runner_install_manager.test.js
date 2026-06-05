@@ -58,6 +58,8 @@ test('buildRunnerInstallScript generates a self-contained bootstrap script', () 
   assert.match(script, /rootgrid_install_system_bubblewrap/)
   assert.match(script, /apt-get install -y bubblewrap/)
   assert.match(script, /ROOTGRID_CODE_SERVER_HOME/)
+  assert.match(script, /sh -s -- --method=standalone/)
+  assert.match(script, /prompt_yes_no "\$continue_question" 0[\s\S]+return 0/)
   assert.match(script, /Installing Rootgrid runner .* into \$ROOTGRID_RUNTIME_DIR/)
 })
 
