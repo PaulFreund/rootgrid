@@ -38,10 +38,18 @@ test('runner release manager installs a received bundle and emits restart state'
 
   const rootgridHome = join(base, 'home', '.rootgrid')
   const previousHome = process.env.ROOTGRID_HOME_DIR
+  const previousRuntime = process.env.ROOTGRID_RUNTIME_DIR
+  const previousInstall = process.env.ROOTGRID_INSTALL_DIR
   process.env.ROOTGRID_HOME_DIR = rootgridHome
+  process.env.ROOTGRID_RUNTIME_DIR = rootgridHome
+  process.env.ROOTGRID_INSTALL_DIR = rootgridHome
   t.after(() => {
     if (previousHome === undefined) delete process.env.ROOTGRID_HOME_DIR
     else process.env.ROOTGRID_HOME_DIR = previousHome
+    if (previousRuntime === undefined) delete process.env.ROOTGRID_RUNTIME_DIR
+    else process.env.ROOTGRID_RUNTIME_DIR = previousRuntime
+    if (previousInstall === undefined) delete process.env.ROOTGRID_INSTALL_DIR
+    else process.env.ROOTGRID_INSTALL_DIR = previousInstall
   })
   await mkdir(join(rootgridHome, 'releases'), { recursive: true })
   const currentRelease = join(rootgridHome, 'releases', 'current-old')
@@ -59,11 +67,17 @@ test('runner release manager installs a received bundle and emits restart state'
 
   const events = []
   const restartCalls = []
+  const callOrder = []
   const manager = new RunnerReleaseManager({
     machineId: 'machine-1',
     autostart: { enabled: true, method: 'systemd-user' },
     upgrade: { enabled: true, keepReleases: 2 },
+    async installBubblewrap() {
+      callOrder.push('bubblewrap')
+      return { ok: true }
+    },
     restartService(method) {
+      callOrder.push('restart')
       restartCalls.push(method)
       return true
     },
@@ -100,6 +114,7 @@ test('runner release manager installs a received bundle and emits restart state'
   const manifest = JSON.parse(await readFile(join(rootgridHome, 'current', 'release.json'), 'utf8'))
   assert.equal(manifest.version, '9.9.9')
   assert.deepEqual(restartCalls, ['systemd-user'])
+  assert.deepEqual(callOrder, ['bubblewrap', 'restart'])
   assert.deepEqual(events.map((entry) => entry.type), [
     'machine.upgrade.state',
     'machine.upgrade.state',
@@ -117,10 +132,18 @@ test('runner release manager accepts multi-chunk bundles beyond 64KB', async (t)
 
   const rootgridHome = join(base, 'home', '.rootgrid')
   const previousHome = process.env.ROOTGRID_HOME_DIR
+  const previousRuntime = process.env.ROOTGRID_RUNTIME_DIR
+  const previousInstall = process.env.ROOTGRID_INSTALL_DIR
   process.env.ROOTGRID_HOME_DIR = rootgridHome
+  process.env.ROOTGRID_RUNTIME_DIR = rootgridHome
+  process.env.ROOTGRID_INSTALL_DIR = rootgridHome
   t.after(() => {
     if (previousHome === undefined) delete process.env.ROOTGRID_HOME_DIR
     else process.env.ROOTGRID_HOME_DIR = previousHome
+    if (previousRuntime === undefined) delete process.env.ROOTGRID_RUNTIME_DIR
+    else process.env.ROOTGRID_RUNTIME_DIR = previousRuntime
+    if (previousInstall === undefined) delete process.env.ROOTGRID_INSTALL_DIR
+    else process.env.ROOTGRID_INSTALL_DIR = previousInstall
   })
   await mkdir(join(rootgridHome, 'releases'), { recursive: true })
   const currentRelease = join(rootgridHome, 'releases', 'current-old')
@@ -141,6 +164,9 @@ test('runner release manager accepts multi-chunk bundles beyond 64KB', async (t)
     machineId: 'machine-1',
     autostart: { enabled: true, method: 'systemd-user' },
     upgrade: { enabled: true, keepReleases: 2 },
+    async installBubblewrap() {
+      return { ok: true }
+    },
     restartService() {
       return true
     },

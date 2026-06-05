@@ -1,7 +1,12 @@
 import { createHash } from 'node:crypto'
+import { spawn } from 'node:child_process'
 import { mkdir, open, readFile, realpath, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
+import {
+  buildSystemBubblewrapInstallShellFunction,
+  getManagedCodexBinPath
+} from '../lib/runnerTooling.js'
 import {
   extractManagedReleaseBundle,
   getCurrentReleaseLinkPath,
@@ -33,6 +38,55 @@ async function currentProcessUsesManagedRuntime() {
   }
 }
 
+async function installBubblewrapForManagedCodex({
+  runShell = defaultRunShell,
+  codexBin = getManagedCodexBinPath()
+} = {}) {
+  const safeCodexBin = trimText(codexBin)
+  if (!safeCodexBin) return { ok: false, skipped: true, reason: 'missing codex path' }
+  const script = `${buildSystemBubblewrapInstallShellFunction()}
+if [ -x ${shellQuote(safeCodexBin)} ]; then
+  rootgrid_install_system_bubblewrap
+fi
+`
+  try {
+    await runShell(script)
+    return { ok: true }
+  } catch (err) {
+    return {
+      ok: false,
+      skipped: false,
+      reason: trimText(err?.message) ?? 'bubblewrap install failed'
+    }
+  }
+}
+
+function shellQuote(value) {
+  const text = String(value ?? '')
+  return `'${text.replaceAll("'", `'\"'\"'`)}'`
+}
+
+function defaultRunShell(script) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('/bin/sh', ['-lc', script], {
+      stdio: ['ignore', 'ignore', 'pipe']
+    })
+    let stderr = ''
+    child.stderr?.on('data', (chunk) => {
+      if (stderr.length >= 16 * 1024) return
+      stderr += String(chunk).slice(0, 16 * 1024 - stderr.length)
+    })
+    child.once('error', reject)
+    child.once('close', (code) => {
+      if (Number(code) === 0) {
+        resolve({ ok: true })
+        return
+      }
+      reject(new Error(trimText(stderr) ?? `bubblewrap install exited with code ${code}`))
+    })
+  })
+}
+
 export class RunnerReleaseManager {
   /**
    * @param {{
@@ -40,10 +94,18 @@ export class RunnerReleaseManager {
    *   emit: (type: string, payload: any, options?: { track?: boolean }) => void,
    *   autostart?: any,
    *   upgrade?: any,
-   *   restartService?: (method: string|null|undefined) => boolean
+   *   restartService?: (method: string|null|undefined) => boolean,
+   *   installBubblewrap?: () => Promise<any>
    * }} opts
    */
-  constructor({ machineId, emit, autostart = null, upgrade = null, restartService = dispatchUserServiceRestart }) {
+  constructor({
+    machineId,
+    emit,
+    autostart = null,
+    upgrade = null,
+    restartService = dispatchUserServiceRestart,
+    installBubblewrap = installBubblewrapForManagedCodex
+  }) {
     this.machineId = machineId
     this.emit = emit
     this.autostart = autostart ?? { enabled: false, method: null }
@@ -52,6 +114,7 @@ export class RunnerReleaseManager {
       keepReleases: Number(upgrade?.keepReleases) > 0 ? Number(upgrade.keepReleases) : 3
     }
     this.restartService = restartService
+    this.installBubblewrap = installBubblewrap
     this.transfer = null
   }
 
@@ -157,6 +220,14 @@ export class RunnerReleaseManager {
       await writeReleaseManifest(transfer.releaseDir, manifest)
 
       await switchCurrentRelease(transfer.releaseDir)
+      try {
+        const bubblewrap = await this.installBubblewrap()
+        if (bubblewrap?.ok === false && bubblewrap?.skipped !== true) {
+          this.#emitState('installing', `bubblewrap install skipped: ${String(bubblewrap?.reason ?? 'unknown error')}`)
+        }
+      } catch (err) {
+        this.#emitState('installing', `bubblewrap install skipped: ${String(err?.message ?? err)}`)
+      }
       await pruneOldManagedReleases({ keep: this.upgrade.keepReleases, excludeReleaseIds: [transfer.releaseId] })
 
       this.emit('machine.upgrade.bundle.received', {

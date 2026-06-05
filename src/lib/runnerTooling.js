@@ -34,7 +34,7 @@ export function buildSystemBubblewrapInstallShellFunction() {
   if [ "$(uname -s 2>/dev/null || true)" != "Linux" ]; then
     return 0
   fi
-  if [ "$ROOTGRID_INSTALL_BUBBLEWRAP" = "0" ]; then
+  if [ "\${ROOTGRID_INSTALL_BUBBLEWRAP:-}" = "0" ]; then
     return 0
   fi
 

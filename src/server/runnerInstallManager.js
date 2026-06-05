@@ -221,7 +221,7 @@ if has_cmd npm; then
     "Codex" \
     "\"$ROOTGRID_CODEX_BIN\" --version" \
     "Install managed Codex now into Rootgrid runtime?" \
-    "mkdir -p \"$ROOTGRID_CODEX_PREFIX\" && npm install --global --prefix \"$ROOTGRID_CODEX_PREFIX\" @openai/codex && rootgrid_install_system_bubblewrap" \
+    "mkdir -p \"$ROOTGRID_CODEX_PREFIX\" && npm install --global --prefix \"$ROOTGRID_CODEX_PREFIX\" @openai/codex" \
     "https://developers.openai.com/codex/cli" \
     "Continue runner install without managed Codex?"
 else
@@ -233,6 +233,10 @@ else
       exit 1
     fi
   fi
+fi
+
+if [ -x "$ROOTGRID_CODEX_BIN" ]; then
+  rootgrid_install_system_bubblewrap
 fi
 
 ensure_optional_tool \
