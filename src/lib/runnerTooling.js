@@ -100,10 +100,19 @@ rootgrid_install_system_bubblewrap
 }`
 }
 
-function buildManagedCodexUpgradeCommand(prefixDir) {
+function buildManagedCodexUpgradeCommand(prefixDir, runtimeDir) {
+  const cacheParentDir = join(runtimeDir, 'tmp', 'tools')
   return [
-    `mkdir -p ${shellQuote(prefixDir)}`,
-    `npm install --global --prefix ${shellQuote(prefixDir)} @openai/codex`,
+    [
+      '( set -e',
+      'ROOTGRID_NPM_CACHE=""',
+      'cleanup() { [ -z "$ROOTGRID_NPM_CACHE" ] || rm -rf "$ROOTGRID_NPM_CACHE"; }',
+      'trap cleanup EXIT',
+      `mkdir -p ${shellQuote(prefixDir)} ${shellQuote(cacheParentDir)}`,
+      `ROOTGRID_NPM_CACHE="$(mktemp -d ${shellQuote(join(cacheParentDir, 'codex-npm.XXXXXX'))})"`,
+      `npm install --global --prefix ${shellQuote(prefixDir)} --cache "$ROOTGRID_NPM_CACHE" @openai/codex`,
+      ')'
+    ].join('; '),
     buildSystemBubblewrapInstallCommand()
   ].join(' && ')
 }
@@ -325,32 +334,39 @@ export function getRunnerToolInstallSpec(toolId, {
       docsUrl: 'https://developers.openai.com/codex/cli',
       managedBinPath: binPath,
       managedBinDir: getManagedCodexBinDir({ runtimeDir }),
-      upgradeCommand: buildManagedCodexUpgradeCommand(prefixDir)
+      upgradeCommand: buildManagedCodexUpgradeCommand(prefixDir, runtimeDir)
     }
   }
 
   if (safeToolId === 'codeServer') {
     const homeDir = getManagedCodeServerHomeDir({ runtimeDir })
     const binDir = getManagedCodeServerBinDir({ runtimeDir })
+    const cacheParentDir = join(runtimeDir, 'tmp', 'tools')
     const envPrefix = [
       `HOME=${shellQuote(homeDir)}`,
       `XDG_CONFIG_HOME=${shellQuote(join(homeDir, '.config'))}`,
-      `XDG_CACHE_HOME=${shellQuote(join(homeDir, '.cache'))}`,
+      'XDG_CACHE_HOME="$ROOTGRID_CODE_SERVER_CACHE"',
       `XDG_DATA_HOME=${shellQuote(join(homeDir, '.local', 'share'))}`,
       `PATH=${shellQuote(binDir)}:"$PATH"`
     ].join(' ')
-      return {
-        id: 'codeServer',
-        label: 'code-server',
-        docsUrl: 'https://coder.com/docs/code-server/latest/install',
-        managedBinPath: getManagedCodeServerBinPath({ runtimeDir }),
-        managedBinDir: binDir,
-        upgradeCommand: [
-          `mkdir -p ${shellQuote(homeDir)} ${shellQuote(binDir)}`,
-          `${envPrefix} sh -lc ${shellQuote('curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone')}`
-        ].join(' && ')
-      }
+    return {
+      id: 'codeServer',
+      label: 'code-server',
+      docsUrl: 'https://coder.com/docs/code-server/latest/install',
+      managedBinPath: getManagedCodeServerBinPath({ runtimeDir }),
+      managedBinDir: binDir,
+      upgradeCommand: [
+        '( set -e',
+        'ROOTGRID_CODE_SERVER_CACHE=""',
+        'cleanup() { [ -z "$ROOTGRID_CODE_SERVER_CACHE" ] || rm -rf "$ROOTGRID_CODE_SERVER_CACHE"; }',
+        'trap cleanup EXIT',
+        `mkdir -p ${shellQuote(homeDir)} ${shellQuote(binDir)} ${shellQuote(cacheParentDir)}`,
+        `ROOTGRID_CODE_SERVER_CACHE="$(mktemp -d ${shellQuote(join(cacheParentDir, 'code-server.XXXXXX'))})"`,
+        `${envPrefix} sh -lc ${shellQuote('curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone')}`,
+        ')'
+      ].join('; ')
     }
+  }
 
   throw new Error(`unknown runner tool: ${safeToolId || 'unknown'}`)
 }

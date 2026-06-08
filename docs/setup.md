@@ -220,8 +220,10 @@ This is a **proposed** starting point; adjust as implementation realities land. 
 Notes:
 - `runner.machineId` should be a stable UUID generated once (so renaming the machine doesn’t create a “new machine”).
 - `runner.upgrade.enabled` defaults to `true`.
-- `runner.upgrade.keepReleases` controls how many old managed releases Rootgrid keeps under `~/.rootgrid/releases/` after a successful remote upgrade.
+- `runner.upgrade.keepReleases` controls how many old managed releases Rootgrid keeps under `~/.rootgrid/releases/` after a successful remote upgrade, and how many generated runner-install bundles are kept under `~/.rootgrid/tmp/bundles/`.
+- Local managed installs (`rootgrid setup`, `rootgrid install-service`, `rootgrid update-local`) also prune old managed releases after switching `~/.rootgrid/current`; stale interrupted-update artifacts under `~/.rootgrid/releases/` and `~/.rootgrid/tmp/` are cleaned best-effort on startup/retention.
 - Remote runner upgrades ship a **prebuilt release bundle** from the host to the runner; the runner does **not** need `git`, `npm`, or a local build toolchain for upgrades.
+- Managed Codex and code-server installs use temporary installer caches under `~/.rootgrid/tmp/tools/` and remove those caches after the install command exits.
 - `autostart.method` can be `systemd-user` (Linux/WSL) or `launchd-user` (macOS).
 - `retentionDays` defaults to `30` and applies to **all** persisted data (sessions, logs, artifacts) unless explicitly exempted later.
 - `notifications.sseToasts` controls toast/desktop notifications delivered over SSE:

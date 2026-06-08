@@ -1,8 +1,8 @@
 import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { createReadStream } from 'node:fs'
-import { access, cp, mkdir, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
-import { basename, join, resolve } from 'node:path'
+import { access, cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { basename, dirname, join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
@@ -32,6 +32,26 @@ function trimText(value) {
 function normalizeBundleSha256(value) {
   const text = String(value ?? '').trim().toLowerCase()
   return /^[a-f0-9]{64}$/.test(text) ? text : null
+}
+
+function normalizeKeepCount(value, fallback = 3) {
+  const count = Number(value)
+  if (!Number.isFinite(count) || count < 1) return fallback
+  return Math.max(1, Math.floor(count))
+}
+
+function normalizeReleaseIdSet(values) {
+  return new Set(
+    (Array.isArray(values) ? values : [])
+      .map((value) => String(value ?? '').trim())
+      .filter(Boolean)
+  )
+}
+
+function releaseIdFromBundleFilename(filename) {
+  const name = String(filename ?? '').trim()
+  if (!name.endsWith('.tgz')) return null
+  return name.slice(0, -4).trim() || null
 }
 
 export function getCurrentPackageRoot() {
@@ -129,7 +149,8 @@ export async function installManagedRelease({
   version = '0.0.0',
   releaseId = buildReleaseId(version),
   rootgridDir = getRootgridDir(),
-  source = 'local'
+  source = 'local',
+  keep = 3
 }) {
   const releasesDir = getReleasesDir()
   const releaseDir = join(releasesDir, releaseId)
@@ -137,6 +158,11 @@ export async function installManagedRelease({
   await mkdir(releasesDir, { recursive: true, mode: 0o700 })
   await stageManagedRelease({ sourceRoot, releaseDir, manifest })
   await switchCurrentRelease(releaseDir, { rootgridDir })
+  await pruneOldManagedReleases({
+    keep,
+    rootgridDir,
+    excludeReleaseIds: [releaseId]
+  })
   return { releaseDir, manifest }
 }
 
@@ -189,7 +215,8 @@ export async function createManagedReleaseBundle({
   version = '0.0.0',
   releaseId = buildReleaseId(version),
   outDir = getReleaseBundlesDir(),
-  source = 'host'
+  source = 'host',
+  keepBundles = 3
 }) {
   const bundlePath = join(outDir, `${releaseId}.tgz`)
   const manifestDir = join(outDir, `${releaseId}.manifest`)
@@ -215,6 +242,11 @@ export async function createManagedReleaseBundle({
     )
     const sha256 = await hashFileSha256(bundlePath)
     const info = await stat(bundlePath)
+    await pruneOldReleaseBundles({
+      keep: keepBundles,
+      bundlesDir: outDir,
+      excludeReleaseIds: [releaseId]
+    })
     return {
       bundlePath,
       filename: basename(bundlePath),
@@ -227,6 +259,63 @@ export async function createManagedReleaseBundle({
   } finally {
     await rm(manifestDir, { recursive: true, force: true }).catch(() => {})
   }
+}
+
+export async function pruneOldReleaseBundles({
+  keep = 3,
+  bundlesDir = getReleaseBundlesDir(),
+  excludeReleaseIds = []
+} = {}) {
+  const keepCount = normalizeKeepCount(keep, 3)
+  const keepReleaseIds = normalizeReleaseIdSet(excludeReleaseIds)
+
+  let entries = []
+  try {
+    entries = await readdir(bundlesDir, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+
+  const bundles = []
+  for (const ent of entries) {
+    if (!ent?.isFile?.()) continue
+    const releaseId = releaseIdFromBundleFilename(ent.name)
+    if (!releaseId) continue
+    const bundlePath = join(bundlesDir, ent.name)
+    try {
+      const info = await stat(bundlePath)
+      bundles.push({
+        releaseId,
+        bundlePath,
+        mtimeMs: Number(info?.mtimeMs ?? 0) || 0
+      })
+    } catch {
+    }
+  }
+
+  bundles.sort((a, b) => {
+    const byTime = b.mtimeMs - a.mtimeMs
+    return byTime || b.releaseId.localeCompare(a.releaseId)
+  })
+
+  for (const bundle of bundles) {
+    if (keepReleaseIds.has(bundle.releaseId)) continue
+    if (keepReleaseIds.size >= keepCount) continue
+    keepReleaseIds.add(bundle.releaseId)
+  }
+
+  const removedReleaseIds = []
+  for (const bundle of bundles) {
+    if (keepReleaseIds.has(bundle.releaseId)) continue
+    await rm(bundle.bundlePath, { force: true }).catch(() => {})
+    removedReleaseIds.push(bundle.releaseId)
+  }
+
+  for (const releaseId of removedReleaseIds) {
+    await rm(join(bundlesDir, `${releaseId}.manifest`), { recursive: true, force: true }).catch(() => {})
+  }
+
+  return removedReleaseIds.length
 }
 
 export async function extractManagedReleaseBundle({ archivePath, targetDir }) {
@@ -295,7 +384,7 @@ export async function pruneOldManagedReleases({
   excludeReleaseIds = []
 } = {}) {
   const releasesDir = getReleasesDir()
-  const exclude = new Set((Array.isArray(excludeReleaseIds) ? excludeReleaseIds : []).map((value) => String(value ?? '').trim()).filter(Boolean))
+  const exclude = normalizeReleaseIdSet(excludeReleaseIds)
 
   let currentReal = null
   try {
@@ -335,6 +424,87 @@ export async function pruneOldManagedReleases({
     await rm(row.releaseDir, { recursive: true, force: true }).catch(() => {})
   }
   return remove.length
+}
+
+async function listDirEntries(path) {
+  try {
+    return await readdir(path, { withFileTypes: true })
+  } catch {
+    return []
+  }
+}
+
+async function isStalePath(path, cutoffMs) {
+  try {
+    const info = await lstat(path)
+    return (Number(info?.mtimeMs ?? 0) || 0) < cutoffMs
+  } catch {
+    return false
+  }
+}
+
+export async function pruneStaleManagedReleaseArtifacts({
+  staleAgeMs = 24 * 60 * 60 * 1000,
+  nowMs = Date.now()
+} = {}) {
+  const cutoffMs = Number(nowMs) - Math.max(60_000, Number(staleAgeMs) || (24 * 60 * 60 * 1000))
+  const result = {
+    pendingReleaseDirsDeleted: 0,
+    currentTempPathsDeleted: 0,
+    transferDirsDeleted: 0,
+    transferArchivesDeleted: 0,
+    bundleManifestDirsDeleted: 0
+  }
+
+  const releasesDir = getReleasesDir()
+  for (const ent of await listDirEntries(releasesDir)) {
+    if (!ent?.isDirectory?.()) continue
+    if (!String(ent.name ?? '').startsWith('.pending-')) continue
+    const path = join(releasesDir, ent.name)
+    if (!(await isStalePath(path, cutoffMs))) continue
+    await rm(path, { recursive: true, force: true }).catch(() => {})
+    result.pendingReleaseDirsDeleted += 1
+  }
+
+  const currentPath = getCurrentReleaseLinkPath()
+  const currentDir = dirname(currentPath)
+  const currentName = basename(currentPath)
+  for (const ent of await listDirEntries(currentDir)) {
+    if (!String(ent.name ?? '').startsWith(`${currentName}.tmp-`)) continue
+    const path = join(currentDir, ent.name)
+    if (!(await isStalePath(path, cutoffMs))) continue
+    await rm(path, { recursive: true, force: true }).catch(() => {})
+    result.currentTempPathsDeleted += 1
+  }
+
+  const transfersDir = getReleaseTransfersDir()
+  for (const ent of await listDirEntries(transfersDir)) {
+    const name = String(ent.name ?? '')
+    const path = join(transfersDir, name)
+    if (ent?.isDirectory?.() && name.startsWith('host-update-')) {
+      if (!(await isStalePath(path, cutoffMs))) continue
+      await rm(path, { recursive: true, force: true }).catch(() => {})
+      result.transferDirsDeleted += 1
+      continue
+    }
+    if (ent?.isFile?.() && name.endsWith('.tgz')) {
+      if (!(await isStalePath(path, cutoffMs))) continue
+      await rm(path, { force: true }).catch(() => {})
+      result.transferArchivesDeleted += 1
+    }
+  }
+
+  const bundlesDir = getReleaseBundlesDir()
+  for (const ent of await listDirEntries(bundlesDir)) {
+    const name = String(ent.name ?? '')
+    if (!ent?.isDirectory?.() || !name.endsWith('.manifest')) continue
+    const path = join(bundlesDir, name)
+    if (!(await isStalePath(path, cutoffMs))) continue
+    await rm(path, { recursive: true, force: true }).catch(() => {})
+    result.bundleManifestDirsDeleted += 1
+  }
+
+  return result
 }
 
 export async function getManagedReleaseCliPath() {

@@ -50,7 +50,9 @@ test('runner tools manager upgrades a tool and refreshes its detected version', 
 
   const result = await manager.upgrade('codex')
 
-  assert.match(commands[0], /^\/bin\/sh -lc mkdir -p '.*\/tools\/codex\/npm-global' && npm install --global --prefix '.*\/tools\/codex\/npm-global' @openai\/codex/)
+  assert.match(commands[0], /^\/bin\/sh -lc \( set -e; ROOTGRID_NPM_CACHE=/)
+  assert.match(commands[0], /mktemp -d '.*\/tmp\/tools\/codex-npm\.XXXXXX'/)
+  assert.match(commands[0], /npm install --global --prefix '.*\/tools\/codex\/npm-global' --cache "\$ROOTGRID_NPM_CACHE" @openai\/codex/)
   assert.match(commands[0], /rootgrid_install_system_bubblewrap/)
   assert.match(commands[0], /apt-get install -y bubblewrap/)
   assert.equal(result?.ok, true)
@@ -87,6 +89,9 @@ test('runner tools manager installs code-server into the managed standalone path
 
   const result = await manager.upgrade('codeServer')
 
+  assert.equal(commands.some((entry) => /ROOTGRID_CODE_SERVER_CACHE=/.test(entry)), true)
+  assert.equal(commands.some((entry) => /mktemp -d '.*\/tmp\/tools\/code-server\.XXXXXX'/.test(entry)), true)
+  assert.equal(commands.some((entry) => /XDG_CACHE_HOME="\$ROOTGRID_CODE_SERVER_CACHE"/.test(entry)), true)
   assert.equal(commands.some((entry) => /curl -fsSL https:\/\/code-server\.dev\/install\.sh \| sh -s -- --method=standalone/.test(entry)), true)
   assert.equal(result?.ok, true)
   assert.equal(result?.tool?.source, 'managed')

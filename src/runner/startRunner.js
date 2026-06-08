@@ -1,3 +1,4 @@
+import { pruneStaleManagedReleaseArtifacts } from '../lib/managedRelease.js'
 import { startRunnerClient } from './startRunnerClient.js'
 import { startTunnelClient } from './startTunnelClient.js'
 
@@ -13,6 +14,9 @@ function toLocalConnectHost(listenHost) {
 
 export async function startRunner({ config }) {
   if (!config.runner.enabled) return
+  await pruneStaleManagedReleaseArtifacts().catch((err) => {
+    console.warn('[rootgrid] stale managed artifact prune failed:', String(err?.message ?? err))
+  })
 
   if (config.host.enabled) {
     const host = toLocalConnectHost(config.host.listen.host)

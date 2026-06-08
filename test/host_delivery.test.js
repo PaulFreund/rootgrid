@@ -54,7 +54,14 @@ async function startHostProcess({ cwd }) {
 
   const child = spawn(process.execPath, ['src/cli.js'], {
     cwd,
-    env: { ...process.env, HOME: home, ROOTGRID_DISABLE_AUTO_MANAGED_RUNTIME: '1' },
+    env: {
+      ...process.env,
+      HOME: home,
+      ROOTGRID_HOME_DIR: join(home, '.rootgrid'),
+      ROOTGRID_RUNTIME_DIR: join(home, '.rootgrid'),
+      ROOTGRID_INSTALL_DIR: join(home, '.rootgrid'),
+      ROOTGRID_DISABLE_AUTO_MANAGED_RUNTIME: '1'
+    },
     stdio: ['ignore', 'pipe', 'pipe']
   })
 
@@ -293,7 +300,10 @@ test('session bootstrap endpoint returns session metadata plus a prefetched summ
   const runner = await connectRunner({
     port,
     token: svc.config.host.auth.runnerToken,
-    machineId
+    machineId,
+    capabilities: {
+      tools: { enabled: true, upgrades: true }
+    }
   })
   t.after(() => {
     try { runner.close() } catch {}
@@ -393,7 +403,10 @@ test('raw upload endpoint streams bytes and messages can reference uploaded file
   const runner = await connectRunner({
     port,
     token: svc.config.host.auth.runnerToken,
-    machineId
+    machineId,
+    capabilities: {
+      tools: { enabled: true, upgrades: true }
+    }
   })
   t.after(() => {
     try { runner.close() } catch {}
@@ -1500,7 +1513,10 @@ test('workspace helper routes proxy fs, git, and terminal requests to the runner
   const runner = await connectRunner({
     port,
     token: svc.config.host.auth.runnerToken,
-    machineId
+    machineId,
+    capabilities: {
+      tools: { enabled: true, upgrades: true }
+    }
   })
   t.after(() => {
     try { runner.close() } catch {}

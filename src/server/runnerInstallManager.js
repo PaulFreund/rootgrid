@@ -173,7 +173,7 @@ ensure_optional_tool() {
 
   echo
   echo "Installing $name…"
-  if ! sh -lc "$install_cmd"; then
+  if ! eval "$install_cmd"; then
     echo
     echo "[!] $name install command failed."
   fi
@@ -202,6 +202,33 @@ ensure_optional_tool() {
 
 ${buildSystemBubblewrapInstallShellFunction()}
 
+rootgrid_install_managed_codex() {
+  local cache_parent="$ROOTGRID_RUNTIME_DIR/tmp/tools"
+  local npm_cache=""
+  mkdir -p "$ROOTGRID_CODEX_PREFIX" "$cache_parent"
+  npm_cache="$(mktemp -d "$cache_parent/codex-npm.XXXXXX")"
+  (
+    trap 'rm -rf "$npm_cache"' EXIT
+    npm install --global --prefix "$ROOTGRID_CODEX_PREFIX" --cache "$npm_cache" @openai/codex
+  )
+}
+
+rootgrid_install_managed_code_server() {
+  local cache_parent="$ROOTGRID_RUNTIME_DIR/tmp/tools"
+  local install_cache=""
+  mkdir -p "$ROOTGRID_CODE_SERVER_HOME" "$ROOTGRID_CODE_SERVER_HOME/.local/bin" "$cache_parent"
+  install_cache="$(mktemp -d "$cache_parent/code-server.XXXXXX")"
+  (
+    trap 'rm -rf "$install_cache"' EXIT
+    HOME="$ROOTGRID_CODE_SERVER_HOME" \\
+      XDG_CONFIG_HOME="$ROOTGRID_CODE_SERVER_HOME/.config" \\
+      XDG_CACHE_HOME="$install_cache" \\
+      XDG_DATA_HOME="$ROOTGRID_CODE_SERVER_HOME/.local/share" \\
+      PATH="$ROOTGRID_CODE_SERVER_HOME/.local/bin:$PATH" \\
+      sh -lc 'curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone'
+  )
+}
+
 need_cmd curl
 need_cmd tar
 need_cmd "$NODE_BIN"
@@ -221,7 +248,7 @@ if has_cmd npm; then
     "Codex" \
     "\"$ROOTGRID_CODEX_BIN\" --version" \
     "Install managed Codex now into Rootgrid runtime?" \
-    "mkdir -p \"$ROOTGRID_CODEX_PREFIX\" && npm install --global --prefix \"$ROOTGRID_CODEX_PREFIX\" @openai/codex" \
+    "rootgrid_install_managed_codex" \
     "https://developers.openai.com/codex/cli" \
     "Continue runner install without managed Codex?"
 else
@@ -243,7 +270,7 @@ ensure_optional_tool \
   "code-server" \
   "\"$ROOTGRID_CODE_SERVER_BIN\" --version" \
   "Install managed code-server now into Rootgrid runtime?" \
-  "mkdir -p \"$ROOTGRID_CODE_SERVER_HOME\" \"$ROOTGRID_CODE_SERVER_HOME/.local/bin\" && HOME=\"$ROOTGRID_CODE_SERVER_HOME\" XDG_CONFIG_HOME=\"$ROOTGRID_CODE_SERVER_HOME/.config\" XDG_CACHE_HOME=\"$ROOTGRID_CODE_SERVER_HOME/.cache\" XDG_DATA_HOME=\"$ROOTGRID_CODE_SERVER_HOME/.local/share\" PATH=\"$ROOTGRID_CODE_SERVER_HOME/.local/bin:$PATH\" sh -lc 'curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone'" \
+  "rootgrid_install_managed_code_server" \
   "https://coder.com/docs/code-server/latest/install" \
   "Continue runner install without managed code-server? (VS Code web viewer will be unavailable)"
 

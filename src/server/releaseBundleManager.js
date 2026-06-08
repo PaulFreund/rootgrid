@@ -4,9 +4,18 @@ import { createReadStream } from 'node:fs'
 import { createManagedReleaseBundle, getCurrentPackageRoot } from '../lib/managedRelease.js'
 import { ROOTGRID_VERSION } from '../lib/rootgridVersion.js'
 
-export function createReleaseBundleManager() {
+function normalizeKeepBundles(value) {
+  const count = Number(value)
+  if (!Number.isFinite(count) || count < 1) return 3
+  return Math.max(1, Math.min(50, Math.floor(count)))
+}
+
+export function createReleaseBundleManager({
+  keepBundles = 3
+} = {}) {
   let cached = null
   let inflight = null
+  const bundleRetention = normalizeKeepBundles(keepBundles)
 
   function getBundleMetadata() {
     return {
@@ -22,7 +31,8 @@ export function createReleaseBundleManager() {
     inflight = createManagedReleaseBundle({
       sourceRoot: getCurrentPackageRoot(),
       version: ROOTGRID_VERSION,
-      source: 'host'
+      source: 'host',
+      keepBundles: bundleRetention
     }).then((bundle) => {
       cached = bundle
       return bundle

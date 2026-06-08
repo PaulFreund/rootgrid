@@ -3,6 +3,7 @@ import http from 'node:http'
 import { rm } from 'node:fs/promises'
 
 import { stripIdeBasePath } from '../lib/idePaths.js'
+import { pruneStaleManagedReleaseArtifacts } from '../lib/managedRelease.js'
 import { getDbPath, getSecretKeyPath } from '../lib/paths.js'
 import { applyRuntimeSettingsToConfig, readRuntimeSettingsFromConfig } from '../lib/runtimeSettings.js'
 import { getOrCreateVapidKeys } from '../lib/vapidKeys.js'
@@ -72,7 +73,11 @@ export async function startHost({ config }) {
   const pendingTerminalExecs = createPendingRequestBook()
   const pendingModelLists = createPendingRequestBook()
   const pendingRunnerCommands = createPendingRequestBook()
-  const releaseBundles = createReleaseBundleManager()
+  const releaseBundles = createReleaseBundleManager({
+    keepBundles: config?.runner?.upgrade?.keepReleases
+      ?? config?.host?.selfUpdate?.keepReleases
+      ?? 3
+  })
   const runnerInstall = createRunnerInstallManager({
     config,
     releaseBundles
@@ -1090,8 +1095,13 @@ export async function startHost({ config }) {
         if (!p || typeof p !== 'string') continue
         try { await rm(p, { force: true }) } catch { }
       }
+      const artifacts = await pruneStaleManagedReleaseArtifacts()
       if (s > 0 || m > 0) {
         console.log(`[rootgrid] retention pruned: sessions=${s} machines=${m}`)
+      }
+      const artifactCount = Object.values(artifacts).reduce((sum, value) => sum + (Number(value) || 0), 0)
+      if (artifactCount > 0) {
+        console.log(`[rootgrid] retention pruned stale managed artifacts: ${artifactCount}`)
       }
     } catch (err) {
       console.warn('[rootgrid] retention prune failed:', String(err?.message ?? err))
